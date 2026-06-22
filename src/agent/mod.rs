@@ -24,8 +24,9 @@ pub use launcher::{
     LaunchFeatures, VmDisks,
 };
 pub use manager::{
-    docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
-    resolve_disk_image, vm_cache_root, vm_data_dir, vm_dir_hash, AgentManager, AgentState,
+    disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
+    read_egress_telemetry, resolve_disk_image, vm_cache_root, vm_data_dir, vm_dir_hash,
+    AgentManager, AgentState,
 };
 
 /// Agent VM name.

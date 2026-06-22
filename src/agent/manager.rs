@@ -181,6 +181,43 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+/// Actual host disk consumed by a machine's data dir, in MiB. Sums *real blocks*
+/// (`st_blocks × 512`), not apparent file lengths — the disk images are sparse, so
+/// a 20 GiB image that the guest has barely written to consumes only a few MiB.
+/// This is the gauge the control integrates over time for active-disk billing.
+/// `None` if the dir can't be read (machine gone / not yet created).
+#[cfg(target_os = "linux")]
+pub fn disk_used_mb(name: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fn walk_blocks(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                total = total.saturating_add(walk_blocks(&entry.path()));
+            } else {
+                // st_blocks is in 512-byte units regardless of the fs block size.
+                total = total.saturating_add(meta.blocks().saturating_mul(512));
+            }
+        }
+        total
+    }
+    let dir = vm_data_dir(name);
+    if !dir.exists() {
+        return None;
+    }
+    Some(walk_blocks(&dir) / (1024 * 1024))
+}
+
+/// macOS host has no VMs (dev stub) — no disk to measure.
+#[cfg(not(target_os = "linux"))]
+pub fn disk_used_mb(_name: &str) -> Option<u64> {
+    None
+}
+
 /// Resolve the on-disk image for a `.raw` disk filename in `dir`. A fork clone
 /// has a `.qcow2` copy-on-write overlay in place of the raw disk, so prefer that
 /// when present; otherwise fall back to the raw disk. The file on disk is the
@@ -207,6 +244,51 @@ pub fn resolve_disk_image(dir: &Path, raw_filename: &str) -> (PathBuf, DiskForma
 /// the `layers/` subtree that `extract_sidecar` creates *inside* this directory.
 pub fn machine_layers_cache_dir(name: &str) -> PathBuf {
     vm_data_dir(name).join("pack")
+}
+
+/// Per-VM egress telemetry file: `<vm_data_dir>/egress`. The launcher (running
+/// in the VM subprocess) periodically writes the NIC's cumulative egress byte
+/// count here; serve (the parent) reads it when building `MachineInfo`, so
+/// egress reaches the node API through the same per-VM dir that already bridges
+/// sockets and console between the two processes. Resolved from the name on both
+/// sides, so no path needs to be threaded across the process boundary.
+pub fn egress_telemetry_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join("egress")
+}
+
+/// How often the VM subprocess flushes its egress counter to disk. The control
+/// plane's egress rollup runs on a multi-minute cadence, so a value this small
+/// keeps the file comfortably fresh while writing only a few bytes.
+const EGRESS_FLUSH_SECS: u64 = 15;
+
+/// Spawn a detached thread (in the VM subprocess) that periodically writes the
+/// NIC's cumulative egress byte count to the per-VM telemetry file. serve reads
+/// that file when building `MachineInfo`, so egress reaches the node API the
+/// same way disk size does. The thread exits when the subprocess does; the last
+/// value persists in the file even after exit, so a stopped machine's final
+/// egress is still readable. Best-effort: a write error never affects the VM.
+pub fn spawn_egress_flush(
+    path: std::path::PathBuf,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    std::thread::spawn(move || loop {
+        let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = std::fs::write(&path, bytes.to_string()) {
+            tracing::debug!(path = ?path, error = %e, "egress telemetry flush failed");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
+    });
+}
+
+/// Read the per-VM egress telemetry file written by [`spawn_egress_flush`].
+/// Returns `None` if the file is absent (TSI VM, or not yet flushed) or
+/// unparseable — egress is simply unavailable for that machine.
+pub fn read_egress_telemetry(name: &str) -> Option<u64> {
+    std::fs::read_to_string(egress_telemetry_file(name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.

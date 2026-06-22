@@ -1093,6 +1093,20 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     } else {
         "stopped"
     };
+    let egress_bytes = crate::agent::read_egress_telemetry(&name);
+    // Live consumed CPU-seconds for the VMM child (host-sampled, resets on
+    // restart); the control plane accumulates the durable total. None when there
+    // is no live process to sample.
+    let stats = entry
+        .manager
+        .child_pid()
+        .and_then(crate::process::process_stats);
+    let cpu_seconds = stats.map(|s| s.cpu_time_ns / 1_000_000_000);
+    let cpu_millis = stats.map(|s| s.cpu_time_ns / 1_000_000);
+    let rss_mb = stats.map(|s| s.rss_bytes / (1024 * 1024));
+    // Actual used disk (sparse-image blocks) — a gauge the control integrates for
+    // active-disk billing. Independent of whether there's a live VMM process.
+    let disk_used_mb = crate::agent::disk_used_mb(&name);
 
     MachineInfo {
         name,
@@ -1117,6 +1131,11 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         allowed_cidrs: entry.resources.allowed_cidrs.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
+        egress_bytes,
+        cpu_seconds,
+        cpu_millis,
+        rss_mb,
+        disk_used_mb,
         created_at: 0,
     }
 }

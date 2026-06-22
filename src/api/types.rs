@@ -519,6 +519,41 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
+    /// Cumulative guest-outbound (egress) bytes since boot, for billing. Present
+    /// only for virtio-net machines that have reported a value; omitted for TSI
+    /// or machines that haven't flushed yet. Surfaced the same way `storage_gb`
+    /// is, so the control plane reads both from the machine list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1048576)]
+    pub egress_bytes: Option<u64>,
+    /// Consumed CPU-seconds (user+system) of the machine's CURRENT VMM process,
+    /// sampled live from the host. Resets to 0 on a VM restart — it's a stateless
+    /// snapshot; the control plane accumulates a durable total from it. Omitted
+    /// for stopped machines (no live process to sample).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 42)]
+    pub cpu_seconds: Option<u64>,
+    /// Same consumed CPU but in MILLISECONDS — sub-second precision so consumers
+    /// integrating this don't quantize a barely-busy process up to a whole second.
+    /// Derived from the same nanosecond sample as `cpu_seconds`. Omitted for
+    /// stopped machines (no live process to sample).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 42830)]
+    pub cpu_millis: Option<u64>,
+    /// Current resident memory (RSS) of the machine's VMM process, in MiB, sampled
+    /// live from the host. Unlike CPU this is an instantaneous gauge (not a
+    /// counter); the control plane integrates it over time for active-memory
+    /// billing. Omitted for stopped machines (no live process to sample).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 128)]
+    pub rss_mb: Option<u64>,
+    /// Actual host disk consumed by this machine's data dir, in MiB (real blocks of
+    /// the sparse disk images, not provisioned capacity). An instantaneous gauge the
+    /// control integrates over time for active-disk billing. Omitted when the data
+    /// dir can't be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 256)]
+    pub disk_used_mb: Option<u64>,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: u64,
 }

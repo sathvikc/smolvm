@@ -98,8 +98,38 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         network: record.network,
         network_backend: record.network_backend,
         allowed_cidrs: record.allowed_cidrs.clone(),
-        storage_gb: record.storage_gb,
-        overlay_gb: record.overlay_gb,
+        // Report the RESOLVED provisioned disk sizes, not the request echo: a
+        // machine created without an explicit size still gets a real disk at the
+        // node default, and billing/telemetry need the actual allocated GiB, not
+        // `None`. `open_or_create` provisions every VM a storage disk at
+        // `DEFAULT_STORAGE_SIZE_GIB` (and an overlay at `DEFAULT_OVERLAY_SIZE_GIB`)
+        // when unset.
+        storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
+        overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        // Cumulative egress, read from the per-VM telemetry file the subprocess
+        // flushes. Surfaced here so the control plane reads it from the machine
+        // list exactly like disk size — no bespoke endpoint.
+        egress_bytes: crate::agent::read_egress_telemetry(name),
+        // Live consumed CPU-seconds for the VMM child, sampled from the host
+        // (user+system CPU time). Resets on restart — the control plane treats it
+        // as a monotonic-with-resets counter and accumulates the durable total.
+        // `None` when stopped (pid cleared) or the process vanished mid-sample.
+        cpu_seconds: pid
+            .and_then(crate::process::process_stats)
+            .map(|s| s.cpu_time_ns / 1_000_000_000),
+        // Same consumed CPU in milliseconds — sub-second precision so consumers
+        // don't quantize a barely-busy process up to a whole second.
+        cpu_millis: pid
+            .and_then(crate::process::process_stats)
+            .map(|s| s.cpu_time_ns / 1_000_000),
+        // Current RSS (MiB) of the VMM process — an instantaneous gauge the
+        // control plane integrates over time for active-memory billing.
+        rss_mb: pid
+            .and_then(crate::process::process_stats)
+            .map(|s| s.rss_bytes / (1024 * 1024)),
+        // Actual used disk (sparse-image blocks) — a gauge for active-disk billing,
+        // measured from the data dir regardless of whether the VMM is running.
+        disk_used_mb: crate::agent::disk_used_mb(name),
         created_at: record.created_at,
     }
 }
@@ -1413,6 +1443,11 @@ mod tests {
         assert!(!info.network);
         assert!(info.pid.is_none());
         assert!(info.created_at > 0);
+        // A machine created without explicit disk sizes still reports the RESOLVED
+        // provisioned sizes (the node default), not None — billing/telemetry need
+        // the actual allocated GiB.
+        assert_eq!(info.storage_gb, Some(DEFAULT_STORAGE_SIZE_GIB));
+        assert_eq!(info.overlay_gb, Some(DEFAULT_OVERLAY_SIZE_GIB));
     }
 
     #[test]
