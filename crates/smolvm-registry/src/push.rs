@@ -71,21 +71,31 @@ pub async fn push(
     let manifest = smolvm_pack::read_manifest_from_sidecar(smolmachine_path)?;
     let config_json = serde_json::to_vec_pretty(&manifest)?;
 
-    // 3. Stream-upload sidecar as the layer blob.
-    //
-    // The factory reopens the file on each call so that a 401 mid-upload can be
-    // retried with a fresh stream. The OS page cache makes repeated opens cheap.
-    tracing::info!("uploading sidecar blob...");
-    let path = smolmachine_path.to_path_buf();
-    client
-        .push_blob_stream(repo, &layer_digest, layer_size, move || {
-            // std::fs::File::open is synchronous but fast (just a syscall).
-            let file = std::fs::File::open(&path).map_err(crate::RegistryError::from)?;
-            let async_file = tokio::fs::File::from_std(file);
-            let stream = tokio_util::io::ReaderStream::with_capacity(async_file, 256 * 1024);
-            Ok(reqwest::Body::wrap_stream(stream))
-        })
-        .await?;
+    // 3. Upload the sidecar as the layer blob. Large blobs go chunked (POST +
+    // per-chunk PATCH + PUT) so a body-size-capping proxy in front of the
+    // registry (e.g. Cloudflare, which 413s a multi-hundred-MB monolithic PUT)
+    // never sees an oversized request; smaller blobs keep the single-PUT stream.
+    let chunk_size = crate::client::upload_chunk_size();
+    if layer_size as usize > chunk_size {
+        tracing::info!(chunk_size, "uploading sidecar blob (chunked)...");
+        client
+            .push_blob_chunked(repo, &layer_digest, smolmachine_path, chunk_size)
+            .await?;
+    } else {
+        // The factory reopens the file on each call so that a 401 mid-upload can
+        // be retried with a fresh stream. The OS page cache makes reopens cheap.
+        tracing::info!("uploading sidecar blob...");
+        let path = smolmachine_path.to_path_buf();
+        client
+            .push_blob_stream(repo, &layer_digest, layer_size, move || {
+                // std::fs::File::open is synchronous but fast (just a syscall).
+                let file = std::fs::File::open(&path).map_err(crate::RegistryError::from)?;
+                let async_file = tokio::fs::File::from_std(file);
+                let stream = tokio_util::io::ReaderStream::with_capacity(async_file, 256 * 1024);
+                Ok(reqwest::Body::wrap_stream(stream))
+            })
+            .await?;
+    }
 
     // 4. Upload config blob (small, buffered is fine).
     tracing::info!("uploading config blob...");

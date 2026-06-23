@@ -8,11 +8,31 @@
 //! - Manifest put/get (PUT/GET)
 
 use crate::{OciIndex, OciPlatform, RegistryError, Result, INDEX_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
-use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
+use reqwest::header::{
+    ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Default chunk size for chunked blob upload: 16 MiB — comfortably under common
+/// proxy request-body caps (e.g. Cloudflare Free/Pro = 100 MB). Override with the
+/// `SMOLVM_REGISTRY_CHUNK_MB` env var. Blobs at or below this size still take the
+/// monolithic single-PUT path; only larger ones are chunked.
+const DEFAULT_CHUNK_MB: usize = 16;
+
+/// The configured upload chunk size in bytes (see [`DEFAULT_CHUNK_MB`]). Also the
+/// threshold above which a blob is uploaded chunked rather than monolithically.
+pub(crate) fn upload_chunk_size() -> usize {
+    std::env::var("SMOLVM_REGISTRY_CHUNK_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&m| m > 0)
+        .unwrap_or(DEFAULT_CHUNK_MB)
+        * 1024
+        * 1024
+}
 
 /// Validate that a digest string matches the expected `sha256:<64 hex chars>` format.
 pub(crate) fn validate_digest(digest: &str) -> Result<()> {
@@ -317,6 +337,125 @@ impl RegistryClient {
         }
 
         Ok(())
+    }
+
+    /// Upload a blob in OCI **chunked** mode: POST to open a session, one PATCH
+    /// per chunk (`Content-Range: <start>-<end>`), then a final PUT carrying the
+    /// whole-blob digest.
+    ///
+    /// Why this exists: a monolithic PUT sends the entire blob as one request
+    /// body, which a proxy in front of the registry can reject — Cloudflare 413s
+    /// a multi-hundred-MB upload. Chunking keeps every request under that cap.
+    ///
+    /// Each chunk is read into a buffered `Vec<u8>` (≤ `chunk_size`) and sent via
+    /// [`send_replayable`], so every PATCH goes through the full auth path. That
+    /// matters for large blobs: the OCI access token is short-lived (~5 min), and
+    /// a multi-chunk upload can outlive it — per-chunk auth lets each request
+    /// refresh the token instead of failing partway through.
+    ///
+    /// Reads from `path` rather than a body factory because chunking requires
+    /// positioned reads, and reopening the file per attempt would not compose
+    /// with the per-chunk retry.
+    pub async fn push_blob_chunked(
+        &self,
+        repo: &str,
+        digest: &str,
+        path: &std::path::Path,
+        chunk_size: usize,
+    ) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        validate_digest(digest)?;
+
+        if self.blob_exists(repo, digest).await? {
+            tracing::debug!(digest = %digest, "blob already exists, skipping upload");
+            return Ok(());
+        }
+
+        // Step 1: POST to open an upload session (empty body — replayable).
+        let post_url = format!("{}/v2/{}/blobs/uploads/", self.base_url, repo);
+        let resp = self
+            .send_replayable(
+                self.request(reqwest::Method::POST, &post_url)
+                    .header(CONTENT_LENGTH, 0),
+            )
+            .await?;
+        if resp.status() != reqwest::StatusCode::ACCEPTED {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+        let mut location = self.upload_location(&resp)?;
+
+        // Step 2: PATCH contiguous chunks. The registry hands back a fresh upload
+        // URL after each chunk; the next PATCH must target it.
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut buf = vec![0u8; chunk_size.max(1)];
+        let mut offset: u64 = 0;
+        loop {
+            // read() may return short — fill the chunk so all but the last are full.
+            let mut filled = 0;
+            while filled < buf.len() {
+                let n = file.read(&mut buf[filled..]).await?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
+                break;
+            }
+            let start = offset;
+            let end = offset + filled as u64 - 1;
+            let resp = self
+                .send_replayable(
+                    self.request(reqwest::Method::PATCH, &location)
+                        .header(CONTENT_TYPE, "application/octet-stream")
+                        .header(CONTENT_RANGE, format!("{start}-{end}"))
+                        .header(CONTENT_LENGTH, filled)
+                        .body(buf[..filled].to_vec()),
+                )
+                .await?;
+            if resp.status() != reqwest::StatusCode::ACCEPTED {
+                return Err(RegistryError::ApiError {
+                    status: resp.status().as_u16(),
+                    body: resp.text().await.unwrap_or_default(),
+                });
+            }
+            location = self.upload_location(&resp)?;
+            offset += filled as u64;
+        }
+
+        // Step 3: PUT (empty body) to close the session, carrying the digest.
+        let separator = if location.contains('?') { "&" } else { "?" };
+        let put_url = format!("{location}{separator}digest={digest}");
+        let resp = self
+            .send_replayable(
+                self.request(reqwest::Method::PUT, &put_url)
+                    .header(CONTENT_LENGTH, 0),
+            )
+            .await?;
+        if resp.status() != reqwest::StatusCode::CREATED {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Extract and resolve the `Location` (next upload URL) from an upload-step
+    /// response, enforcing same-origin.
+    fn upload_location(&self, resp: &reqwest::Response) -> Result<String> {
+        let loc = resp
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| RegistryError::ApiError {
+                status: 202,
+                body: "upload step accepted but missing Location header".into(),
+            })?;
+        self.resolve_location(loc)
     }
 
     /// Download a blob as a byte stream.
@@ -1622,5 +1761,63 @@ mod http_tests {
         // Factory called exactly once — PUT succeeded on first attempt with preemptive token.
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         // MockServer drop asserts token endpoint expect(1) was satisfied.
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunked upload: POST → one PATCH per chunk (Content-Range) → PUT finalize.
+    // 10 bytes with a 3-byte chunk_size = 4 PATCHes ([0-2],[3-5],[6-8],[9-9]),
+    // then a single PUT carrying the digest. Proves the engine never sends the
+    // blob as one oversized body (the Cloudflare-413 fix).
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_chunked_upload_patches_then_finalizes() {
+        let server = MockServer::start().await;
+        let content: &[u8] = b"abcdefghij"; // 10 bytes
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(content)));
+
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/myrepo/blobs/uploads/"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", "/v2/myrepo/blobs/uploads/sess-1"),
+            )
+            .mount(&server)
+            .await;
+        // Each PATCH is accepted and hands back the next upload URL (same one here).
+        Mock::given(method("PATCH"))
+            .and(path("/v2/myrepo/blobs/uploads/sess-1"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", "/v2/myrepo/blobs/uploads/sess-1"),
+            )
+            .expect(4)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/v2/myrepo/blobs/uploads/sess-1"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("smolvm-chunk-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob_path = dir.join("blob.bin");
+        std::fs::write(&blob_path, content).unwrap();
+
+        let client =
+            RegistryClient::new(server.uri().to_string()).with_identity_token("jwt".to_string());
+        client
+            .push_blob_chunked("myrepo", &digest, &blob_path, 3)
+            .await
+            .unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+        // MockServer drop asserts PATCH expect(4) and PUT expect(1) were satisfied.
     }
 }

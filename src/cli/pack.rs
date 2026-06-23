@@ -149,11 +149,38 @@ pub struct PackCreateCmd {
     #[arg(long)]
     pub gpu: bool,
 
+    /// Directory under which to stage pack assets (pulled layers, the merged
+    /// layer, agent rootfs, and the ext4 template). Defaults to the smolvm cache
+    /// dir; point this at a roomy disk-backed path when the default filesystem is
+    /// small. Overrides the `SMOLVM_PACK_STAGING` env var.
+    #[arg(long = "staging-dir", value_name = "DIR")]
+    pub staging_dir: Option<PathBuf>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
 impl PackCreateCmd {
+    /// Resolve the directory under which the staging temp dir is created.
+    ///
+    /// Precedence: `--staging-dir` → `SMOLVM_PACK_STAGING` → the disk-backed
+    /// cache dir (`<cache>/smolvm`) → `$TMPDIR`. The default must NOT be
+    /// `$TMPDIR`: staging holds the whole image (the pulled layers, a merged
+    /// copy, the agent rootfs, and the ext4 template), and on most Linux distros
+    /// `$TMPDIR` is tmpfs (RAM-backed, small), so large images fail there with
+    /// ENOSPC/EDQUOT.
+    fn staging_root(&self) -> smolvm::Result<PathBuf> {
+        let root = self
+            .staging_dir
+            .clone()
+            .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
+            .or_else(|| dirs::cache_dir().map(|c| c.join("smolvm")))
+            .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&root)
+            .map_err(|e| Error::agent("create staging root", e.to_string()))?;
+        Ok(root)
+    }
+
     pub fn run(self) -> smolvm::Result<()> {
         if let Some(vm_name) = self.from_vm.clone() {
             if self.oci_platform.is_some() {
@@ -183,7 +210,9 @@ impl PackCreateCmd {
         info!(image = %image, output = %self.output.display(), "packing image");
 
         // Create temporary staging directory
-        let temp_dir = tempfile::tempdir()
+        let temp_dir = tempfile::Builder::new()
+            .prefix("pack-staging-")
+            .tempdir_in(self.staging_root()?)
             .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
         let staging_dir = temp_dir.path().join("staging");
 
@@ -495,7 +524,9 @@ impl PackCreateCmd {
         println!("Packing VM '{}' snapshot...", vm_name);
 
         // 3. Create temporary staging directory
-        let temp_dir = tempfile::tempdir()
+        let temp_dir = tempfile::Builder::new()
+            .prefix("pack-staging-")
+            .tempdir_in(self.staging_root()?)
             .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
         let staging_dir = temp_dir.path().join("staging");
 
