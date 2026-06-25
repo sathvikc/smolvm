@@ -152,6 +152,13 @@ struct AgentInner {
     config_state: ConfigState,
     /// If true, the agent has been detached and should not be stopped on drop.
     detached: bool,
+    /// True for the most recent launch via a fork snapshot. A clone resumes past
+    /// boot and never (re)writes the `.smolvm-ready` marker, so `wait_for_ready`
+    /// must detect readiness by pinging the restored agent instead. Set per-launch
+    /// in `start_via_subprocess` from `LaunchFeatures.snapshot_dir` — this carries
+    /// the flag without a process-global env var (unsafe in the multithreaded
+    /// `serve` process where concurrent forks would race).
+    is_clone: bool,
     /// Held while the VM is running. Released on stop/Drop to allow other
     /// processes to start the VM. The kernel releases the lock automatically
     /// if the process crashes.
@@ -502,6 +509,7 @@ impl AgentManager {
                 resources: VmResources::default(),
                 config_state: ConfigState::Unknown,
                 detached: false,
+                is_clone: false,
                 #[cfg(unix)]
                 vm_lock_handle: None,
             })),
@@ -1472,6 +1480,26 @@ impl AgentManager {
             .overlay_gib
             .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
+        // Forkable / fork-clone launch params are carried PER-PROCESS — set on
+        // the boot subprocess's own env below (and on `self.is_clone`), never via
+        // `std::env::set_var`. A process-global env var is a data race in the
+        // multithreaded `serve` process, where concurrent forks would clobber
+        // each other (and `set_var` is `unsafe` in edition 2024 for that reason).
+        let fork_env: Vec<(&str, String)> = {
+            let mut v = Vec::new();
+            if features.forkable {
+                v.push(("SMOLVM_FORKABLE", "1".to_string()));
+            }
+            if let Some(ref ctl) = features.control_socket {
+                v.push(("SMOLVM_CONTROL_SOCKET", ctl.to_string_lossy().into_owned()));
+            }
+            if let Some(ref snap) = features.snapshot_dir {
+                v.push(("SMOLVM_SNAPSHOT_DIR", snap.to_string_lossy().into_owned()));
+            }
+            v
+        };
+        self.inner.lock().is_clone = features.snapshot_dir.is_some();
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -1529,6 +1557,9 @@ impl AgentManager {
                 "SMOLVM_BOOT_WATCH_PARENT",
                 if watch_parent { "1" } else { "0" },
             )
+            // Forkable / fork-clone vars set explicitly on the child (not via
+            // inherited process-global env) — see fork_env above.
+            .envs(fork_env)
             .stdin(std::process::Stdio::null())
             // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
             // embedded-host launch failures can be diagnosed (normally silenced).
@@ -1727,24 +1758,53 @@ impl AgentManager {
     /// and there's no state to preserve. Much faster than `stop()` which
     /// attempts a graceful vsock shutdown + SIGTERM + poll.
     pub fn kill(&self) {
-        let pid = {
+        // Two PID sources with very different PID-reuse risk:
+        //   - the in-memory child: a direct child we still own, so the kernel
+        //     cannot recycle its PID until we reap it → safe to SIGKILL by PID.
+        //   - the pid-file: a process we did NOT spawn as our child (recovered
+        //     after a re-attach), so between the pid-file write and now the OS
+        //     may have reused the PID. Verify the recorded start-time before
+        //     SIGKILL (`kill_verified`) so we never signal an unrelated process.
+        let owned_child = {
             let inner = self.inner.lock();
             inner.child.as_ref().map(|c| c.pid())
         };
-        let pid = pid.or_else(|| self.read_pid_file_with_start_time().map(|(p, _)| p));
 
-        if let Some(pid) = pid {
-            if process::is_alive(pid) {
-                process::kill(pid);
-                // Brief wait for the kernel to reap (SIGKILL is near-instant).
-                // try_wait reaps zombie children; is_alive catches non-children
-                // that have been reparented to init/launchd.
-                for _ in 0..10 {
-                    if process::try_wait(pid).is_some() || !process::is_alive(pid) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+        let killed_pid = match owned_child {
+            Some(pid) => {
+                if process::is_alive(pid) {
+                    process::kill(pid);
                 }
+                Some(pid)
+            }
+            None => match self.read_pid_file_with_start_time() {
+                Some((pid, start_time)) => {
+                    if process::kill_verified(pid, start_time) {
+                        Some(pid)
+                    } else {
+                        if process::is_alive(pid) {
+                            tracing::warn!(
+                                pid,
+                                "skipping kill: pid-file PID is alive but start-time \
+                                 unverified (possible PID reuse)"
+                            );
+                        }
+                        None
+                    }
+                }
+                None => None,
+            },
+        };
+
+        if let Some(pid) = killed_pid {
+            // Brief wait for the kernel to reap (SIGKILL is near-instant).
+            // try_wait reaps zombie children; is_alive catches non-children
+            // that have been reparented to init/launchd.
+            for _ in 0..10 {
+                if process::try_wait(pid).is_some() || !process::is_alive(pid) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         self.cleanup_marker_files();
@@ -1890,7 +1950,7 @@ impl AgentManager {
         // Fork clone: the guest resumes past boot, so it never (re)writes the
         // `.smolvm-ready` marker. Detect readiness by pinging the restored agent
         // directly (it is already in its accept loop) — no marker, no grace.
-        let is_clone = std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some_and(|v| !v.is_empty());
+        let is_clone = self.inner.lock().is_clone;
         if is_clone {
             while start.elapsed() < timeout {
                 {

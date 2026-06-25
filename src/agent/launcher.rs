@@ -164,6 +164,14 @@ pub struct LaunchFeatures {
     /// Additional disk images to attach to the VM (path, read_only, format).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
     pub extra_disks: Vec<(std::path::PathBuf, bool, DiskFormat)>,
+    /// Start as a fork base: back guest RAM with a memfd (copy-on-write
+    /// cloneable) and expose `control_socket` so the machine can be forked.
+    pub forkable: bool,
+    /// Boot this VM as a fork clone, restoring from the golden's snapshot at
+    /// this directory (set on the clone; `None` for a normal cold boot).
+    pub snapshot_dir: Option<std::path::PathBuf>,
+    /// Control socket path for a forkable machine (pause/resume/checkpoint/FORK).
+    pub control_socket: Option<std::path::PathBuf>,
 }
 
 impl LaunchFeatures {

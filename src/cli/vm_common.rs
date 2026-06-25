@@ -654,12 +654,28 @@ fn control_socket_path(name: &str) -> std::path::PathBuf {
     vm_data_dir(name).join("control.sock")
 }
 
-/// Mark the current process so the VM it is about to launch (in the inherited
-/// environment of the spawned `_boot-vm`) backs guest RAM with a memfd and
-/// exposes a control socket — the prerequisites for forking it later.
-pub fn enable_forkable_env(name: &str) {
-    std::env::set_var("SMOLVM_FORKABLE", "1");
-    std::env::set_var("SMOLVM_CONTROL_SOCKET", control_socket_path(name));
+/// Per-launch fork parameters, threaded into `start_vm_named` instead of mutating
+/// process-global env vars. The launcher (in the spawned `_boot-vm`) reads these
+/// from its own env, which the manager now sets explicitly on the child — so the
+/// long-lived `serve` process never does a racy `std::env::set_var`.
+#[derive(Debug, Default, Clone)]
+pub struct ForkLaunch {
+    /// Start as a fork base: memfd-back guest RAM and expose `control_socket`.
+    pub forkable: bool,
+    /// Boot as a fork clone, restoring from the golden's snapshot at this dir.
+    pub snapshot_dir: Option<std::path::PathBuf>,
+    /// Control socket path (set together with `forkable`).
+    pub control_socket: Option<std::path::PathBuf>,
+}
+
+/// Fork parameters for starting `name` as a forkable base (memfd RAM + a control
+/// socket at the machine's known path), so `machine fork` can later freeze it.
+pub fn forkable_launch(name: &str) -> ForkLaunch {
+    ForkLaunch {
+        forkable: true,
+        control_socket: Some(control_socket_path(name)),
+        snapshot_dir: None,
+    }
 }
 
 /// Send a single line command to a VM control socket and return its reply line.
@@ -882,10 +898,17 @@ pub fn fork_vm(
     }
 
     // Boot the clone from the golden's snapshot instead of cold-booting.
-    std::env::set_var("SMOLVM_SNAPSHOT_DIR", &snapshot_dir);
     eprintln!("Booting clone '{clone}' from snapshot...");
-    let result = start_vm_named(clone, None, None, /* from_snapshot */ true);
-    std::env::remove_var("SMOLVM_SNAPSHOT_DIR");
+    let result = start_vm_named(
+        clone,
+        None,
+        None,
+        /* from_snapshot */ true,
+        ForkLaunch {
+            snapshot_dir: Some(snapshot_dir.clone()),
+            ..Default::default()
+        },
+    );
     if result.is_ok() {
         rejuvenate_clone(clone);
         eprintln!(
@@ -994,6 +1017,7 @@ pub fn start_vm_named(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
     from_snapshot: bool,
+    fork: ForkLaunch,
 ) -> smolvm::Result<()> {
     use smolvm::Error;
 
@@ -1104,6 +1128,11 @@ pub fn start_vm_named(
         &smolvm::agent::machine_layers_cache_dir(name),
         record.source_smolmachine.as_deref(),
     )?;
+    // Fork params (forkable base / clone-from-snapshot) — carried per-launch into
+    // the boot subprocess's env by the manager, not via process-global env vars.
+    features.forkable = fork.forkable;
+    features.snapshot_dir = fork.snapshot_dir;
+    features.control_socket = fork.control_socket;
     // A machine created from a local image archive/dir persists a `local:…`
     // reference; re-derive its virtiofs mount dir so the guest assembles the
     // rootfs from it instead of pulling.

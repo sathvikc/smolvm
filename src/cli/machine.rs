@@ -1033,6 +1033,7 @@ impl RunCmd {
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir,
             extra_disks: Vec::new(),
+            ..Default::default()
         };
 
         let freshly_started = manager
@@ -2429,13 +2430,16 @@ impl StartCmd {
         let name = self.name.unwrap_or_else(|| "default".to_string());
         let proxy = self.proxy_opts.proxy();
         let no_proxy = self.proxy_opts.no_proxy();
-        if self.forkable {
-            // Read by launcher.rs in the spawned _boot-vm (inherits our env):
-            // memfd-back guest RAM and register a control socket at a known path
-            // so `machine fork` can later freeze this machine as a CoW base.
-            vm_common::enable_forkable_env(&name);
-        }
-        match vm_common::start_vm_named(&name, proxy, no_proxy, /* from_snapshot */ false) {
+        // Forkable start: memfd-back guest RAM and register a control socket at a
+        // known path so `machine fork` can later freeze this machine as a CoW base.
+        let fork = if self.forkable {
+            vm_common::forkable_launch(&name)
+        } else {
+            vm_common::ForkLaunch::default()
+        };
+        match vm_common::start_vm_named(
+            &name, proxy, no_proxy, /* from_snapshot */ false, fork,
+        ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
@@ -3470,7 +3474,13 @@ impl MonitorCmd {
 
         if !manager.is_process_alive() {
             println!("Machine '{}' is not running, starting...", name);
-            vm_common::start_vm_named(&name, None, None, /* from_snapshot */ false)?;
+            vm_common::start_vm_named(
+                &name,
+                None,
+                None,
+                /* from_snapshot */ false,
+                vm_common::ForkLaunch::default(),
+            )?;
         }
 
         println!(
@@ -3648,7 +3658,11 @@ impl MonitorCmd {
                     }
 
                     match vm_common::start_vm_named(
-                        &name, None, None, /* from_snapshot */ false,
+                        &name,
+                        None,
+                        None,
+                        /* from_snapshot */ false,
+                        vm_common::ForkLaunch::default(),
                     ) {
                         Ok(()) => {
                             println!("  machine restarted");
