@@ -626,7 +626,10 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
     crane
         .args(["export", "-", "-"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        // Capture (don't discard) crane's stderr so a failure reports the REAL
+        // reason — e.g. "file manifest.json not found in tar" for an empty or
+        // truncated archive — instead of a misleading guess.
+        .stderr(Stdio::piped());
     let gunzip = pipe_archive_into(&mut crane, archive)?;
 
     let mut crane_child = crane
@@ -636,6 +639,10 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
         .stdout
         .take()
         .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
+    let mut crane_err = crane_child
+        .stderr
+        .take()
+        .ok_or_else(|| StorageError::new("failed to capture crane stderr".to_string()))?;
 
     let tar_out = Command::new("tar")
         .arg("-x")
@@ -655,9 +662,19 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
     }
 
     if !crane_status.success() {
-        return Err(StorageError::new(
-            "crane export failed (is this a docker/podman `save` archive?)".to_string(),
-        ));
+        // crane's stderr is a single short line; reading it after the process
+        // exits (its stdout was drained by `tar`) cannot deadlock.
+        let mut stderr = String::new();
+        let _ = std::io::Read::read_to_string(&mut crane_err, &mut stderr);
+        let stderr = stderr.trim();
+        return Err(StorageError::new(format!(
+            "crane export failed{} (is the image a valid `docker save` / OCI archive?)",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        )));
     }
     if !tar_out.status.success() {
         return Err(StorageError::new(format!(
@@ -2309,11 +2326,13 @@ fn overlay_resolv_conf_contents() -> String {
         return "nameserver 127.0.0.1\n".to_string();
     }
 
-    if std::env::var(guest_env::BACKEND).as_deref() == Ok(guest_env::BACKEND_VIRTIO_NET) {
-        if let Ok(dns_server) = std::env::var(guest_env::DNS) {
-            if !dns_server.is_empty() {
-                return format!("nameserver {}\n", dns_server);
-            }
+    // A nameserver supplied by the host (SMOLVM_NETWORK_DNS) wins for either
+    // backend: under virtio-net it's the gateway address, and under TSI it's a
+    // custom resolver (--dns) the guest queries directly. Only fall back to
+    // public resolvers when the host didn't specify one.
+    if let Ok(dns_server) = std::env::var(guest_env::DNS) {
+        if !dns_server.is_empty() {
+            return format!("nameserver {}\n", dns_server);
         }
     }
 
@@ -3932,6 +3951,23 @@ mod tests {
         assert_eq!(overlay_resolv_conf_contents(), "nameserver 100.96.0.1\n");
 
         std::env::remove_var(guest_env::BACKEND);
+        std::env::remove_var(guest_env::DNS);
+    }
+
+    #[test]
+    fn overlay_resolv_conf_uses_custom_dns_under_tsi() {
+        // TSI sets SMOLVM_NETWORK_DNS without SMOLVM_NETWORK_BACKEND. The guest
+        // must honor the custom resolver (--dns) rather than the public default.
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::set_var(guest_env::DNS, "100.100.100.100");
+
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 100.100.100.100\n"
+        );
+
         std::env::remove_var(guest_env::DNS);
     }
 
