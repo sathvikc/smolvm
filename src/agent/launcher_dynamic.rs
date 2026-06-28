@@ -6,15 +6,28 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
-use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
+use crate::network::backend::TSI_FEATURE_HIJACK_INET;
+// Only used by the unix-only virtio-net path.
+#[cfg(unix)]
+use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
-use smolvm_network::{
-    start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
-    VirtioNetworkRuntime,
-};
+use smolvm_network::{GuestNetworkConfig, VirtioNetworkRuntime};
+// `VirtioPortMapping` is only used by the unix-only virtio-net path.
+#[cfg(unix)]
+use smolvm_network::PortMapping as VirtioPortMapping;
+// `start_virtio_network` is `#[cfg(unix)]` in smolvm-network; virtio-net
+// networking is unix-only, so the import is gated to match.
+#[cfg(unix)]
+use smolvm_network::start_virtio_network;
 use smolvm_protocol::{guest_env, ports};
 use std::ffi::CString;
+// `std::os::fd` does not exist on Windows. Keep the `RawFd` name working in
+// signatures on both platforms via a portable alias.
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(not(unix))]
+#[allow(dead_code)]
+type RawFd = std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 
 pub use super::krun::KrunFunctions;
@@ -80,7 +93,12 @@ pub fn launch_agent_vm_dynamic(
     // Raise file descriptor limits
     raise_fd_limits();
 
-    // Set library path so libkrun can find libkrunfw
+    // Set library path so libkrun can find libkrunfw. Only consumed by the
+    // macos/linux env-var blocks below, so unused on other targets (Windows).
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        allow(unused_variables)
+    )]
     let lib_dir = config
         .rootfs_path
         .parent()
@@ -168,24 +186,36 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
-    // Set root filesystem
+    // Set root filesystem via the root virtiofs tag (upstream removed
+    // krun_set_root in favor of krun_add_virtiofs with KRUN_FS_ROOT_TAG).
     let root = try_or_free_ctx!(
         path_to_cstring(config.rootfs_path),
         "rootfs path contains null byte"
     );
-    // SAFETY: ctx is valid, root.as_ptr() is a valid null-terminated C string
-    if unsafe { (krun.set_root)(ctx, root.as_ptr()) } < 0 {
-        free_ctx_on_err!("krun_set_root failed");
+    let root_tag = cstr("/dev/root");
+    // Default root with a 512 MB DAX window (matches the removed krun_set_root).
+    // Plain krun_add_virtiofs passes shm_size=0 (no DAX), dropping virtiofs to
+    // writeback caching so the guest's ready-marker write isn't visible to the
+    // host until the socket-probe grace — a multi-second boot-time regression.
+    let Some(add_virtiofs3) = krun.add_virtiofs3 else {
+        free_ctx_on_err!("root DAX requires libkrun with krun_add_virtiofs3");
+    };
+    // SAFETY: ctx is valid; root_tag/root are valid null-terminated C strings.
+    if unsafe { add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 1 << 29, false) } < 0 {
+        free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
     }
 
     let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
 
+    // `mut` is only needed on unix (the VirtioNet arm assigns it); on Windows
+    // that arm diverges, so the binding is never reassigned.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
-    let guest_network = match network_plan.backend {
+    // Explicit type: on Windows the VirtioNet arm diverges (`!`), so the
+    // element type can no longer be inferred from the arms alone.
+    let guest_network: Option<GuestNetworkConfig> = match network_plan.backend {
         EffectiveNetworkBackend::None => {
-            if unsafe { (krun.disable_implicit_vsock)(ctx) } < 0 {
-                free_ctx_on_err!("krun_disable_implicit_vsock failed");
-            }
+            // Upstream libkrun no longer creates an implicit vsock; add explicitly.
             if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
                 free_ctx_on_err!("krun_add_vsock failed");
             }
@@ -193,9 +223,6 @@ pub fn launch_agent_vm_dynamic(
             None
         }
         EffectiveNetworkBackend::Tsi => {
-            if unsafe { (krun.disable_implicit_vsock)(ctx) } < 0 {
-                free_ctx_on_err!("krun_disable_implicit_vsock failed");
-            }
             if unsafe { (krun.add_vsock)(ctx, TSI_FEATURE_HIJACK_INET) } < 0 {
                 free_ctx_on_err!("krun_add_vsock with TSI failed");
             }
@@ -251,53 +278,72 @@ pub fn launch_agent_vm_dynamic(
             None
         }
         EffectiveNetworkBackend::VirtioNet => {
-            let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
+            // virtio-net networking relies on unix socketpair fds and the
+            // unix-only `start_virtio_network`; it is unsupported on Windows.
+            #[cfg(not(unix))]
+            {
+                free_ctx_on_err!("virtio-net networking is not supported on Windows");
+            }
+            #[cfg(unix)]
+            {
+                let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                 "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi"
                     .to_string()
             })?;
-            let guest_network = GuestNetworkConfig::default();
-            let mut guest_mac = guest_network.guest_mac;
-            let (host_fd, guest_fd) =
-                create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
-            let port_mappings: Vec<VirtioPortMapping> = config
-                .port_mappings
-                .iter()
-                .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
-                .collect();
-            let egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
-                config.resources.allowed_cidrs.as_deref(),
-            );
 
-            let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings, egress)
-            {
-                Ok(runtime) => runtime,
-                Err(err) => {
+                // virtio-net carries guest networking, but the host-guest control
+                // channel still rides vsock. Upstream libkrun no longer creates an
+                // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
+                // owns the network path); otherwise krun_add_vsock_port2 below fails
+                // with ENODEV.
+                if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
+                    free_ctx_on_err!("krun_add_vsock failed");
+                }
+
+                let guest_network = GuestNetworkConfig::default();
+                let mut guest_mac = guest_network.guest_mac;
+                let (host_fd, guest_fd) =
+                    create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
+                let port_mappings: Vec<VirtioPortMapping> = config
+                    .port_mappings
+                    .iter()
+                    .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
+                    .collect();
+                let egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
+                    config.resources.allowed_cidrs.as_deref(),
+                );
+
+                let runtime =
+                    match start_virtio_network(host_fd, guest_network, &port_mappings, egress) {
+                        Ok(runtime) => runtime,
+                        Err(err) => {
+                            // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
+                            unsafe { libc::close(guest_fd) };
+                            return Err(format!("failed to start virtio network runtime: {err}"));
+                        }
+                    };
+
+                if unsafe {
+                    (add_net_unixstream)(
+                        ctx,
+                        std::ptr::null(),
+                        guest_fd,
+                        guest_mac.as_mut_ptr(),
+                        COMPAT_NET_FEATURES,
+                        0,
+                    )
+                } < 0
+                {
                     // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
                     unsafe { libc::close(guest_fd) };
-                    return Err(format!("failed to start virtio network runtime: {err}"));
+                    free_ctx_on_err!("krun_add_net_unixstream failed");
                 }
-            };
 
-            if unsafe {
-                (add_net_unixstream)(
-                    ctx,
-                    std::ptr::null(),
-                    guest_fd,
-                    guest_mac.as_mut_ptr(),
-                    COMPAT_NET_FEATURES,
-                    0,
-                )
-            } < 0
-            {
-                // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
-                unsafe { libc::close(guest_fd) };
-                free_ctx_on_err!("krun_add_net_unixstream failed");
+                virtio_network_runtime = Some(runtime);
+
+                tracing::info!("network backend: virtio-net");
+                Some(guest_network)
             }
-
-            virtio_network_runtime = Some(runtime);
-
-            tracing::info!("network backend: virtio-net");
-            Some(guest_network)
         }
     };
 
@@ -338,13 +384,10 @@ pub fn launch_agent_vm_dynamic(
 
     // Redirect console output to a log file so libkrun doesn't put the
     // inherited terminal into raw mode (which would break terminal echo
-    // if the child is killed before exit observers can restore it).
-    let console_path = try_or_free_ctx!(
-        path_to_cstring(&config.console_log),
-        "console log path contains null byte"
-    );
-    // SAFETY: ctx is valid, console_path is a valid null-terminated C string
-    if unsafe { (krun.set_console_output)(ctx, console_path.as_ptr()) } < 0 {
+    // if the child is killed before exit observers can restore it). Uses the
+    // upstream virtio-console API (krun_set_console_output was removed).
+    // SAFETY: ctx is a valid, not-yet-started libkrun context.
+    if unsafe { krun.console_output_to_file(ctx, &config.console_log) } < 0 {
         tracing::warn!("failed to set console output");
     }
 
@@ -471,6 +514,8 @@ fn path_to_cstring(path: &Path) -> Result<CString, String> {
         .map_err(|_| "path contains null byte".to_string())
 }
 
+// Unix-only: virtio-net is the sole caller and is itself unix-gated.
+#[cfg(unix)]
 fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
     // SAFETY: `socketpair` initializes both descriptors on success.
@@ -483,6 +528,9 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
 
 /// Raise file descriptor limits (required by libkrun).
 fn raise_fd_limits() {
+    // rlimit is a unix concept; no-op on Windows. The function stays callable
+    // on all platforms so its (unconditional) call sites need no gating.
+    #[cfg(unix)]
     unsafe {
         let mut limit = libc::rlimit {
             rlim_cur: 0,

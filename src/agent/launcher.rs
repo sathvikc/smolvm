@@ -8,18 +8,31 @@ use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
 use crate::data::disk::DiskFormat;
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
-use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
+use crate::network::backend::TSI_FEATURE_HIJACK_INET;
+// Only used by the unix-only virtio-net path.
+#[cfg(unix)]
+use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
-use smolvm_network::{
-    start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
-    VirtioNetworkRuntime,
-};
+use smolvm_network::{GuestNetworkConfig, VirtioNetworkRuntime};
+// `VirtioPortMapping` is only used by the unix-only virtio-net path.
+#[cfg(unix)]
+use smolvm_network::PortMapping as VirtioPortMapping;
+// `start_virtio_network` is `#[cfg(unix)]` in smolvm-network; virtio-net
+// networking is unix-only, so the import is gated to match.
+#[cfg(unix)]
+use smolvm_network::start_virtio_network;
 use smolvm_protocol::{guest_env, ports};
 use std::ffi::CString;
+// `std::os::fd` does not exist on Windows. Keep the `RawFd` name working in
+// signatures on both platforms via a portable alias.
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(not(unix))]
+#[allow(dead_code)]
+type RawFd = std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 
 use super::{KrunFunctions, PortMapping, VmResources};
@@ -31,10 +44,19 @@ const EGRESS_CIDR_CAP: usize = 512;
 
 /// Hidden benchmark knob for root virtiofs DAX.
 ///
-/// Default behavior uses `krun_set_root`, which configures the root virtiofs
-/// device with libkrun's default DAX window. Set `SMOLVM_ROOTFS_DAX=0` to use
-/// `krun_add_virtiofs3("/dev/root", ..., shm_size=0, read_only=false)` instead.
+/// Default configures the root virtiofs device with a 512 MB DAX window (the
+/// same default the removed `krun_set_root` used). Set `SMOLVM_ROOTFS_DAX=0` to
+/// use `krun_add_virtiofs3("/dev/root", ..., shm_size=0, read_only=false)`,
+/// disabling the root DAX region for benchmarking.
 const ENV_SMOLVM_ROOTFS_DAX: &str = "SMOLVM_ROOTFS_DAX";
+
+/// Root virtiofs DAX window (512 MB), matching the default the removed
+/// `krun_set_root` configured. DAX gives the host a coherent shared mapping of
+/// the root fs so the guest agent's ready-marker write is visible to the host
+/// immediately. Plain `krun_add_virtiofs` passes shm_size=0 (no DAX), dropping
+/// virtiofs to writeback caching — the marker isn't seen until the multi-second
+/// socket-probe grace, regressing boot time from ~hundreds of ms to ~5 s.
+const ROOTFS_DAX_WINDOW: u64 = 1 << 29;
 
 /// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
 type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
@@ -310,6 +332,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         };
     }
 
+    // `egress_telemetry` is consumed only by the unix-only virtio-net path.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let LaunchConfig {
         rootfs_path,
         disks,
@@ -362,17 +386,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_create_ctx = krun.create_ctx;
         let krun_free_ctx = krun.free_ctx;
         let krun_set_vm_config = krun.set_vm_config;
-        let krun_set_root = krun.set_root;
         let krun_set_workdir = krun.set_workdir;
         let krun_set_exec = krun.set_exec;
         let krun_add_disk2 = krun.add_disk2;
         let krun_add_vsock_port2 = krun.add_vsock_port2;
-        let krun_set_console_output = krun.set_console_output;
         let krun_set_port_map = krun.set_port_map;
         let krun_add_virtiofs = krun.add_virtiofs;
         let krun_add_virtiofs3 = krun.add_virtiofs3;
         let krun_start_enter = krun.start_enter;
-        let krun_disable_implicit_vsock = krun.disable_implicit_vsock;
         let krun_add_vsock = krun.add_vsock;
 
         // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
@@ -447,17 +468,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             };
         }
 
-        // Set root filesystem.
+        // Set root filesystem via the root virtiofs tag ("/dev/root").
         //
-        // Default path: krun_set_root, preserving libkrun's established rootfs
-        // behavior and DAX defaults. Benchmark path: SMOLVM_ROOTFS_DAX=0 uses
-        // krun_add_virtiofs3 with shm_size=0, disabling the root DAX region
+        // Upstream libkrun removed krun_set_root in favor of krun_add_virtiofs*
+        // with KRUN_FS_ROOT_TAG. Default path: krun_add_virtiofs, preserving the
+        // established rootfs DAX defaults. Benchmark path: SMOLVM_ROOTFS_DAX=0
+        // uses krun_add_virtiofs3 with shm_size=0, disabling the root DAX region
         // while keeping the root read-write.
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
             "set rootfs",
             "path contains null byte"
         );
+        let root_tag = cstr("/dev/root");
         if rootfs_dax_disabled() {
             let Some(add_virtiofs3) = krun_add_virtiofs3 else {
                 krun_free_ctx(ctx);
@@ -467,7 +490,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             };
 
-            let root_tag = cstr("/dev/root");
             if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 0, false) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
@@ -476,23 +498,46 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             }
             tracing::info!("rootfs configured via virtiofs without DAX");
-        } else if krun_set_root(ctx, root.as_ptr()) < 0 {
-            krun_free_ctx(ctx);
-            return Err(Error::agent("set rootfs", "krun_set_root failed"));
+        } else {
+            // Default: restore the 512 MB root DAX window the removed krun_set_root
+            // configured. Plain krun_add_virtiofs passes shm_size=0 (no DAX), which
+            // drops virtiofs to writeback caching and hides the guest's ready-marker
+            // write from the host until the socket-probe grace — a boot-time regression.
+            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "set rootfs",
+                    "root DAX requires libkrun with krun_add_virtiofs3",
+                ));
+            };
+            if add_virtiofs3(
+                ctx,
+                root_tag.as_ptr(),
+                root.as_ptr(),
+                ROOTFS_DAX_WINDOW,
+                false,
+            ) < 0
+            {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "set rootfs",
+                    "krun_add_virtiofs3 failed for root filesystem",
+                ));
+            }
         }
 
         let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
 
+        // `mut` is only needed on unix (the VirtioNet arm assigns it); on
+        // Windows that arm diverges, so the binding is never reassigned.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
-        let guest_network = match network_plan.backend {
+        // Explicit type: on Windows the VirtioNet arm diverges (`!`), so the
+        // element type can no longer be inferred from the arms alone.
+        let guest_network: Option<GuestNetworkConfig> = match network_plan.backend {
             EffectiveNetworkBackend::None => {
-                if krun_disable_implicit_vsock(ctx) < 0 {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "configure vsock",
-                        "krun_disable_implicit_vsock failed",
-                    ));
-                }
+                // Upstream libkrun no longer creates an implicit vsock (the old
+                // krun_disable_implicit_vsock is gone), so just add it explicitly.
                 if krun_add_vsock(ctx, 0) < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
@@ -502,13 +547,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 None
             }
             EffectiveNetworkBackend::Tsi => {
-                if krun_disable_implicit_vsock(ctx) < 0 {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "configure vsock",
-                        "krun_disable_implicit_vsock failed",
-                    ));
-                }
                 if krun_add_vsock(ctx, TSI_FEATURE_HIJACK_INET) < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
@@ -596,78 +634,101 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 None
             }
             EffectiveNetworkBackend::VirtioNet => {
-                let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
+                // virtio-net networking relies on unix socketpair fds and the
+                // unix-only `start_virtio_network`; it is unsupported on Windows.
+                #[cfg(not(unix))]
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "configure virtio-net",
+                        "virtio-net networking is not supported on Windows",
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                     Error::agent(
                         "configure virtio-net",
                         "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi",
                     )
                 })?;
-                let mut guest_network = GuestNetworkConfig::default();
-                // A custom resolver (--dns) becomes the gateway's upstream: the
-                // guest still points at the gateway (100.96.0.1), which forwards
-                // queries to this address instead of the default.
-                if let Some(dns) = resources.dns {
-                    guest_network.upstream_dns = dns;
-                }
-                let mut guest_mac = guest_network.guest_mac;
-                let (host_fd, guest_fd) = create_unix_stream_pair().map_err(|e| {
-                    Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
-                })?;
+                    // virtio-net carries guest networking, but the host-guest control
+                    // channel still rides vsock. Upstream libkrun no longer creates an
+                    // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
+                    // owns the network path); otherwise krun_add_vsock_port2 below fails
+                    // with ENODEV.
+                    if krun_add_vsock(ctx, 0) < 0 {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
+                    }
 
-                let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
-                    .iter()
-                    .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
-                    .collect();
-                let egress = smolvm_network::EgressPolicy::new(
-                    resources.allowed_cidrs.as_deref(),
-                    egress_refresh_hosts.as_deref(),
-                );
-                let runtime = match start_virtio_network(
-                    host_fd,
-                    guest_network,
-                    &virtio_port_mappings,
-                    egress,
-                ) {
-                    Ok(runtime) => runtime,
-                    Err(err) => {
+                    let mut guest_network = GuestNetworkConfig::default();
+                    // A custom resolver (--dns) becomes the gateway's upstream: the
+                    // guest still points at the gateway (100.96.0.1), which forwards
+                    // queries to this address instead of the default.
+                    if let Some(dns) = resources.dns {
+                        guest_network.upstream_dns = dns;
+                    }
+                    let mut guest_mac = guest_network.guest_mac;
+                    let (host_fd, guest_fd) = create_unix_stream_pair().map_err(|e| {
+                        Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
+                    })?;
+
+                    let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
+                        .iter()
+                        .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
+                        .collect();
+                    let egress = smolvm_network::EgressPolicy::new(
+                        resources.allowed_cidrs.as_deref(),
+                        egress_refresh_hosts.as_deref(),
+                    );
+                    let runtime = match start_virtio_network(
+                        host_fd,
+                        guest_network,
+                        &virtio_port_mappings,
+                        egress,
+                    ) {
+                        Ok(runtime) => runtime,
+                        Err(err) => {
+                            libc::close(guest_fd);
+                            krun_free_ctx(ctx);
+                            return Err(Error::agent(
+                                "configure virtio-net",
+                                format!("failed to start virtio network runtime: {err}"),
+                            ));
+                        }
+                    };
+
+                    if add_net_unixstream(
+                        ctx,
+                        std::ptr::null(),
+                        guest_fd,
+                        guest_mac.as_mut_ptr(),
+                        COMPAT_NET_FEATURES,
+                        0,
+                    ) < 0
+                    {
                         libc::close(guest_fd);
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "configure virtio-net",
-                            format!("failed to start virtio network runtime: {err}"),
+                            "krun_add_net_unixstream failed",
                         ));
                     }
-                };
 
-                if add_net_unixstream(
-                    ctx,
-                    std::ptr::null(),
-                    guest_fd,
-                    guest_mac.as_mut_ptr(),
-                    COMPAT_NET_FEATURES,
-                    0,
-                ) < 0
-                {
-                    libc::close(guest_fd);
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "configure virtio-net",
-                        "krun_add_net_unixstream failed",
-                    ));
+                    // Flush this NIC's egress counter to the per-VM dir so serve can
+                    // bill it (parity with how disk size reaches the node API).
+                    if let Some(path) = egress_telemetry {
+                        crate::agent::manager::spawn_egress_flush(
+                            path.to_path_buf(),
+                            runtime.egress_counter(),
+                        );
+                    }
+                    virtio_network_runtime = Some(runtime);
+
+                    tracing::info!("network backend: virtio-net");
+                    Some(guest_network)
                 }
-
-                // Flush this NIC's egress counter to the per-VM dir so serve can
-                // bill it (parity with how disk size reaches the node API).
-                if let Some(path) = egress_telemetry {
-                    crate::agent::manager::spawn_egress_flush(
-                        path.to_path_buf(),
-                        runtime.egress_counter(),
-                    );
-                }
-                virtio_network_runtime = Some(runtime);
-
-                tracing::info!("network backend: virtio-net");
-                Some(guest_network)
             }
         };
 
@@ -799,14 +860,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Set console output if specified
+        // Redirect console output to a file if specified, via the upstream
+        // virtio-console API (krun_set_console_output was removed).
         if let Some(log_path) = console_log {
-            let console_path = try_or_free_ctx!(
-                path_to_cstring(log_path),
-                "set console output",
-                "path contains null byte"
-            );
-            if krun_set_console_output(ctx, console_path.as_ptr()) < 0 {
+            if krun.console_output_to_file(ctx, log_path) < 0 {
                 tracing::warn!("failed to set console output");
             }
         }
@@ -945,6 +1002,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             cstr("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
             cstr("TERM=xterm-256color"),
         ];
+
+        // Host wall-clock at launch, so the agent can seed the guest clock on
+        // hypervisors without a guest-readable paravirt clock (WHP/Windows). The
+        // agent ignores it unless its own clock looks obviously wrong.
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::HOST_TIME_NS,
+                now.as_nanos()
+            )));
+        }
 
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
@@ -1141,6 +1209,8 @@ fn rootfs_dax_disabled() -> bool {
         .unwrap_or(false)
 }
 
+// Unix-only: virtio-net is the sole caller and is itself unix-gated.
+#[cfg(unix)]
 fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
     // SAFETY: `socketpair` initializes both descriptors on success.
@@ -1219,6 +1289,9 @@ fn resolve_host_subprocess(host: &str) -> std::result::Result<Vec<String>, Strin
 
 /// Raise file descriptor limits (required by libkrun).
 fn raise_fd_limits() {
+    // rlimit is a unix concept; no-op on Windows. The function stays callable
+    // on all platforms so its (unconditional) call sites need no gating.
+    #[cfg(unix)]
     unsafe {
         let mut limit = libc::rlimit {
             rlim_cur: 0,

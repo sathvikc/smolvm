@@ -54,6 +54,19 @@ pub struct ApiState {
     /// Previous CPU samples per VM PID, used to compute the fractional-CPU
     /// rate as a delta over wall time. Pruned on each sample to drop dead PIDs.
     cpu_samples: parking_lot::Mutex<HashMap<i32, CpuSample>>,
+    /// Monotonic base for the runtime-liveness heartbeat. All heartbeat values
+    /// are millis elapsed since this instant, so they're a single lock-free
+    /// `AtomicU64` instead of a mutex-guarded `Instant`.
+    started_at: std::time::Instant,
+    /// Milliseconds (since `started_at`) of the supervisor's last tick. The
+    /// supervisor bumps this every `CHECK_INTERVAL` from the main runtime, so a
+    /// stale value means the main runtime's timer wheel stopped being driven
+    /// (a reactor stall) or the supervisor task itself wedged. The loopback
+    /// `/capacity` listener — which runs on its OWN runtime and so keeps
+    /// answering even when the main runtime is stuck — reads this to report the
+    /// node as unschedulable (HTTP 503) the moment the main runtime stops
+    /// making progress, turning a silent wedge into a fast, honest drain signal.
+    runtime_heartbeat_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Internal machine entry with manager and configuration.
@@ -191,6 +204,8 @@ impl ApiState {
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
+            started_at: std::time::Instant::now(),
+            runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -204,7 +219,48 @@ impl ApiState {
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
+            started_at: std::time::Instant::now(),
+            runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// How long the main runtime may go without a supervisor heartbeat before
+    /// the loopback `/capacity` door reports the node as stalled. Defaults to
+    /// 4× the supervisor's 5s tick (`SMOLVM_RUNTIME_STALE_SECS` overrides), so
+    /// a few slow ticks never flap the node but a genuine reactor wedge drains
+    /// it within ~20s + the node-agent's own cordon grace.
+    fn runtime_stale_after_ms() -> u64 {
+        std::env::var("SMOLVM_RUNTIME_STALE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .map(|s| s * 1000)
+            .unwrap_or(20_000)
+    }
+
+    /// Record that the main runtime is making progress. Called from the
+    /// supervisor's tick — a value only advances if the runtime's timer wheel
+    /// fired the tick, so it is a true liveness signal for the main reactor.
+    pub fn beat_runtime_heartbeat(&self) {
+        let elapsed = self.started_at.elapsed().as_millis() as u64;
+        self.runtime_heartbeat_ms
+            .store(elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the main runtime has gone too long without a heartbeat — i.e. the
+    /// supervisor tick stopped firing, which on a multi-thread runtime means the
+    /// IO/timer driver is no longer being driven. Read from the loopback door's
+    /// dedicated runtime so it stays accurate even when the main runtime is
+    /// wedged. The window before the first heartbeat is treated as healthy
+    /// (startup), since `elapsed - 0 = elapsed` only crosses the threshold once
+    /// the runtime has actually been up longer than the stall window without a
+    /// single supervisor tick — which is itself a real stall.
+    pub fn runtime_stalled(&self) -> bool {
+        let now = self.started_at.elapsed().as_millis() as u64;
+        let last = self
+            .runtime_heartbeat_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        now.saturating_sub(last) > Self::runtime_stale_after_ms()
     }
 
     /// Load existing machines from persistent database.
@@ -734,8 +790,52 @@ impl ApiState {
     }
 
     /// Get the underlying database handle.
+    ///
+    /// Prefer the async helpers below (`lookup_vm`/`list_vm_records`/`update_vm`)
+    /// from async request handlers: `SmolvmDb`'s methods are synchronous SQLite
+    /// I/O, and calling them directly on the tokio reactor lets a stalled write
+    /// (under create/delete churn) park the worker pool and wedge the liveness
+    /// probes. The helpers run the I/O on the blocking pool. `db()` itself is for
+    /// synchronous contexts (CLI, embedded runtime, inside an existing
+    /// `spawn_blocking`). See `tests/reactor_wedge.rs`.
     pub fn db(&self) -> &SmolvmDb {
         &self.db
+    }
+
+    /// Off-reactor VM lookup. Runs the blocking SQLite read on the blocking pool.
+    pub async fn lookup_vm(&self, name: &str) -> Result<Option<VmRecord>, ApiError> {
+        let db = self.db.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || db.get_vm(&name))
+            .await
+            .map_err(|e| ApiError::internal(format!("db lookup_vm task join: {e}")))?
+            .map_err(ApiError::database)
+    }
+
+    /// Off-reactor full VM listing. Runs the blocking SQLite scan on the blocking
+    /// pool (reads use the connection-pool, so this never serializes behind a write).
+    pub async fn list_vm_records(&self) -> Result<Vec<(String, VmRecord)>, ApiError> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.list_vms())
+            .await
+            .map_err(|e| ApiError::internal(format!("db list_vm_records task join: {e}")))?
+            .map_err(ApiError::database)
+    }
+
+    /// Off-reactor read-modify-write of a VM record. Runs the synchronous
+    /// transaction on the blocking pool so the write — which holds the single
+    /// writer connection and may wait out `busy_timeout` under contention — never
+    /// parks a reactor worker thread.
+    pub async fn update_vm<F>(&self, name: &str, f: F) -> Result<Option<VmRecord>, ApiError>
+    where
+        F: FnOnce(&mut VmRecord) + Send + 'static,
+    {
+        let db = self.db.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || db.update_vm(&name, f))
+            .await
+            .map_err(|e| ApiError::internal(format!("db update_vm task join: {e}")))?
+            .map_err(ApiError::database)
     }
 
     /// Insert a machine entry directly into the in-memory registry.
@@ -833,8 +933,17 @@ impl ApiState {
     /// reuse, and covers orphan processes not tracked in-memory.
     pub fn is_machine_alive(&self, name: &str) -> bool {
         if let Some(entry) = self.machines.read().get(name) {
-            let entry = entry.lock();
-            entry.manager.is_process_alive()
+            // This runs on the supervisor's heartbeat path, so it must never
+            // block. A `MachineEntry` whose lock is currently held is, by
+            // definition, actively in use (mid agent I/O) — i.e. alive — so we
+            // treat lock contention as "alive" rather than parking the
+            // supervisor on it. Blocking here behind a single busy/stuck
+            // machine would stall the runtime heartbeat and mark the entire
+            // node unschedulable.
+            match entry.try_lock() {
+                Some(entry) => entry.manager.is_process_alive(),
+                None => true,
+            }
         } else {
             false
         }
@@ -856,11 +965,22 @@ where
 {
     let entry_clone = entry.clone();
     tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mut client = entry.manager.connect()?;
-        if let Some(tid) = trace_id {
-            client.set_trace_id(tid);
-        }
+        // Acquire a connected client under the per-machine lock, then RELEASE
+        // the lock before running the (potentially long, unbounded-blocking)
+        // agent operation. `connect()` returns an owned `AgentClient` over its
+        // own socket, so `op` needs no lock once connected. Holding the
+        // `MachineEntry` lock across blocking agent I/O lets a hung guest agent
+        // pin the lock indefinitely, which blocks the supervisor's liveness
+        // probe (`is_machine_alive`) and stalls the whole runtime heartbeat —
+        // marking the node unschedulable behind a single stuck exec.
+        let mut client = {
+            let entry = entry_clone.lock();
+            let mut client = entry.manager.connect()?;
+            if let Some(tid) = trace_id {
+                client.set_trace_id(tid);
+            }
+            client
+        };
         op(&mut client)
     })
     .await?
@@ -1272,6 +1392,65 @@ mod tests {
             state.remove_machine("remove-test-m1"),
             Err(ApiError::NotFound(_))
         ));
+    }
+
+    // REGRESSION (runtime-wedge): the supervisor's liveness probe must NEVER
+    // block on the per-machine `MachineEntry` lock. A machine that is mid
+    // agent-I/O (e.g. a stuck exec) holds that lock; if `is_machine_alive`
+    // blocked on it, one wedged machine would stall the supervisor heartbeat
+    // and mark the whole node unschedulable (the 503/black-hole wedge observed
+    // under concurrent boots). With the entry lock held, `is_machine_alive`
+    // must return promptly, reporting the in-use machine as alive.
+    #[test]
+    fn is_machine_alive_does_not_block_when_entry_locked() {
+        use std::time::Duration;
+
+        let (_dir, state) = temp_api_state();
+        let record = VmRecord::new("busy-m1".into(), 1, 512, vec![], vec![], false);
+        state.db.insert_vm("busy-m1", &record).unwrap();
+        let manager = AgentManager::for_vm("busy-m1").unwrap();
+        state.insert_machine(
+            "busy-m1",
+            MachineEntry {
+                manager,
+                mounts: vec![],
+                ports: vec![],
+                resources: ResourceSpec {
+                    cpus: None,
+                    memory_mb: None,
+                    network: None,
+                    gpu: None,
+                    storage_gb: None,
+                    overlay_gb: None,
+                    allowed_cidrs: None,
+                    network_backend: None,
+                },
+                restart: RestartConfig::default(),
+                network: false,
+                secret_refs: Default::default(),
+                source_smolmachine: None,
+            },
+        );
+
+        // Hold the entry lock to simulate an in-flight agent op pinning it.
+        let entry = state.get_machine("busy-m1").unwrap();
+        let held = entry.lock();
+
+        // The probe must finish without waiting on the held lock. If it blocked,
+        // the scoped thread would still be running after the grace period.
+        std::thread::scope(|s| {
+            let h = s.spawn(|| state.is_machine_alive("busy-m1"));
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                h.is_finished(),
+                "is_machine_alive blocked on a held MachineEntry lock — would stall the supervisor"
+            );
+            assert!(
+                h.join().unwrap(),
+                "a locked (actively in-use) machine must read as alive"
+            );
+        });
+        drop(held);
     }
 
     // ========================================================================
