@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-network"
-version = "1.2.5"
+version = "1.3.0"
 edition = "2021"
 description = "Host-side virtio-net runtime for smolvm"
 license = "Apache-2.0"
@@ -27,11 +27,6 @@ smoltcp = { version = "0.13", default-features = false, features = [
 ] }
 socket2 = "0.6"
 tracing = { workspace = true }
-
-# The libkrun virtio-net bridge speaks over a Unix-domain stream socket and uses
-# raw `setsockopt`/`fcntl`; those primitives only exist on Unix hosts.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [features]
 # Exposes fuzz-only entrypoints (e.g. fuzz_classify_guest_frame). Never enabled in normal builds.

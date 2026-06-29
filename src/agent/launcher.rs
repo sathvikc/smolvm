@@ -8,24 +8,22 @@ use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
 use crate::data::disk::DiskFormat;
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
-use crate::network::backend::TSI_FEATURE_HIJACK_INET;
-// Only used by the unix-only virtio-net path.
-#[cfg(unix)]
 use crate::network::backend::COMPAT_NET_FEATURES;
+use crate::network::backend::TSI_FEATURE_HIJACK_INET;
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
-use smolvm_network::{GuestNetworkConfig, VirtioNetworkRuntime};
-// `VirtioPortMapping` is only used by the unix-only virtio-net path.
-#[cfg(unix)]
+use crate::agent::vsock_service;
 use smolvm_network::PortMapping as VirtioPortMapping;
-// `start_virtio_network` is `#[cfg(unix)]` in smolvm-network; virtio-net
-// networking is unix-only, so the import is gated to match.
-#[cfg(unix)]
-use smolvm_network::start_virtio_network;
+use smolvm_network::{start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
 use smolvm_protocol::{guest_env, ports};
+use socket2::Socket;
+#[cfg(windows)]
+use socket2::{Domain, SockAddr, Type};
 use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 // `std::os::fd` does not exist on Windows. Keep the `RawFd` name working in
 // signatures on both platforms via a portable alias.
 #[cfg(unix)]
@@ -96,6 +94,11 @@ pub fn find_lib_dir() -> Option<PathBuf> {
 
     let candidates = [
         exe_dir.join("lib"),
+        // The Windows release ships krun.dll / libkrunfw.dll directly beside
+        // smolvm.exe (no lib/ subdir, no wrapper to set SMOLVM_LIB_DIR), matching
+        // the convention that Windows resolves DLLs from the executable's own
+        // directory. Harmless on Unix dists, where the libs live in lib/.
+        exe_dir.to_path_buf(),
         exe_dir.join("../lib"),
         exe_dir.join("../../lib"),
         exe_dir.join(format!("../../lib/linux-{}", std::env::consts::ARCH)),
@@ -183,6 +186,12 @@ pub struct LaunchFeatures {
     /// When set, the launcher mounts this directory via virtiofs so the agent
     /// can use pre-extracted layers instead of pulling from a registry.
     pub packed_layers_dir: Option<std::path::PathBuf>,
+    /// Root-owned shared pack copy (`_shared/<checksum>`) to present at
+    /// `packed_layers_dir` via a per-VM idmapped bind mount. Set by
+    /// [`with_packed_layers`](LaunchFeatures::with_packed_layers) when create
+    /// wrote a shared pointer; the manager keeps it only when the per-VM uid drop
+    /// is active (else it collapses `packed_layers_dir` onto the shared copy).
+    pub pack_idmap_source: Option<std::path::PathBuf>,
     /// Additional disk images to attach to the VM (path, read_only, format).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
     pub extra_disks: Vec<(std::path::PathBuf, bool, DiskFormat)>,
@@ -234,6 +243,19 @@ impl LaunchFeatures {
         let Some(sidecar_path) = source_smolmachine else {
             return Ok(self);
         };
+
+        // Shared pack store: if create extracted the pack into the node's shared
+        // content-addressed store and dropped a pointer beside this machine, the
+        // per-machine `pack` dir is an empty mountpoint. Point `packed_layers_dir`
+        // at it and carry the shared copy as the idmap source; the manager keeps
+        // the idmap only when the per-VM uid drop is active (else it collapses
+        // `packed_layers_dir` onto the shared copy directly). No lease — the
+        // shared copy is never the macOS case-sensitive volume (Linux-only path).
+        if let Some(shared) = super::read_shared_pack_pointer(layers_cache_dir) {
+            self.packed_layers_dir = Some(layers_cache_dir.to_path_buf());
+            self.pack_idmap_source = Some(shared);
+            return Ok(self);
+        }
 
         if !smolvm_pack::extract::is_extracted(layers_cache_dir) {
             // Fallback: layers not yet extracted into this machine's own dir
@@ -529,11 +551,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
 
         // `mut` is only needed on unix (the VirtioNet arm assigns it); on
-        // Windows that arm diverges, so the binding is never reassigned.
+        // Windows the runtime is owned by the accept thread, so the launcher's
+        // binding stays `None`.
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
-        // Explicit type: on Windows the VirtioNet arm diverges (`!`), so the
-        // element type can no longer be inferred from the arms alone.
         let guest_network: Option<GuestNetworkConfig> = match network_plan.backend {
             EffectiveNetworkBackend::None => {
                 // Upstream libkrun no longer creates an implicit vsock (the old
@@ -634,56 +655,57 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 None
             }
             EffectiveNetworkBackend::VirtioNet => {
-                // virtio-net networking relies on unix socketpair fds and the
-                // unix-only `start_virtio_network`; it is unsupported on Windows.
-                #[cfg(not(unix))]
-                {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "configure virtio-net",
-                        "virtio-net networking is not supported on Windows",
-                    ));
-                }
-                #[cfg(unix)]
-                {
-                    let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
+                let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                     Error::agent(
                         "configure virtio-net",
                         "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi",
                     )
                 })?;
-                    // virtio-net carries guest networking, but the host-guest control
-                    // channel still rides vsock. Upstream libkrun no longer creates an
-                    // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
-                    // owns the network path); otherwise krun_add_vsock_port2 below fails
-                    // with ENODEV.
-                    if krun_add_vsock(ctx, 0) < 0 {
-                        krun_free_ctx(ctx);
-                        return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
-                    }
+                // virtio-net carries guest networking, but the host-guest control
+                // channel still rides vsock. Upstream libkrun no longer creates an
+                // implicit vsock, so add it explicitly (no TSI hijacking — virtio-net
+                // owns the network path); otherwise krun_add_vsock_port2 below fails
+                // with ENODEV.
+                if krun_add_vsock(ctx, 0) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
+                }
 
-                    let mut guest_network = GuestNetworkConfig::default();
-                    // A custom resolver (--dns) becomes the gateway's upstream: the
-                    // guest still points at the gateway (100.96.0.1), which forwards
-                    // queries to this address instead of the default.
-                    if let Some(dns) = resources.dns {
-                        guest_network.upstream_dns = dns;
-                    }
-                    let mut guest_mac = guest_network.guest_mac;
+                let mut guest_network = GuestNetworkConfig::default();
+                // A custom resolver (--dns) becomes the gateway's upstream: the
+                // guest still points at the gateway (100.96.0.1), which forwards
+                // queries to this address instead of the default.
+                if let Some(dns) = resources.dns {
+                    guest_network.upstream_dns = dns;
+                }
+                let mut guest_mac = guest_network.guest_mac;
+
+                let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
+                    .iter()
+                    .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
+                    .collect();
+                let egress = smolvm_network::EgressPolicy::new(
+                    resources.allowed_cidrs.as_deref(),
+                    egress_refresh_hosts.as_deref(),
+                );
+                let egress_path = egress_telemetry.map(|p| p.to_path_buf());
+
+                // The host and guest ends of the virtio-net channel are an AF_UNIX
+                // stream. On Unix we hand libkrun one end of a socketpair fd and run
+                // the gateway on the other immediately. Windows has no socketpair
+                // for AF_UNIX, so we bind a listener on a per-VM path, hand libkrun
+                // the path, and accept its connection (made when the VM boots inside
+                // the blocking `krun_start_enter`) on a background thread.
+                #[cfg(unix)]
+                {
                     let (host_fd, guest_fd) = create_unix_stream_pair().map_err(|e| {
                         Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
                     })?;
-
-                    let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
-                        .iter()
-                        .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
-                        .collect();
-                    let egress = smolvm_network::EgressPolicy::new(
-                        resources.allowed_cidrs.as_deref(),
-                        egress_refresh_hosts.as_deref(),
-                    );
+                    // SAFETY: ownership of the host-side socketpair fd transfers
+                    // here (already inside the function's outer `unsafe` block).
+                    let host_stream = Socket::from_raw_fd(host_fd);
                     let runtime = match start_virtio_network(
-                        host_fd,
+                        host_stream,
                         guest_network,
                         &virtio_port_mappings,
                         egress,
@@ -718,17 +740,85 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
                     // Flush this NIC's egress counter to the per-VM dir so serve can
                     // bill it (parity with how disk size reaches the node API).
-                    if let Some(path) = egress_telemetry {
-                        crate::agent::manager::spawn_egress_flush(
-                            path.to_path_buf(),
-                            runtime.egress_counter(),
-                        );
+                    if let Some(path) = egress_path {
+                        crate::agent::manager::spawn_egress_flush(path, runtime.egress_counter());
                     }
                     virtio_network_runtime = Some(runtime);
-
-                    tracing::info!("network backend: virtio-net");
-                    Some(guest_network)
                 }
+                #[cfg(windows)]
+                {
+                    // Per-VM AF_UNIX path for the net channel, a sibling of the
+                    // agent-control vsock socket (already a working AF_UNIX path).
+                    let net_sock_path = vsock_socket.with_extension("net");
+                    let listener = bind_unix_listener(&net_sock_path).map_err(|e| {
+                        krun_free_ctx(ctx);
+                        Error::agent(
+                            "configure virtio-net",
+                            format!("failed to bind virtio-net socket: {e}"),
+                        )
+                    })?;
+                    let path_c = try_or_free_ctx!(
+                        path_to_cstring(&net_sock_path),
+                        "configure virtio-net",
+                        "virtio-net socket path contains null byte"
+                    );
+                    if add_net_unixstream(
+                        ctx,
+                        path_c.as_ptr(),
+                        -1,
+                        guest_mac.as_mut_ptr(),
+                        COMPAT_NET_FEATURES,
+                        0,
+                    ) < 0
+                    {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure virtio-net",
+                            "krun_add_net_unixstream failed",
+                        ));
+                    }
+
+                    // libkrun connects to the path while the VM boots inside the
+                    // blocking krun_start_enter, so accept on a background thread.
+                    // The accepted runtime owns its worker threads and parks here
+                    // until libkrun closes the stream (VM exit) for a clean teardown.
+                    let spawn = std::thread::Builder::new()
+                        .name("smolvm-net-accept".into())
+                        .spawn(move || match listener.accept() {
+                            Ok((sock, _)) => match start_virtio_network(
+                                sock,
+                                guest_network,
+                                &virtio_port_mappings,
+                                egress,
+                            ) {
+                                Ok(runtime) => {
+                                    if let Some(path) = egress_path {
+                                        crate::agent::manager::spawn_egress_flush(
+                                            path,
+                                            runtime.egress_counter(),
+                                        );
+                                    }
+                                    runtime.block_until_shutdown();
+                                }
+                                Err(err) => {
+                                    tracing::error!(error = %err, "virtio-net runtime failed to start");
+                                }
+                            },
+                            Err(err) => {
+                                tracing::warn!(error = %err, "virtio-net accept failed");
+                            }
+                        });
+                    if let Err(e) = spawn {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure virtio-net",
+                            format!("failed to spawn virtio-net accept thread: {e}"),
+                        ));
+                    }
+                }
+
+                tracing::info!("network backend: virtio-net");
+                Some(guest_network)
             }
         };
 
@@ -827,36 +917,41 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             ));
         }
 
-        // Add vsock port for SSH agent forwarding (optional)
-        if let Some(ssh_socket) = ssh_agent_socket {
-            let ssh_path = try_or_free_ctx!(
-                path_to_cstring(ssh_socket),
-                "add ssh agent vsock port",
+        // Guest↔host vsock services (SSH agent, DNS filter, CUDA, …). The set
+        // and its wiring live in `vsock_service`; here we just register the
+        // port for each one enabled for this launch. Adding a capability needs
+        // no new control flow in this function. The `active_vsock` set is reused
+        // below to inject each service's guest-side activation env vars, so the
+        // host and guest sides cannot drift.
+        let vsock_inputs = vsock_service::VsockServiceInputs {
+            ssh_agent_socket: ssh_agent_socket.as_deref(),
+            dns_filter_socket: dns_filter_socket.as_deref(),
+        };
+        let active_vsock: Vec<_> = vsock_service::registry()
+            .iter()
+            .filter_map(|svc| svc.resolve(&vsock_inputs))
+            .collect();
+        for svc in &active_vsock {
+            // An egress port must never shadow the required control channel.
+            debug_assert_ne!(
+                svc.port,
+                ports::AGENT_CONTROL,
+                "{} would shadow the agent control channel",
+                svc.name
+            );
+            let sock_path = try_or_free_ctx!(
+                path_to_cstring(svc.socket),
+                "add vsock port",
                 "path contains null byte"
             );
-            // listen=false: guest connects out to this port, host receives via Unix socket
-            if krun_add_vsock_port2(ctx, ports::SSH_AGENT, ssh_path.as_ptr(), false) < 0 {
-                tracing::warn!("failed to add SSH agent vsock port — SSH forwarding disabled");
-            } else {
-                tracing::info!(
-                    "SSH agent forwarding enabled on vsock port {}",
-                    ports::SSH_AGENT
+            if krun_add_vsock_port2(ctx, svc.port, sock_path.as_ptr(), svc.listen) < 0 {
+                tracing::warn!(
+                    "failed to add {} vsock port {} — disabled",
+                    svc.name,
+                    svc.port
                 );
-            }
-        }
-
-        // Add vsock port for DNS filter proxy (optional)
-        if let Some(dns_socket) = dns_filter_socket {
-            let dns_path = try_or_free_ctx!(
-                path_to_cstring(dns_socket),
-                "add dns filter vsock port",
-                "path contains null byte"
-            );
-            // listen=false: guest connects out to this port, host listens via Unix socket
-            if krun_add_vsock_port2(ctx, ports::DNS_FILTER, dns_path.as_ptr(), false) < 0 {
-                tracing::warn!("failed to add DNS filter vsock port — DNS filtering disabled");
             } else {
-                tracing::info!("DNS filtering enabled on vsock port {}", ports::DNS_FILTER);
+                tracing::info!("{} enabled on vsock port {}", svc.name, svc.port);
             }
         }
 
@@ -1038,9 +1133,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Tell the agent to start SSH agent forwarding bridge
-        if ssh_agent_socket.is_some() {
-            env_strings.push(cstr("SMOLVM_SSH_AGENT=1"));
+        // Activate the guest side of each enabled vsock service (e.g. tell the
+        // agent to start the SSH agent bridge). The env pairs come from the same
+        // registry that wired the ports above, so the two sides cannot diverge.
+        for svc in &active_vsock {
+            for (key, value) in svc.guest_env {
+                env_strings.push(cstr(&format!("{key}={value}")));
+            }
         }
 
         // Tell the agent GPU was requested so it can sanity-check the
@@ -1067,9 +1166,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // egress policy above). The guest-side DNS proxy is intentionally NOT
         // started: the guest keeps its default resolv.conf (1.1.1.1/8.8.8.8) so
         // its UDP DNS queries leave as real datagrams and are intercepted at the
-        // TSI layer. `dns_filter_socket` is retained for now but unused on the
-        // guest path.
-        let _ = &dns_filter_socket;
+        // TSI layer. The DNS-filter vsock port is still registered (above, via
+        // the service registry) for the host-side proxy.
 
         // Guest-network env vars — virtio-net interface config plus the TSI
         // `--dns` override — are built in one shared place so the static and
@@ -1219,6 +1317,19 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
         return Err(std::io::Error::last_os_error());
     }
     Ok((fds[0], fds[1]))
+}
+
+// Windows has no AF_UNIX `socketpair`, so the virtio-net host end binds a
+// listener on a per-VM path and accepts the connection libkrun makes to it.
+#[cfg(windows)]
+pub(crate) fn bind_unix_listener(path: &Path) -> std::io::Result<Socket> {
+    // A leftover socket file from a previous run would make bind fail with
+    // EADDRINUSE, so clear it first (ignore "not found").
+    let _ = std::fs::remove_file(path);
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    listener.bind(&SockAddr::unix(path)?)?;
+    listener.listen(1)?;
+    Ok(listener)
 }
 
 fn select_network_plan(

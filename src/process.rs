@@ -131,8 +131,55 @@ mod win {
         if ok == 0 {
             None
         } else {
-            Some(((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64))
+            Some(filetime_to_u64(&creation))
         }
+    }
+
+    /// Combine a FILETIME's high/low halves into a single u64 (100 ns ticks).
+    fn filetime_to_u64(ft: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
+        ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+    }
+
+    /// Sample cumulative CPU time (ns) and resident set size (bytes) for a
+    /// process. Mirrors the Linux `/proc/<pid>/{stat,statm}` and macOS
+    /// `proc_pidinfo` sampling so `machine monitor` reports live CPU/RSS on
+    /// Windows too. Returns `None` if the process is gone or stats are
+    /// unavailable.
+    pub fn process_stats(pid: u32) -> Option<(u64, u64)> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+        let handle = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: handle is live for the call; all four FILETIME out-params are
+        // valid, writable locals.
+        let times_ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+
+        let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        let pmc_size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        pmc.cb = pmc_size;
+        // SAFETY: handle is live; pmc is a valid, correctly-sized counters buffer.
+        let mem_ok = unsafe { GetProcessMemoryInfo(handle, &mut pmc, pmc_size) };
+
+        unsafe { CloseHandle(handle) };
+        if times_ok == 0 || mem_ok == 0 {
+            return None;
+        }
+
+        // GetProcessTimes' kernel/user are 100 ns ticks; sum and scale to ns.
+        let cpu_time_ns = filetime_to_u64(&kernel)
+            .saturating_add(filetime_to_u64(&user))
+            .saturating_mul(100);
+        Some((cpu_time_ns, pmc.WorkingSetSize as u64))
     }
 }
 
@@ -512,6 +559,10 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         // epoll / poll event loops (virtio, vsock/TSI)
         libc::SYS_epoll_create1, libc::SYS_epoll_ctl,
         libc::SYS_epoll_pwait, libc::SYS_ppoll,
+        // timerfd — the virtio-net host network stack's event loop arms timers
+        // (TCP retransmit/poll) via timerfd; without these the VMM is SIGSYS-killed
+        // at start as soon as a published port enables virtio-net.
+        libc::SYS_timerfd_create, libc::SYS_timerfd_settime, libc::SYS_timerfd_gettime,
         // sockets (vsock/TSI data path, host networking)
         libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind,
         libc::SYS_listen, libc::SYS_accept, libc::SYS_sendto, libc::SYS_recvfrom,
@@ -1081,6 +1132,215 @@ pub fn chown_tree(_path: &std::path::Path, _uid: u32, _gid: u32) -> std::io::Res
     Ok(())
 }
 
+/// Build a user namespace whose single-entry uid/gid maps make on-disk id 0
+/// appear as `(uid, gid)` *through an idmapped mount*, and return an fd to its
+/// `/proc/<pid>/ns/user` (the open fd keeps the namespace alive after the helper
+/// process exits).
+///
+/// Mechanics (validated against kernels 6.17/6.18): fork a helper that
+/// `unshare(CLONE_NEWUSER)`s and blocks; the parent (still privileged) writes the
+/// child's `uid_map`/`gid_map`. A map line is `<nsid> <hostid> <count>`, and an
+/// idmapped mount treats the ON-DISK id as an nsid and maps it DOWN to a host
+/// kuid — so to surface on-disk 0 as host `uid` we write `0 <uid> 1` (NOT
+/// `<uid> 0 1`, which surfaces the overflow uid and denies every read). The
+/// parent MUST wait until the child is inside the new userns before writing the
+/// maps (a two-pipe handshake), or the write races the `unshare` and fails EPERM.
+/// `setgroups` is denied before `gid_map` (required to write a gid map).
+#[cfg(target_os = "linux")]
+fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
+    let errno = || std::io::Error::last_os_error();
+    // ready: child -> parent (userns created); go: parent -> child (maps written).
+    let mut ready = [-1i32; 2];
+    let mut go = [-1i32; 2];
+    if unsafe { libc::pipe(ready.as_mut_ptr()) } != 0 {
+        return Err(errno());
+    }
+    if unsafe { libc::pipe(go.as_mut_ptr()) } != 0 {
+        let e = errno();
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(ready[1]);
+        }
+        return Err(e);
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let e = errno();
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(ready[1]);
+            libc::close(go[0]);
+            libc::close(go[1]);
+        }
+        return Err(e);
+    }
+    if pid == 0 {
+        // CHILD: async-signal-safe calls only (post-fork in a possibly threaded
+        // process). Become a fresh userns, signal the parent, block until the maps
+        // are written, then exit — the parent's open ns fd keeps the userns alive.
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+        let sig: [u8; 1] = [b'r'];
+        unsafe {
+            libc::write(ready[1], sig.as_ptr() as *const libc::c_void, 1);
+        }
+        let mut got = 0u8;
+        unsafe {
+            libc::read(go[0], &mut got as *mut u8 as *mut libc::c_void, 1);
+            libc::_exit(0);
+        }
+    }
+
+    // PARENT. Close the ends we don't use, then wait for the child's "ready".
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(go[0]);
+    }
+    let mut got = 0u8;
+    let _ = unsafe { libc::read(ready[0], &mut got as *mut u8 as *mut libc::c_void, 1) };
+
+    // Write the maps from the privileged parent. A single entry mapping host id
+    // `uid`/`gid` is permitted via the ns-creator's CAP_SETUID/CAP_SETGID path.
+    let finish = |result: std::io::Result<libc::c_int>| -> std::io::Result<libc::c_int> {
+        let go_w: [u8; 1] = [b'x'];
+        unsafe {
+            libc::write(go[1], go_w.as_ptr() as *const libc::c_void, 1);
+            libc::close(go[1]);
+            libc::close(ready[0]);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+        result
+    };
+    if let Err(e) = std::fs::write(format!("/proc/{pid}/uid_map"), format!("0 {uid} 1\n")) {
+        return finish(Err(e));
+    }
+    // Must deny setgroups(2) before a gid_map may be written in a userns.
+    let _ = std::fs::write(format!("/proc/{pid}/setgroups"), "deny");
+    if let Err(e) = std::fs::write(format!("/proc/{pid}/gid_map"), format!("0 {gid} 1\n")) {
+        return finish(Err(e));
+    }
+    let ns_path = std::ffi::CString::new(format!("/proc/{pid}/ns/user")).unwrap();
+    let nsfd = unsafe { libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if nsfd < 0 {
+        return finish(Err(errno()));
+    }
+    finish(Ok(nsfd))
+}
+
+/// Present the root-owned shared pack at `shared` onto the per-VM mountpoint
+/// `target` via an idmapped bind mount that maps on-disk uid/gid 0 -> `(uid, gid)`
+/// — so the VMM (about to drop to that uid) reads every file as its owner, while
+/// the underlying shared copy stays root-only on disk (a sibling VM's uid can't
+/// read it directly). This is what lets one root-owned shared copy replace the
+/// per-machine extract + chown while preserving the per-VM uid isolation (#456).
+///
+/// The mount is made in a fresh **private** mount namespace, so it is visible only
+/// to this VMM process (and the libkrun threads it later spawns) and is torn down
+/// automatically when the process exits — no teardown plumbing, no propagation to
+/// the host or sibling VMs. MUST run while still privileged (CAP_SYS_ADMIN) and
+/// BEFORE Landlock/seccomp/`drop_privileges`. Linux ≥ 5.12.
+#[cfg(target_os = "linux")]
+pub fn setup_pack_idmap_mount(
+    shared: &std::path::Path,
+    target: &std::path::Path,
+    uid: u32,
+    gid: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let errno = || std::io::Error::last_os_error();
+
+    // Our own mount namespace: the idmap mount lives and dies with this process.
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(errno());
+    }
+    // Don't propagate mounts back into the host's mount namespace.
+    if unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(errno());
+    }
+
+    let userns_fd = make_idmap_userns(uid, gid)?;
+    let close_userns = || unsafe {
+        libc::close(userns_fd);
+    };
+
+    let shared_c = std::ffi::CString::new(shared.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let target_c = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    // Clone the shared subtree into a detached mount object. mount_setattr's idmap
+    // requires a freshly-cloned mount with no other users, which OPEN_TREE_CLONE
+    // provides; AT_RECURSIVE covers any submounts.
+    let open_flags: libc::c_uint = libc::OPEN_TREE_CLONE
+        | libc::AT_RECURSIVE as libc::c_uint
+        | libc::O_CLOEXEC as libc::c_uint;
+    let tree = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            shared_c.as_ptr(),
+            open_flags,
+        )
+    } as libc::c_int;
+    if tree < 0 {
+        let e = errno();
+        close_userns();
+        return Err(e);
+    }
+    let close_tree = || unsafe {
+        libc::close(tree);
+    };
+
+    // Attach the idmap (recursively) to the cloned tree.
+    let mut attr: libc::mount_attr = unsafe { std::mem::zeroed() };
+    attr.attr_set = libc::MOUNT_ATTR_IDMAP;
+    attr.userns_fd = userns_fd as u64;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            tree,
+            c"".as_ptr(),
+            (libc::AT_EMPTY_PATH | libc::AT_RECURSIVE) as libc::c_uint,
+            &attr as *const libc::mount_attr,
+            std::mem::size_of::<libc::mount_attr>() as libc::size_t,
+        )
+    };
+    if rc != 0 {
+        let e = errno();
+        close_tree();
+        close_userns();
+        return Err(e);
+    }
+
+    // Move the now-idmapped tree onto the per-VM mountpoint.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            tree,
+            c"".as_ptr(),
+            libc::AT_FDCWD,
+            target_c.as_ptr(),
+            libc::MOVE_MOUNT_F_EMPTY_PATH as libc::c_uint,
+        )
+    };
+    let result = if rc != 0 { Err(errno()) } else { Ok(()) };
+    // The kernel holds its own references now; our fds are no longer needed.
+    close_tree();
+    close_userns();
+    result
+}
+
 /// Process-wide gate bounding concurrent VM disk-prep / boot. Every boot path —
 /// the API `start_machine`, the supervisor's restart/reconnect, and startup
 /// reconnect — funnels through `AgentManager::start_via_subprocess`, which
@@ -1566,9 +1826,20 @@ pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
     })
 }
 
+/// Sample CPU time and RSS for a process on Windows via the Win32 process APIs
+/// (`GetProcessTimes` + `GetProcessMemoryInfo`).
+#[cfg(windows)]
+pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
+    let (cpu_time_ns, rss_bytes) = win::process_stats(pid as u32)?;
+    Some(ProcessStats {
+        cpu_time_ns,
+        rss_bytes,
+    })
+}
+
 /// Sample CPU time and RSS for a process (stub on platforms without a
-/// supported implementation; e.g. Windows). Always returns `None`.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// supported implementation). Always returns `None`.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn process_stats(_pid: Pid) -> Option<ProcessStats> {
     None
 }
@@ -2565,6 +2836,32 @@ mod tests {
         assert!(
             drained,
             "registry should drain: real child reaped, bogus PID dropped on ECHILD"
+        );
+    }
+
+    /// `process_stats` must report live CPU/RSS for our own (alive) process on
+    /// every supported host — macOS, Linux, and Windows (where it previously
+    /// returned None). RSS is always > 0 for a running process; CPU time is
+    /// cumulative and may legitimately read 0 very early, so we only assert RSS.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn process_stats_samples_self() {
+        let me = std::process::id() as Pid;
+        let stats = process_stats(me).expect("process_stats must sample the current process");
+        assert!(
+            stats.rss_bytes > 0,
+            "a live process must have non-zero RSS, got {}",
+            stats.rss_bytes
+        );
+    }
+
+    /// A PID that does not exist must yield None, not a bogus sample.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn process_stats_dead_pid_is_none() {
+        assert!(
+            process_stats(i32::MAX as Pid).is_none(),
+            "stats for a non-existent PID must be None"
         );
     }
 }

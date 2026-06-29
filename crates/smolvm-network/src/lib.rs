@@ -60,10 +60,8 @@
 pub mod device;
 pub mod dns;
 pub mod egress;
-// The libkrun frame bridge speaks over a Unix-domain stream socket, so it only
-// exists on Unix hosts. The rest of the stack (smoltcp loop, TCP/UDP/ICMP
-// relays) is cross-platform.
-#[cfg(unix)]
+// The libkrun frame bridge speaks over an AF_UNIX stream socket, available on
+// both Unix and Windows (10 1809+), so the whole stack is cross-platform.
 pub mod frame_stream;
 pub mod icmp_relay;
 pub mod queues;
@@ -74,25 +72,17 @@ pub mod udp_relay;
 
 pub use egress::EgressPolicy;
 
+use socket2::Socket;
 use std::fmt;
-// `io` and the stack/listener constructors below are only used by the Unix-only
-// `start_virtio_network` entry point.
-#[cfg(unix)]
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-#[cfg(unix)]
-use std::os::fd::RawFd;
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
-#[cfg(unix)]
 use frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
 use queues::NetworkFrameQueues;
-#[cfg(unix)]
 use queues::DEFAULT_FRAME_QUEUE_CAPACITY;
-#[cfg(unix)]
 use stack::{start_network_stack, VirtioPollConfig};
-#[cfg(unix)]
 use tcp_listeners::create_tcp_channel;
 use tcp_listeners::TcpPortListeners;
 
@@ -216,7 +206,6 @@ pub(crate) use virtio_net_log;
 /// as shutting down, wakes blocked workers, and joins the poll thread.
 pub struct VirtioNetworkRuntime {
     queues: std::sync::Arc<NetworkFrameQueues>,
-    #[cfg(unix)]
     _frame_bridge: FrameStreamBridge,
     published_ports: Option<TcpPortListeners>,
     poll_handle: Option<JoinHandle<()>>,
@@ -266,24 +255,24 @@ pub struct VirtioNetworkRuntime {
 /// - published host TCP connections can be forwarded toward guest listeners
 /// - the poll loop starts acting as the guest-visible gateway
 ///
-/// Only available on Unix: the libkrun frame bridge it builds requires a
-/// Unix-domain stream socket.
-#[cfg(unix)]
+/// Cross-platform: the libkrun frame bridge speaks over an AF_UNIX stream
+/// socket, available on Unix and Windows (10 1809+). The caller supplies the
+/// already-connected host-side socket (Unix: one end of a `socketpair`;
+/// Windows: the socket `accept`ed from libkrun on the per-VM path).
 pub fn start_virtio_network(
-    host_fd: RawFd,
+    host_stream: Socket,
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
     egress: EgressPolicy,
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
-        "virtio-net: starting runtime host_fd={} guest_ip={} gateway_ip={} dns_server={}",
-        host_fd,
+        "virtio-net: starting runtime guest_ip={} gateway_ip={} dns_server={}",
         guest_network.guest_ip,
         guest_network.gateway_ip,
         guest_network.dns_server
     );
     let queues = NetworkFrameQueues::shared(DEFAULT_FRAME_QUEUE_CAPACITY);
-    let frame_bridge = start_frame_stream_bridge(host_fd, queues.clone())?;
+    let frame_bridge = start_frame_stream_bridge(host_stream, queues.clone())?;
     // tcp_sender sends the accepted TCP connections to the channel
     // tcp_receiver receives the accepted TCP connections via the channel, and let it be consumed in poll thread.
     let (tcp_sender, tcp_receiver) = create_tcp_channel();
@@ -335,6 +324,19 @@ impl VirtioNetworkRuntime {
     /// VM's runtime dir for the node API to read (the runtime is not `Clone`).
     pub fn egress_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.queues.egress_counter()
+    }
+
+    /// Take ownership of the runtime and block until the libkrun stream closes
+    /// (the frame reader marks the queues shutting down on EOF), then drop it for
+    /// a graceful shutdown. Used on Windows, where the runtime is built on the
+    /// `accept` thread: that thread parks here so the runtime — and its worker
+    /// threads — live for the whole VM lifetime instead of being dropped at the
+    /// end of the `accept` callback.
+    pub fn block_until_shutdown(self) {
+        while !self.queues.is_shutting_down() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        // `self` drops here, joining the worker threads.
     }
 }
 

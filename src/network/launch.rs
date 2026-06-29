@@ -75,16 +75,9 @@ pub fn plan_launch_network(
             NetworkBackend::Tsi
         },
     );
-    // virtio-net is not available on Windows. libkrun's TSI carries inbound
-    // published ports on every platform (it opens the host listener when the
-    // guest binds a mapped port) and enforces egress via krun_set_egress_policy,
-    // so route the default through TSI there instead of the missing backend.
-    #[cfg(windows)]
-    let backend = if backend == NetworkBackend::VirtioNet {
-        NetworkBackend::Tsi
-    } else {
-        backend
-    };
+    // virtio-net works on Windows too: the host-side smolvm-network gateway is
+    // cross-platform and libkrun's net device bridges over an AF_UNIX path
+    // (Windows 10 1809+ has native AF_UNIX). See launcher's VirtioNet arm.
     match backend {
         NetworkBackend::Tsi => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::Tsi,
@@ -116,8 +109,6 @@ pub fn validate_requested_network_backend(
     // Mirror plan_launch_network's default: unset backend + (ports OR egress
     // policy) ⇒ virtio-net. So only an EXPLICIT `--net-backend tsi` alongside
     // ports/egress is a misconfig.
-    // Only read by the virtio-net requirement checks below (non-Windows).
-    #[cfg_attr(windows, allow(unused_variables))]
     let backend = resources
         .network_backend
         .unwrap_or(if port_count > 0 || has_egress_policy {
@@ -126,29 +117,23 @@ pub fn validate_requested_network_backend(
             NetworkBackend::Tsi
         });
 
-    // On Windows virtio-net is unavailable; libkrun's TSI carries inbound ports
-    // and enforces the egress policy (krun_set_egress_policy), so the virtio-net
-    // requirements below don't apply there.
-    #[cfg(not(windows))]
-    {
-        // Published ports require the inbound path that only virtio-net has. With
-        // the default above this only fires when the caller EXPLICITLY forced TSI.
-        if port_count > 0 && backend != NetworkBackend::VirtioNet {
-            return Err(crate::Error::config(
-                "ports",
-                "published ports require the virtio-net backend (TSI is outbound-only); \
-                 remove --net-backend tsi or set it to virtio-net",
-            ));
-        }
+    // Published ports require the inbound path that only virtio-net has. With
+    // the default above this only fires when the caller EXPLICITLY forced TSI.
+    if port_count > 0 && backend != NetworkBackend::VirtioNet {
+        return Err(crate::Error::config(
+            "ports",
+            "published ports require the virtio-net backend (TSI is outbound-only); \
+             remove --net-backend tsi or set it to virtio-net",
+        ));
+    }
 
-        // Same for an egress policy — fires only on EXPLICIT TSI + policy.
-        if has_egress_policy && backend != NetworkBackend::VirtioNet {
-            return Err(crate::Error::config(
-                "egress",
-                "egress policy (--allow-cidr/--allow-host/--outbound-localhost-only) requires the \
-                 virtio-net backend; TSI does not enforce it. Remove --net-backend tsi or set it to virtio-net",
-            ));
-        }
+    // Same for an egress policy — fires only on EXPLICIT TSI + policy.
+    if has_egress_policy && backend != NetworkBackend::VirtioNet {
+        return Err(crate::Error::config(
+            "egress",
+            "egress policy (--allow-cidr/--allow-host/--outbound-localhost-only) requires the \
+             virtio-net backend; TSI does not enforce it. Remove --net-backend tsi or set it to virtio-net",
+        ));
     }
 
     if resources.network_backend != Some(NetworkBackend::VirtioNet) {

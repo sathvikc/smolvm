@@ -187,6 +187,16 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+/// Node-shared, content-addressed pack store: `<vm_cache_root>/_shared`. Each
+/// build-constant pack is extracted here once per node under `<checksum>/`
+/// (root-owned, read-only) and presented to every machine via a per-VM idmapped
+/// bind mount — instead of a private per-machine extraction + chown. The `_`
+/// prefix cannot collide with a 16-hex [`vm_dir_hash`], so it sits safely beside
+/// the per-machine data dirs on the same filesystem.
+pub fn shared_pack_cache_root() -> PathBuf {
+    vm_cache_root().join("_shared")
+}
+
 /// Actual host disk consumed by a machine's data dir, in MiB. Sums *real blocks*
 /// (`st_blocks × 512`), not apparent file lengths — the disk images are sparse, so
 /// a 20 GiB image that the guest has barely written to consumes only a few MiB.
@@ -250,6 +260,32 @@ pub fn resolve_disk_image(dir: &Path, raw_filename: &str) -> (PathBuf, DiskForma
 /// the `layers/` subtree that `extract_sidecar` creates *inside* this directory.
 pub fn machine_layers_cache_dir(name: &str) -> PathBuf {
     vm_data_dir(name).join("pack")
+}
+
+/// Filename of the shared-pack pointer dropped beside a machine's
+/// [`machine_layers_cache_dir`] when create extracted the pack into the node's
+/// shared content-addressed store (`_shared/<checksum>`) instead of a private
+/// per-machine copy. Its contents are the absolute path of that shared copy.
+pub const SHARED_PACK_POINTER: &str = ".pack-shared";
+
+/// Path of the shared-pack pointer for a machine, given its layers cache dir
+/// (`<vm_data_dir>/pack`). The pointer sits in the parent (`<vm_data_dir>`) so it
+/// is not shadowed when the `pack` mountpoint is idmap-bound at boot.
+pub fn shared_pack_pointer_path(layers_cache_dir: &std::path::Path) -> PathBuf {
+    layers_cache_dir
+        .parent()
+        .unwrap_or(layers_cache_dir)
+        .join(SHARED_PACK_POINTER)
+}
+
+/// Read the shared-pack pointer for a machine, returning the shared copy's path
+/// iff the pointer exists and names an existing directory. A stale pointer (the
+/// shared copy was evicted) reads as `None`, so callers fall back to the
+/// per-machine extraction path.
+pub fn read_shared_pack_pointer(layers_cache_dir: &std::path::Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(shared_pack_pointer_path(layers_cache_dir)).ok()?;
+    let shared = PathBuf::from(raw.trim());
+    shared.is_dir().then_some(shared)
 }
 
 /// Per-VM egress telemetry file: `<vm_data_dir>/egress`. The launcher (running
@@ -337,6 +373,46 @@ pub fn vm_dir_hash(name: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(name.as_bytes());
     hex::encode(&digest[..8])
+}
+
+/// Sweep stale readiness markers out of the shared agent rootfs.
+///
+/// Every VM writes a per-VM marker `.smolvm-ready.<hash>` into the *shared*
+/// agent rootfs, where `<hash>` is its data-dir name. `cleanup_marker_files`
+/// removes a VM's own marker on clean teardown, but a crash / SIGKILL / external
+/// reap leaves it behind — and `delete_vm` removes the VM's data dir, not the
+/// marker in the shared rootfs — so the rootfs accumulates one stale marker per
+/// VM ever booted. Under uid isolation those markers are foreign-owned `0600`,
+/// which also broke `pack create` (BUG-151). Remove any marker whose VM data dir
+/// (`vm_cache_root()/<hash>`) no longer exists. The host owns the rootfs
+/// directory, so it can unlink the markers regardless of their file owner.
+/// Best-effort: I/O errors are ignored.
+pub fn prune_orphaned_ready_markers() {
+    if let Ok(rootfs) = AgentManager::default_rootfs_path() {
+        prune_orphaned_ready_markers_in(&rootfs, &vm_cache_root());
+    }
+}
+
+/// Path-injectable core of [`prune_orphaned_ready_markers`] (unit-testable).
+fn prune_orphaned_ready_markers_in(rootfs: &Path, vm_cache_root: &Path) {
+    let prefix = format!("{}.", AGENT_READY_MARKER);
+    let Ok(entries) = std::fs::read_dir(rootfs) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(hash) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        // A marker with no hash suffix is the shared/legacy `.smolvm-ready`; leave
+        // it. Otherwise the marker is stale iff its VM data dir is gone.
+        if !hash.is_empty() && !vm_cache_root.join(hash).exists() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Create the VM data directory and commit the `name → hash` binding.
@@ -643,6 +719,28 @@ impl AgentManager {
             return Self::ensure_extracted_rootfs(Path::new(&tar));
         }
 
+        // Distribution layout: the binary sits next to its rootfs. The macOS /
+        // Linux tarballs use a wrapper script that sets SMOLVM_AGENT_ROOTFS, but
+        // the Windows release ships `smolvm.exe` with no wrapper, so resolve the
+        // rootfs relative to the executable: prefer an already-extracted
+        // `agent-rootfs/` dir, else extract a bundled `agent-rootfs.tar[.gz]`
+        // once (a `.zip` can't carry the Linux dir tree with its symlinks/modes).
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        {
+            let dir = exe_dir.join("agent-rootfs");
+            if dir.is_dir() {
+                return Ok(dir);
+            }
+            for name in ["agent-rootfs.tar.gz", "agent-rootfs.tar"] {
+                let tar = exe_dir.join(name);
+                if tar.is_file() {
+                    return Self::ensure_extracted_rootfs(&tar);
+                }
+            }
+        }
+
         let data_dir = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
@@ -692,11 +790,23 @@ impl AgentManager {
             .status()
             .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))?;
         if !status.success() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(Error::storage(
-                "extract rootfs tar",
-                format!("tar exited with {status}"),
-            ));
+            // On Windows, `tar` can't recreate the rootfs's busybox symlinks
+            // without symlink privilege (Developer Mode / elevation) and exits
+            // non-zero with warnings — but the real files (notably the agent)
+            // still extract. Treat the result as usable as long as the agent
+            // binary landed; otherwise it's a genuine extraction failure.
+            let agent_present = tmp.join("usr/local/bin/smolvm-agent").exists();
+            if !agent_present {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(Error::storage(
+                    "extract rootfs tar",
+                    format!("tar exited with {status} and the agent binary was not extracted"),
+                ));
+            }
+            tracing::warn!(
+                "rootfs tar extraction exited with {status} (host could not create some \
+                 symlinks); continuing — the agent binary extracted successfully"
+            );
         }
         let _ = std::fs::write(tmp.join(".extracted"), b"");
         // Atomic publish; if another process won the race, just use theirs.
@@ -1484,7 +1594,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        features: launcher::LaunchFeatures,
+        mut features: launcher::LaunchFeatures,
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
@@ -1545,6 +1655,21 @@ impl AgentManager {
         let data_dir = self.storage_disk.path().parent().map(|p| p.to_path_buf());
         let registry = vm_uid_registry_dir();
         let mut uid_env: Vec<(&str, String)> = Vec::new();
+        // Shared pack store: `with_packed_layers` sets `pack_idmap_source` when
+        // create wrote a `_shared/<checksum>` pointer, leaving `packed_layers_dir`
+        // an empty per-VM mountpoint. Ensure that mountpoint exists BEFORE the
+        // uid-drop chown_tree below, so it's owned by the VM's uid (harmless — the
+        // idmap bind covers it at boot) rather than left for chown to miss.
+        if features.pack_idmap_source.is_some() {
+            if let Some(ref mountpoint) = features.packed_layers_dir {
+                let _ = std::fs::create_dir_all(mountpoint);
+            }
+        }
+        // Whether the per-VM uid drop is active for this boot. The idmapped pack
+        // bind mount needs CAP_SYS_ADMIN (root) — the same precondition as the
+        // drop — so we only keep `pack_idmap_source` when the drop is active;
+        // otherwise the VMM stays root and reads the shared copy directly.
+        let mut uid_drop_active = false;
         if let Some(d) = data_dir.as_deref() {
             if let Some(result) =
                 crate::process::vm_drop_ids(&registry, d, features.snapshot_dir.as_deref())
@@ -1609,8 +1734,25 @@ impl AgentManager {
                     ("SMOLVM_VM_UID", uid.to_string()),
                     ("SMOLVM_VM_GID", gid.to_string()),
                 ];
+                uid_drop_active = true;
             }
         }
+
+        // Resolve how the shared pack is presented to the guest. With the uid
+        // drop active, keep the idmap source so `internal_boot` (still root, in a
+        // private mount namespace) idmap-binds the root-owned shared copy onto the
+        // empty `packed_layers_dir` mountpoint, mapping on-disk uid 0 -> vm_uid.
+        // Without the drop (non-root `serve`, or SMOLVM_VM_UID_DROP=off), there is
+        // no second uid to isolate from, so collapse the indirection: point
+        // `packed_layers_dir` straight at the shared copy and read it as root.
+        let pack_idmap_source = if uid_drop_active {
+            features.pack_idmap_source.take()
+        } else {
+            if let Some(shared) = features.pack_idmap_source.take() {
+                features.packed_layers_dir = Some(shared);
+            }
+            None
+        };
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
@@ -1628,6 +1770,7 @@ impl AgentManager {
             ssh_agent_socket: features.ssh_agent_socket,
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
+            pack_idmap_source,
             extra_disks: features.extra_disks,
         };
         let config_path = self
@@ -2311,6 +2454,32 @@ mod tests {
         // Callers rely on this to locate existing VM data across processes.
         assert_eq!(vm_dir_hash("sandbox-1"), vm_dir_hash("sandbox-1"));
         assert_eq!(vm_dir_hash("default"), vm_dir_hash("default"));
+    }
+
+    #[test]
+    fn prune_removes_only_orphaned_ready_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("agent-rootfs");
+        let cache = tmp.path().join("vms");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+
+        // A live VM (its data dir exists) and markers in the shared rootfs.
+        std::fs::create_dir_all(cache.join("aaaa")).unwrap();
+        let live = rootfs.join(format!("{AGENT_READY_MARKER}.aaaa")); // VM exists -> keep
+        let orphan = rootfs.join(format!("{AGENT_READY_MARKER}.bbbb")); // VM gone -> remove
+        let legacy = rootfs.join(AGENT_READY_MARKER); // no hash suffix -> keep
+        let real_file = rootfs.join("bin"); // not a marker -> keep
+        for p in [&live, &orphan, &legacy, &real_file] {
+            std::fs::write(p, b"1").unwrap();
+        }
+
+        prune_orphaned_ready_markers_in(&rootfs, &cache);
+
+        assert!(live.exists(), "marker for a live VM must be kept");
+        assert!(!orphan.exists(), "marker for a deleted VM must be removed");
+        assert!(legacy.exists(), "the hash-less shared marker must be kept");
+        assert!(real_file.exists(), "non-marker files must be untouched");
     }
 
     #[test]

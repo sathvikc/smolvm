@@ -39,57 +39,67 @@
 //! ```
 
 use crate::queues::NetworkFrameQueues;
+use socket2::Socket;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 const FRAME_HEADER_LEN: usize = 4;
-const SOCKET_SENDBUF_BYTES: libc::c_int = 16 * 1024 * 1024;
+const SOCKET_SENDBUF_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FRAME_LEN: usize = 64 * 1024;
 
 /// Running libkrun unix-stream bridge for one virtio NIC.
 ///
 /// The bridge owns:
-/// - a control clone of the Unix stream used to trigger shutdown
+/// - the shared AF_UNIX stream socket (used to trigger shutdown via `shutdown`)
 /// - a reader thread for guest->host frames
 /// - a writer thread for host->guest frames
+///
+/// The transport is an AF_UNIX stream socket, wrapped in [`socket2::Socket`] so
+/// the same code serves Unix hosts and Windows (10 1809+ has native AF_UNIX).
+/// On Unix the launcher hands us one end of a `socketpair`; on Windows it hands
+/// us the socket it `accept`ed from libkrun on a per-VM path.
+///
+/// The socket is shared via `Arc` and the reader/writer threads use it through
+/// `&Socket` (socket2 implements `Read`/`Write` for `&Socket`), rather than
+/// `try_clone`-ing it three ways: duplicating an AF_UNIX socket handle is
+/// unreliable on Windows (a clone may not observe the peer's writes), which
+/// silently stalled all guest traffic. Concurrent read + write on one socket is
+/// safe — the directions are independent.
 pub struct FrameStreamBridge {
-    control: UnixStream,
+    socket: Arc<Socket>,
     queues: Arc<NetworkFrameQueues>,
     reader_handle: Option<JoinHandle<()>>,
     writer_handle: Option<JoinHandle<()>>,
 }
 
-/// Start the libkrun unix-stream reader and writer threads for one virtio NIC.
+/// Start the libkrun stream reader and writer threads for one virtio NIC.
+///
+/// Takes ownership of an already-connected AF_UNIX stream socket to libkrun.
 pub fn start_frame_stream_bridge(
-    fd: RawFd,
+    stream: Socket,
     queues: Arc<NetworkFrameQueues>,
 ) -> io::Result<FrameStreamBridge> {
-    // SAFETY: ownership of the provided host-side socket fd transfers here.
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    set_socket_send_buffer(&stream)?;
-    // create 3 handles for the unix socket
-    let control = stream.try_clone()?;
-    let reader = stream.try_clone()?;
-    let writer = stream;
+    set_socket_send_buffer(&stream);
+    let socket = Arc::new(stream);
 
+    let reader_socket = socket.clone();
     let reader_handle = thread::Builder::new()
         .name("smolvm-net-reader".into())
         .spawn({
             let queues = queues.clone();
-            move || run_reader(reader, queues)
+            move || run_reader(reader_socket, queues)
         })?;
 
+    let writer_socket = socket.clone();
     let writer_queues = queues.clone();
     let writer_handle = thread::Builder::new()
         .name("smolvm-net-writer".into())
-        .spawn(move || run_writer(writer, writer_queues))?;
+        .spawn(move || run_writer(writer_socket, writer_queues))?;
 
     Ok(FrameStreamBridge {
-        control,
+        socket,
         queues,
         reader_handle: Some(reader_handle),
         writer_handle: Some(writer_handle),
@@ -100,11 +110,11 @@ impl Drop for FrameStreamBridge {
     /// Request shutdown and join the reader/writer workers.
     ///
     /// `shutdown(Shutdown::Both)` is the important part here: it forces any
-    /// blocking read/write on the other stream clones to wake up and fail,
-    /// which lets the threads notice shutdown and return.
+    /// blocking read/write on the shared socket to wake up and fail, which lets
+    /// the threads notice shutdown and return.
     fn drop(&mut self) {
         self.queues.begin_shutdown();
-        let _ = self.control.shutdown(Shutdown::Both);
+        let _ = self.socket.shutdown(Shutdown::Both);
 
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
@@ -115,11 +125,12 @@ impl Drop for FrameStreamBridge {
     }
 }
 
-fn run_reader(mut reader: UnixStream, queues: Arc<NetworkFrameQueues>) {
+fn run_reader(reader: Arc<Socket>, queues: Arc<NetworkFrameQueues>) {
     // Reader thread:
     // libkrun -> Unix stream -> guest_to_host queue -> smoltcp poll loop
+    let mut sock: &Socket = &reader;
     loop {
-        match read_frame(&mut reader) {
+        match read_frame(&mut sock) {
             Ok(frame) => {
                 if queues.guest_to_host.push(frame).is_ok() {
                     queues.guest_wake.wake();
@@ -136,9 +147,10 @@ fn run_reader(mut reader: UnixStream, queues: Arc<NetworkFrameQueues>) {
     }
 }
 
-fn run_writer(mut writer: UnixStream, queues: Arc<NetworkFrameQueues>) {
+fn run_writer(writer: Arc<Socket>, queues: Arc<NetworkFrameQueues>) {
     // Writer thread:
     // smoltcp / host runtime -> host_to_guest queue -> Unix stream -> libkrun
+    let mut sock: &Socket = &writer;
     loop {
         if queues.is_shutting_down() && queues.host_to_guest.is_empty() {
             return;
@@ -154,7 +166,7 @@ fn run_writer(mut writer: UnixStream, queues: Arc<NetworkFrameQueues>) {
         }
 
         while let Some(frame) = queues.host_to_guest.pop() {
-            if let Err(err) = write_frame(&mut writer, &frame) {
+            if let Err(err) = write_frame(&mut sock, &frame) {
                 queues.begin_shutdown();
                 tracing::debug!(error = %err, "virtio-net writer thread stopped");
                 return;
@@ -243,37 +255,18 @@ fn write_all<W: Write>(writer: &mut W, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// set_socket_send_buffer is used to set the "send buffer size" of the provided unix socket.this unix socket is
-/// used to send the Ethernet frames toward libkrun. Setting a large "send buffer size" is helpful for bursty
-/// traffics. This is because we can burst multiple Ethernet frames before the consumer catches up. The
-/// kernel may clamp the requested size, so failure here is logged but not treated as fatal.
-fn set_socket_send_buffer(stream: &UnixStream) -> io::Result<()> {
-    // using the default 16 MiB as the send buffer size
-    let size = SOCKET_SENDBUF_BYTES;
-    // syscall to set the option of a provided socket. Read this:
-    let result = unsafe {
-        libc::setsockopt(
-            // this is the fd of the target socket.
-            stream.as_raw_fd(),
-            // the option to be set is a general socket-level option
-            libc::SOL_SOCKET,
-            // the option name is “the send buffer size”
-            libc::SO_SNDBUF,
-            // and here is the value we want to set for that option (passing it as a c_int pointer)
-            (&size as *const libc::c_int).cast(),
-            // this is needed only because setsockopt is a generic syscall,
-            // and the kernel needs to know how many bytes that option value takes
-            std::mem::size_of_val(&size) as libc::socklen_t,
-        )
-    };
-    if result < 0 {
+/// Increase the socket's send-buffer size (SO_SNDBUF). This stream carries
+/// Ethernet frames toward libkrun; a large send buffer absorbs bursts so we can
+/// queue several frames before libkrun catches up. The OS may clamp the request,
+/// and the option is non-critical, so a failure is logged and ignored.
+/// `socket2` issues the platform `setsockopt` so this works on Unix and Windows.
+fn set_socket_send_buffer(stream: &Socket) {
+    if let Err(err) = stream.set_send_buffer_size(SOCKET_SENDBUF_BYTES) {
         tracing::warn!(
-            error = %io::Error::last_os_error(),
+            error = %err,
             "failed to increase SO_SNDBUF for virtio-net unixstream"
         );
-        return Ok(());
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -314,8 +307,10 @@ mod tests {
         assert_eq!(read_frame(&mut input).unwrap(), vec![7, 8, 9]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn unix_stream_round_trip_multiple_frames() {
+        use std::os::unix::net::UnixStream;
         let (mut left, mut right) = UnixStream::pair().unwrap();
         write_frame(&mut left, &[1, 2, 3]).unwrap();
         write_frame(&mut left, &[4, 5]).unwrap();

@@ -256,6 +256,12 @@ impl ServeStartCmd {
                 loaded.join(", ")
             );
         }
+        // GC VM data dirs no machine record references (legacy/orphan disk leaks).
+        // Server-only: this owns the node's cache and runs before serving requests.
+        let reclaimed = state.reclaim_dangling_vm_dirs();
+        if reclaimed > 0 {
+            println!("Reclaimed {reclaimed} dangling VM data dir(es)");
+        }
 
         // Create shutdown channel for supervisor
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

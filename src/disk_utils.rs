@@ -360,8 +360,134 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
         }
     }
 
+    #[cfg(windows)]
+    {
+        // std::fs::copy materialises holes on NTFS, so a large-virtual sparse
+        // template (e.g. a 10 GiB overlay with ~50 MB of real data) balloons to
+        // its full logical size. Copy sparsely instead, mirroring the Linux path.
+        match sparse_copy_windows(src, dst) {
+            Ok(bytes) => {
+                tracing::debug!(
+                    src = %src.display(), dst = %dst.display(),
+                    bytes_copied = bytes, "windows sparse copy succeeded"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::debug!(src = %src.display(), error = %e, "windows sparse copy failed, falling back to fs::copy");
+            }
+        }
+    }
+
     std::fs::copy(src, dst).map_err(|e| Error::storage("copy file", e.to_string()))?;
     Ok(())
+}
+
+/// Copy a sparse file on Windows/NTFS by replicating only its allocated regions,
+/// leaving holes as holes — the Win32 analogue of the Linux `SEEK_HOLE`/`SEEK_DATA`
+/// path. A scan-and-skip-zeros copy would have to read the whole logical size
+/// (20+ GiB for a disk image) and, worse, allocate any non-zero region it finds;
+/// `FSCTL_QUERY_ALLOCATED_RANGES` reports exactly the regions NTFS has backed, so
+/// a 20 GiB image holding a few MB copies a few MB.
+#[cfg(windows)]
+fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // FSCTL_QUERY_ALLOCATED_RANGES (winioctl.h) + its in/out record. LARGE_INTEGER
+    // fields are signed 64-bit byte counts.
+    const FSCTL_QUERY_ALLOCATED_RANGES: u32 = 0x0009_40CF;
+    const ERROR_MORE_DATA: i32 = 234;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct AllocatedRange {
+        file_offset: i64,
+        length: i64,
+    }
+
+    let mut src_file = std::fs::File::open(src)?;
+    let src_len = src_file.metadata()?.len();
+    if dst.exists() {
+        std::fs::remove_file(dst)?;
+    }
+    let mut dst_file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(dst)?;
+    if src_len == 0 {
+        return Ok(0);
+    }
+    // Mark sparse BEFORE extending so the holes are never allocated.
+    mark_file_sparse(&dst_file)?;
+    dst_file.set_len(src_len)?;
+
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut out: Vec<AllocatedRange> = vec![
+        AllocatedRange {
+            file_offset: 0,
+            length: 0
+        };
+        1024
+    ];
+    // Query allocated ranges starting at 0; the FSCTL fills as many as fit, and
+    // signals ERROR_MORE_DATA when there are more (resume past the last range).
+    let mut query = AllocatedRange {
+        file_offset: 0,
+        length: src_len as i64,
+    };
+    loop {
+        let mut returned: u32 = 0;
+        // SAFETY: src handle is live; `query` is a valid input record; `out` is a
+        // valid, correctly-sized output array; `returned` is a writable out-param.
+        let ok = unsafe {
+            DeviceIoControl(
+                src_file.as_raw_handle(),
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                &query as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<AllocatedRange>() as u32,
+                out.as_mut_ptr() as *mut core::ffi::c_void,
+                (out.len() * std::mem::size_of::<AllocatedRange>()) as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        let more =
+            ok == 0 && std::io::Error::last_os_error().raw_os_error() == Some(ERROR_MORE_DATA);
+        if ok == 0 && !more {
+            return Err(std::io::Error::last_os_error());
+        }
+        let count = returned as usize / std::mem::size_of::<AllocatedRange>();
+        if count == 0 {
+            break;
+        }
+        let mut resume = query.file_offset;
+        for r in &out[..count] {
+            let mut pos = r.file_offset as u64;
+            let end = (r.file_offset + r.length) as u64;
+            while pos < end {
+                let want = std::cmp::min((end - pos) as usize, buf.len());
+                src_file.seek(SeekFrom::Start(pos))?;
+                src_file.read_exact(&mut buf[..want])?;
+                dst_file.seek(SeekFrom::Start(pos))?;
+                dst_file.write_all(&buf[..want])?;
+                pos += want as u64;
+                total += want as u64;
+            }
+            resume = r.file_offset + r.length;
+        }
+        if !more {
+            break;
+        }
+        query.file_offset = resume;
+        query.length = src_len as i64 - resume;
+        if query.length <= 0 {
+            break;
+        }
+    }
+    tracing::debug!(total, "sparse_copy_windows: allocated-range copy done");
+    Ok(total)
 }
 
 /// Copy only data regions of a sparse file via SEEK_HOLE/SEEK_DATA.
@@ -424,4 +550,71 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
         offset = data_end;
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    /// `clone_or_copy_file` must reproduce a sparse file byte-for-byte on every
+    /// platform — including the Windows sparse-copy path, which skips zero runs.
+    /// We build a file with a head data region, a large hole, and a tail data
+    /// region, then assert the clone's length and full contents match.
+    #[test]
+    fn clone_or_copy_preserves_sparse_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.img");
+        let dst = dir.path().join("dst.img");
+
+        let logical_len: u64 = 8 * 1024 * 1024; // 8 MiB logical
+        let head = b"HEAD-DATA-REGION";
+        let tail = b"TAIL-DATA-REGION";
+        {
+            let mut f = std::fs::File::create(&src).unwrap();
+            f.write_all(head).unwrap();
+            f.set_len(logical_len).unwrap();
+            f.seek(SeekFrom::Start(logical_len - tail.len() as u64))
+                .unwrap();
+            f.write_all(tail).unwrap();
+        }
+
+        clone_or_copy_file(&src, &dst).expect("clone_or_copy_file");
+
+        let src_bytes = std::fs::read(&src).unwrap();
+        let dst_bytes = std::fs::read(&dst).unwrap();
+        assert_eq!(
+            dst_bytes.len() as u64,
+            logical_len,
+            "clone must preserve logical length"
+        );
+        assert_eq!(
+            src_bytes, dst_bytes,
+            "clone must be byte-identical to source"
+        );
+        assert_eq!(&dst_bytes[..head.len()], head);
+        assert_eq!(&dst_bytes[dst_bytes.len() - tail.len()..], tail);
+
+        // On Windows the whole point is that the clone stays sparse — the 8 MiB
+        // hole must NOT be allocated on disk. GetCompressedFileSizeW reports the
+        // real on-disk allocation; assert it's a tiny fraction of the logical size.
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+            let wide: Vec<u16> = dst
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut high: u32 = 0;
+            // SAFETY: `wide` is a valid NUL-terminated path; `high` is a writable out-param.
+            let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+            let allocated = ((high as u64) << 32) | (low as u64);
+            assert!(
+                allocated < logical_len / 2,
+                "sparse clone must not allocate the full {logical_len} bytes (got {allocated} allocated)"
+            );
+        }
+    }
 }
