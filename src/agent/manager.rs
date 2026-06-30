@@ -1601,16 +1601,12 @@ impl AgentManager {
         let t_launch = Instant::now();
 
         let resources_for_config = resources.clone();
-        // Bound concurrent disk-prep across ALL boot paths (this is the chokepoint
-        // they share): unbounded parallel template copies thrash the host disk so
-        // each balloons (3.8s → 50s under ~13 concurrent boots) and the start
-        // times out. The permit is held only across `prepare_for_launch` (the disk
-        // copy), then released before the VMM spawn. Process-wide; tune with
-        // SMOLVM_BOOT_CONCURRENCY.
-        {
-            let _boot_permit = crate::process::acquire_boot_permit();
-            self.prepare_for_launch(&mounts, &ports, resources)?;
-        }
+        // Per-boot disk-prep (template copy). Formerly bounded by a process-wide
+        // boot gate to avoid host-disk thrash on slow/shared storage; removed
+        // after metal measurements showed disk-prep at ~1ms (NVMe + qcow2 thin
+        // clone) with flat boot latency from 8 → 32 concurrent boots — the gate
+        // was non-binding and only serialized needlessly.
+        self.prepare_for_launch(&mounts, &ports, resources)?;
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
             "boot: disks ready"
@@ -1768,6 +1764,7 @@ impl AgentManager {
             ports: ports.clone(),
             resources: resources_for_config.clone(),
             ssh_agent_socket: features.ssh_agent_socket,
+            cuda: features.cuda,
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
@@ -2012,19 +2009,33 @@ impl AgentManager {
                 );
             }
             let _ = process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT);
-        } else {
-            tracing::warn!(
-                pid,
-                "skipping kill: PID identity not verified and vsock shutdown failed"
-            );
         }
 
         if process::is_alive(pid) {
+            if !identity_ok {
+                // Kill was skipped (no vsock ack, start-time unverifiable) AND the
+                // process is genuinely still alive — a real orphan/leak risk.
+                tracing::warn!(
+                    pid,
+                    "skipping kill: PID identity not verified and vsock shutdown \
+                     failed; process still alive"
+                );
+            }
             Err(Error::agent(
                 "stop agent",
                 format!("process {} still alive after stop attempts", pid),
             ))
         } else {
+            if !identity_ok {
+                // The vsock connect failed because the VMM was already exiting, so
+                // the skipped SIGKILL was a no-op against an already-dead process.
+                // Benign teardown race (not a leak) — log at debug, not warn.
+                tracing::debug!(
+                    pid,
+                    "skipped kill (identity unverified, vsock shutdown failed); \
+                     process already exited"
+                );
+            }
             Ok(())
         }
     }

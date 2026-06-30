@@ -179,6 +179,9 @@ pub fn create_disk_overlays(specs: &[DiskOverlaySpec]) -> Result<()> {
 pub struct LaunchFeatures {
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<std::path::PathBuf>,
+    /// Enable CUDA-over-vsock: smolvm starts a host CUDA server and the guest
+    /// remotes its CUDA Driver-API calls to the host GPU.
+    pub cuda: bool,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
@@ -186,11 +189,13 @@ pub struct LaunchFeatures {
     /// When set, the launcher mounts this directory via virtiofs so the agent
     /// can use pre-extracted layers instead of pulling from a registry.
     pub packed_layers_dir: Option<std::path::PathBuf>,
-    /// Root-owned shared pack copy (`_shared/<checksum>`) to present at
-    /// `packed_layers_dir` via a per-VM idmapped bind mount. Set by
+    /// Root-owned shared pack copy's OCI layers dir (`_shared/<checksum>/layers`)
+    /// to present at `packed_layers_dir` via a per-VM idmapped bind mount. Set by
     /// [`with_packed_layers`](LaunchFeatures::with_packed_layers) when create
     /// wrote a shared pointer; the manager keeps it only when the per-VM uid drop
-    /// is active (else it collapses `packed_layers_dir` onto the shared copy).
+    /// is active (else it collapses `packed_layers_dir` onto the shared copy). The
+    /// `layers/` subdir is presented (not the store root) so the guest stacks only
+    /// the image layers, never the sibling `agent-rootfs/`.
     pub pack_idmap_source: Option<std::path::PathBuf>,
     /// Additional disk images to attach to the VM (path, read_only, format).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
@@ -251,9 +256,20 @@ impl LaunchFeatures {
         // the idmap only when the per-VM uid drop is active (else it collapses
         // `packed_layers_dir` onto the shared copy directly). No lease — the
         // shared copy is never the macOS case-sensitive volume (Linux-only path).
+        //
+        // The pointer is the store ROOT (`_shared/<checksum>`), which holds the
+        // sidecar's whole tree — `agent-rootfs/`, `layers/`, `storage.ext4` as
+        // siblings. The guest stacks OCI image layers from the `layers/` subdir
+        // (its `layer-order` index + digest dirs live there), exactly like the
+        // per-machine path's `<cache>/layers`. Present that subdir, NOT the root:
+        // otherwise the guest name-sorts the root's entries and mis-stacks
+        // `agent-rootfs/` as an image layer alongside `layers/`, surfacing the
+        // pack's internals (`<digest>/`, `<digest>.tar`, `layer-order`) at the
+        // container `/` and running the agent rootfs instead of the real image.
         if let Some(shared) = super::read_shared_pack_pointer(layers_cache_dir) {
+            let layers = shared.join("layers");
             self.packed_layers_dir = Some(layers_cache_dir.to_path_buf());
-            self.pack_idmap_source = Some(shared);
+            self.pack_idmap_source = Some(if layers.is_dir() { layers } else { shared });
             return Ok(self);
         }
 
@@ -315,6 +331,11 @@ pub struct LaunchConfig<'a> {
     /// Host DNS filter socket path. When set, the guest DNS proxy forwards
     /// queries over vsock to this socket for filtering.
     pub dns_filter_socket: Option<&'a Path>,
+    /// Host CUDA-over-vsock server socket (experimental). When set, the guest
+    /// CUDA client connects out to this AF_UNIX path and the host server runs
+    /// the calls on the NVIDIA GPU. Resolved at the boot-config boundary (the
+    /// subprocess reads `SMOLVM_CUDA_SOCK`) so the launcher stays policy-free.
+    pub cuda_socket: Option<&'a Path>,
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
@@ -366,6 +387,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         resources,
         ssh_agent_socket,
         dns_filter_socket,
+        cuda_socket,
         packed_layers_dir,
         extra_disks,
         dns_filter_enabled,
@@ -926,6 +948,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let vsock_inputs = vsock_service::VsockServiceInputs {
             ssh_agent_socket: ssh_agent_socket.as_deref(),
             dns_filter_socket: dns_filter_socket.as_deref(),
+            cuda_socket: cuda_socket.as_deref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()
             .iter()
@@ -1413,5 +1436,89 @@ fn raise_fd_limits() {
             limit.rlim_cur = limit.rlim_max;
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Build a machine `pack` dir plus a `.pack-shared` pointer in its parent that
+    /// names `shared`, mirroring what create writes when the pack lands in the
+    /// node's content-addressed store. Returns the layers cache dir to pass to
+    /// [`LaunchFeatures::with_packed_layers`].
+    fn machine_with_pointer(root: &Path, shared: &Path) -> PathBuf {
+        let layers_cache_dir = root.join("vm").join("pack");
+        fs::create_dir_all(&layers_cache_dir).unwrap();
+        let pointer = super::super::shared_pack_pointer_path(&layers_cache_dir);
+        fs::write(&pointer, shared.to_string_lossy().as_bytes()).unwrap();
+        layers_cache_dir
+    }
+
+    // Regression: the shared-store branch must present the `layers/` SUBDIR of the
+    // shared copy as the idmap source, not the store root. Carrying the root let
+    // the guest name-sort `agent-rootfs/` + `layers/` and mis-stack the agent
+    // rootfs as an image layer, surfacing pack internals (`<digest>/`, `.tar`,
+    // `layer-order`) at the container `/`.
+    #[test]
+    fn shared_pack_idmap_source_targets_layers_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("_shared").join("ea92da8fcheck");
+        fs::create_dir_all(shared.join("layers").join("25f1d6b1951a")).unwrap();
+        fs::create_dir_all(shared.join("agent-rootfs")).unwrap();
+        let layers_cache_dir = machine_with_pointer(tmp.path(), &shared);
+
+        let features = LaunchFeatures::default()
+            .with_packed_layers(&layers_cache_dir, Some("dummy.smolmachine"))
+            .unwrap();
+
+        // The guest mounts the per-machine `pack` mountpoint...
+        assert_eq!(
+            features.packed_layers_dir.as_deref(),
+            Some(layers_cache_dir.as_path())
+        );
+        // ...backed by the shared copy's `layers/` subdir — NOT the store root.
+        assert_eq!(
+            features.pack_idmap_source.as_deref(),
+            Some(shared.join("layers").as_path())
+        );
+    }
+
+    // A shared copy with no `layers/` subdir (hypothetical/legacy layout) falls
+    // back to the store root so boot still has a valid idmap source rather than
+    // pointing at a path that doesn't exist (internal_boot fails closed on a
+    // missing source).
+    #[test]
+    fn shared_pack_idmap_falls_back_to_root_without_layers_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("_shared").join("deadbeefcheck");
+        fs::create_dir_all(&shared).unwrap();
+        let layers_cache_dir = machine_with_pointer(tmp.path(), &shared);
+
+        let features = LaunchFeatures::default()
+            .with_packed_layers(&layers_cache_dir, Some("dummy.smolmachine"))
+            .unwrap();
+
+        assert_eq!(
+            features.pack_idmap_source.as_deref(),
+            Some(shared.as_path())
+        );
+    }
+
+    // No pointer + no source bundle: this is not the shared-store path, so the
+    // function must not invent an idmap source. (A bare VM with no packed layers.)
+    #[test]
+    fn no_source_smolmachine_leaves_idmap_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layers_cache_dir = tmp.path().join("vm").join("pack");
+        fs::create_dir_all(&layers_cache_dir).unwrap();
+
+        let features = LaunchFeatures::default()
+            .with_packed_layers(&layers_cache_dir, None)
+            .unwrap();
+
+        assert!(features.pack_idmap_source.is_none());
+        assert!(features.packed_layers_dir.is_none());
     }
 }
