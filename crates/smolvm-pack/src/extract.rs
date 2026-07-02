@@ -429,7 +429,9 @@ fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
-fn resolve_cache_asset_path(
+/// Resolve a manifest asset path against an extraction cache without allowing
+/// absolute paths, parent components, or symlink traversal outside the cache.
+pub fn resolve_cache_asset_path(
     cache_dir: &Path,
     asset_rel_path: &str,
     context: &str,
@@ -823,7 +825,7 @@ fn extract_sidecar_inner(
             m.assets
                 .layers
                 .iter()
-                .filter_map(|l| short_layer_id(&l.digest))
+                .filter_map(|l| layer_id_from_asset_path(&l.path))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -925,12 +927,16 @@ pub unsafe fn extract_from_section(
 /// can be mis-stacked. Must match the agent's `LAYER_ORDER_FILE`.
 const LAYER_ORDER_FILE: &str = "layer-order";
 
-/// Short layer id (first 12 hex of the digest) used as the on-disk layer dir
-/// name — mirrors `assets::digest_to_filename` minus the `.tar`. Returns `None`
-/// for a digest too short to form a valid id.
-fn short_layer_id(digest: &str) -> Option<String> {
-    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
-    (hex.len() >= 12).then(|| hex[..12].to_string())
+/// Layer id used as the on-disk layer dir name, derived from the manifest asset
+/// path stem so old short paths and new full-digest paths both preserve order.
+fn layer_id_from_asset_path(path: &str) -> Option<String> {
+    let rel = Path::new(path);
+    (!rel.is_absolute())
+        .then_some(rel)?
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Post-process extracted assets: unpack agent rootfs, OCI layers, fix
@@ -1760,6 +1766,86 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
         // The symlink target must not be modified
         assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    /// Build a tar archive carrying a single symlink entry whose link target
+    /// is `link_target`, plus (optionally) a trailing regular-file entry.
+    fn make_symlink_tar(name: &str, link_target: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder.append_link(&mut header, name, link_target).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_safe_unpack_rejects_symlink_entry_escaping_dest_relative() {
+        // A crafted tar entry `evil -> ../../outside.bin` must be rejected by
+        // safe_unpack before it is materialized: otherwise a later write
+        // through `evil` would land outside the extraction directory.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside = temp_dir.path().join("outside.bin");
+        fs::write(&outside, b"untouched").unwrap();
+
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let tar_bytes = make_symlink_tar("evil", "../../outside.bin");
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+
+        assert!(
+            result.is_err(),
+            "escaping relative symlink must be rejected"
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert!(!dest.join("evil").exists(), "symlink must not be created");
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_safe_unpack_rejects_symlink_entry_escaping_dest_absolute() {
+        // An absolute-target symlink `evil -> /etc/passwd` is jailed to
+        // `dest/etc/passwd`, staying inside dest, so it is allowed. But an
+        // absolute target with `..` that climbs out (`/../escape`) must be
+        // rejected — this guards the absolute-symlink jailing branch.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let tar_bytes = make_symlink_tar("evil", "/../../escape");
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+
+        assert!(
+            result.is_err(),
+            "escaping absolute symlink must be rejected"
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert!(!dest.join("evil").exists(), "symlink must not be created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_safe_unpack_allows_in_dest_symlink() {
+        // A well-behaved relative symlink that stays within dest is accepted.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let tar_bytes = make_symlink_tar("link", "target");
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack(&mut archive, &dest).unwrap();
+
+        let meta = fs::symlink_metadata(dest.join("link")).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "in-dest symlink should exist"
+        );
     }
 
     #[test]

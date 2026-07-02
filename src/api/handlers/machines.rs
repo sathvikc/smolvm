@@ -98,6 +98,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         network: record.network,
         network_backend: record.network_backend,
         allowed_cidrs: record.allowed_cidrs.clone(),
+        allowed_hosts: record.dns_filter_hosts.clone(),
         // Report the RESOLVED provisioned disk sizes, not the request echo: a
         // machine created without an explicit size still gets a real disk at the
         // node default, and billing/telemetry need the actual allocated GiB, not
@@ -161,7 +162,12 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         manager,
         mounts,
         ports,
-        resources: vm_resources_to_spec(record.vm_resources()),
+        resources: ResourceSpec {
+            // VmResources carries no hostname allow-list, so graft it back from the
+            // record — otherwise a reloaded machine would silently lose allowed_hosts.
+            allowed_hosts: record.dns_filter_hosts.clone(),
+            ..vm_resources_to_spec(record.vm_resources())
+        },
         restart: record.restart.clone(),
         network: record.network,
         secret_refs: record.secret_refs.clone(),
@@ -218,21 +224,47 @@ fn shutdown_machine_process(
             tracing::debug!(pid, name, "PID already dead");
         }
 
-        // Post-check: verify the process is actually gone.
+        // Post-check: verify the process is actually gone. If it outlived the
+        // pid-targeted SIGKILL (or the recorded pid is wrong), fall back to
+        // killing the systemd transient scope — its cgroup owns every process the
+        // VM spawned — then wait briefly for the SIGKILL to land. Only give up if
+        // STILL alive.
         if is_alive(pid) {
-            tracing::warn!(pid, name, "process still alive after shutdown attempts");
-            return false;
-        }
-    } else {
-        // No PID available — check if VM is still reachable via vsock.
-        if let Some(ref manager) = manager {
-            if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
-                if client.ping().is_ok() {
-                    tracing::warn!(name, "VM still reachable via vsock but no PID to signal");
-                    return false;
+            let _ = crate::systemd_scope::kill_scope(name);
+            for _ in 0..10 {
+                if !is_alive(pid) {
+                    break;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            if is_alive(pid) {
+                tracing::warn!(pid, name, "process still alive after shutdown + scope kill");
+                return false;
             }
         }
+    } else {
+        // No recorded pid — the pid-based kill can't run at all, which is exactly
+        // how a stuck/crash-looping VM becomes an un-deletable orphan (delete 500s
+        // "still alive; not removing" while the node keeps running the VM). Kill
+        // the transient scope's cgroup directly and confirm via vsock that the VM
+        // is actually gone.
+        let _ = crate::systemd_scope::kill_scope(name);
+        for _ in 0..10 {
+            let reachable = manager
+                .as_ref()
+                .and_then(|m| AgentClient::connect(m.vsock_socket()).ok())
+                .map(|mut c| c.ping().is_ok())
+                .unwrap_or(false);
+            if !reachable {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        tracing::warn!(
+            name,
+            "VM still reachable via vsock after scope kill; no PID to signal"
+        );
+        return false;
     }
 
     true
@@ -598,6 +630,7 @@ pub async fn create_machine(
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
         allowed_cidrs: req.allowed_cidrs.clone(),
+        allowed_hosts: req.allowed_hosts.clone(),
         network_backend: req.network_backend,
     };
 
@@ -837,6 +870,7 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
+    let dns_filter_hosts = record.dns_filter_hosts.clone();
     let forkable = query.forkable;
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
@@ -846,6 +880,7 @@ pub async fn start_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
+            dns_filter_hosts,
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Forkable start: memfd-back guest RAM and expose a control socket at the
@@ -1040,6 +1075,7 @@ pub async fn fork_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
+            record.dns_filter_hosts.clone(),
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
@@ -1821,6 +1857,7 @@ mod tests {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            allowed_hosts: None,
             network_backend: None,
             restart: None,
             image: None,
