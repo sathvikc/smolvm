@@ -252,7 +252,7 @@ pub(crate) fn run_init_commands(
     }
     println!("Running {} init command(s)...", init.len());
     for (i, cmd) in init.iter().enumerate() {
-        let (exit_code, stdout, stderr) = if let Some(image) = context.image {
+        if let Some(image) = context.image {
             let defaults =
                 resolve_image_runtime_defaults(context.image_info, context.env, context.workdir);
             let config = build_init_run_config(
@@ -261,30 +261,42 @@ pub(crate) fn run_init_commands(
                 &defaults,
                 context.record_mounts,
                 context.overlay_id,
-            );
-            client.run_non_interactive(config)?
+            )
+            .with_tty(true);
+            // Interactive run streams the command's output live so the user sees
+            // progress (a slow compile, apt-get, etc.). The output isn't buffered
+            // here, so on a non-zero exit we report just the code — the detail was
+            // already printed above. Not checking the exit code would silently
+            // ignore a failed init command (e.g. a broken `apt install`).
+            let exit_code = client.run_interactive(config)?;
+            if exit_code != 0 {
+                return Err(smolvm::Error::agent(
+                    "init",
+                    format_init_failure(i, exit_code, "", ""),
+                ));
+            }
         } else {
-            client.vm_exec(
+            let (exit_code, stdout, stderr) = client.vm_exec(
                 init_argv(cmd),
                 context.env.to_vec(),
                 context.workdir.map(|s| s.to_string()),
                 None,
                 None,
-            )?
+            )?;
+            if exit_code != 0 {
+                // Init output is generally text — lossy conversion is fine for
+                // error messages. Binary init output isn't a real use case.
+                return Err(smolvm::Error::agent(
+                    "init",
+                    format_init_failure(
+                        i,
+                        exit_code,
+                        &String::from_utf8_lossy(&stdout),
+                        &String::from_utf8_lossy(&stderr),
+                    ),
+                ));
+            }
         };
-        if exit_code != 0 {
-            // Init output is generally text — lossy conversion is fine for
-            // error messages. Binary init output isn't a real use case.
-            return Err(smolvm::Error::agent(
-                "init",
-                format_init_failure(
-                    i,
-                    exit_code,
-                    &String::from_utf8_lossy(&stdout),
-                    &String::from_utf8_lossy(&stderr),
-                ),
-            ));
-        }
     }
     Ok(())
 }
@@ -437,6 +449,8 @@ pub struct CreateVmParams {
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
     pub gpu_vram_mib: Option<u32>,
+    /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
+    pub rosetta: bool,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
@@ -607,6 +621,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.gpu = if params.gpu { Some(true) } else { None };
+    record.rosetta = if params.rosetta { Some(true) } else { None };
     // Same invariant the CLI enforces, applied again here because
     // Smolfile values arrive through `params.gpu_vram_mib` without
     // passing through the clap value_parser.
@@ -1165,6 +1180,7 @@ pub fn persist_named_running(
                 r.dns_filter_hosts = o.dns_filter_hosts.clone();
                 r.gpu = if o.gpu { Some(true) } else { None };
                 r.gpu_vram_mib = o.gpu_vram_mib;
+                r.rosetta = if o.rosetta { Some(true) } else { None };
             }
         })
         .ok_or_else(|| smolvm::Error::config(
@@ -1202,6 +1218,7 @@ pub struct DefaultVmOverrides {
     pub dns_filter_hosts: Option<Vec<String>>,
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,
+    pub rosetta: bool,
 }
 
 /// Check if any running VM already binds to the same host ports.

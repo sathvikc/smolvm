@@ -474,6 +474,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_add_virtiofs3 = krun.add_virtiofs3;
         let krun_start_enter = krun.start_enter;
         let krun_add_vsock = krun.add_vsock;
+        let krun_get_guest_ram = krun.get_guest_ram;
 
         // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
         // Enable debug logging to trace vsock timing issues
@@ -1175,6 +1176,26 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Attach the Rosetta 2 Linux runtime as a virtiofs mount when requested
+        // AND available on this host, so a stray `--rosetta` on a non-Rosetta host
+        // degrades to a no-op rather than a dangling tag the guest can't mount.
+        // The guest agent (gated on guest_env::ROSETTA, set below) mounts it at
+        // ROSETTA_GUEST_PATH and registers the binfmt_misc wrapper.
+        let rosetta_enabled = resources.rosetta && crate::vm::rosetta::is_available();
+        if rosetta_enabled {
+            if let Some(runtime) = crate::vm::rosetta::runtime_path() {
+                let tag = cstr(smolvm_protocol::ROSETTA_TAG);
+                let host_path = cstr(runtime);
+                if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add rosetta virtiofs",
+                        "krun_add_virtiofs failed for Rosetta runtime",
+                    ));
+                }
+            }
+        }
+
         boot_timing!("devices configured");
 
         // Set working directory
@@ -1241,6 +1262,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if resources.gpu {
             let gpu_env = format!("{}={}", guest_env::GPU, guest_env::VALUE_ON);
             if let Ok(cs) = CString::new(gpu_env) {
+                env_strings.push(cs);
+            }
+        }
+
+        // Signal the guest agent to set up Rosetta (mount the runtime + register
+        // binfmt_misc). Gated on the same host-availability check as the mount.
+        if rosetta_enabled {
+            let rosetta_env = format!("{}={}", guest_env::ROSETTA, guest_env::VALUE_ON);
+            if let Ok(cs) = CString::new(rosetta_env) {
                 env_strings.push(cs);
             }
         }
@@ -1358,6 +1388,32 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         tracing::warn!(error = %e, "egress-refresh spawn failed");
                     }
                 }
+            }
+        }
+
+        // Enable guest-RAM zero-copy for the CUDA server: publish a provider it
+        // can query (lazily, once the VM is up) for the guest-RAM host mapping.
+        // The guest side is armed via SMOLVM_CUDA_ZEROCOPY (see vsock_service).
+        if cuda_socket.is_some() {
+            if let Some(get_ram) = krun_get_guest_ram {
+                crate::cuda_host::set_guest_ram_provider(Box::new(move || {
+                    let mut count = 0u64;
+                    // SAFETY: FFI into libkrun; valid after the VM is built.
+                    if get_ram(ctx, std::ptr::null_mut(), 0, &mut count) != 0 || count == 0 {
+                        return None;
+                    }
+                    let mut buf = vec![0u64; count as usize * 3];
+                    if get_ram(ctx, buf.as_mut_ptr(), count as u32, &mut count) != 0 {
+                        return None;
+                    }
+                    Some(
+                        buf.chunks_exact(3)
+                            .map(|c| (c[0], c[1], c[2]))
+                            .collect::<Vec<_>>(),
+                    )
+                }));
+            } else {
+                tracing::info!("cuda-host: libkrun has no krun_get_guest_ram — zero-copy disabled");
             }
         }
 
