@@ -47,6 +47,7 @@ pub enum Op {
     ModuleUnload = 0x22,
     FuncGetParamInfo = 0x23,
     FuncSetAttribute = 0x24,
+    FuncGetAttribute = 0x25,
     MemAlloc = 0x30,
     MemFree = 0x31,
     MemcpyHtoD = 0x32,
@@ -142,6 +143,7 @@ impl Op {
             0x22 => Op::ModuleUnload,
             0x23 => Op::FuncGetParamInfo,
             0x24 => Op::FuncSetAttribute,
+            0x25 => Op::FuncGetAttribute,
             0x30 => Op::MemAlloc,
             0x31 => Op::MemFree,
             0x32 => Op::MemcpyHtoD,
@@ -201,7 +203,11 @@ impl Op {
 /// A decoded request. Handles are opaque ids; device pointers are real values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    Init,
+    /// Connect handshake. `proto_hash` is the client's wire fingerprint
+    /// (`crate::PROTO_HASH`); the host rejects a mismatch (stale binary).
+    Init {
+        proto_hash: u64,
+    },
     DeviceGetCount,
     DeviceGetName {
         device: i32,
@@ -252,6 +258,14 @@ pub enum Request {
         function: u64,
         attrib: i32,
         value: i32,
+    },
+    /// Read a `CUfunction_attribute` (max-threads, num-regs, shared/local
+    /// bytes, ptx/binary version) — forwarded so `cudaFuncGetAttributes`
+    /// returns real values instead of fakes (num_regs=0 divides by zero in
+    /// occupancy math).
+    FuncGetAttribute {
+        function: u64,
+        attrib: i32,
     },
     MemAlloc {
         bytes: u64,
@@ -304,9 +318,15 @@ pub enum Request {
     },
     StreamEndCapture {
         stream: u64,
+        /// Guest-minted virtual graph handle (bit-63 tagged). The host maps it
+        /// to the real captured graph so EndCapture can be fire-and-forget.
+        graph_vh: u64,
     },
     GraphInstantiate {
         graph: u64,
+        /// Guest-minted virtual exec handle; host maps it to the real
+        /// instantiated exec so GraphInstantiate can be fire-and-forget.
+        exec_vh: u64,
     },
     GraphLaunch {
         graph_exec: u64,
@@ -668,7 +688,10 @@ pub fn read_msg<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
 pub fn encode_request(req: &Request) -> Vec<u8> {
     let mut b = Vec::new();
     match req {
-        Request::Init => w_u8(&mut b, Op::Init as u8),
+        Request::Init { proto_hash } => {
+            w_u8(&mut b, Op::Init as u8);
+            w_u64(&mut b, *proto_hash);
+        }
         Request::DeviceGetCount => w_u8(&mut b, Op::DeviceGetCount as u8),
         Request::DeviceGetName { device } => {
             w_u8(&mut b, Op::DeviceGetName as u8);
@@ -720,6 +743,11 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::FuncGetParamInfo { function } => {
             w_u8(&mut b, Op::FuncGetParamInfo as u8);
             w_u64(&mut b, *function);
+        }
+        Request::FuncGetAttribute { function, attrib } => {
+            w_u8(&mut b, Op::FuncGetAttribute as u8);
+            w_u64(&mut b, *function);
+            w_i32(&mut b, *attrib);
         }
         Request::FuncSetAttribute {
             function,
@@ -797,13 +825,15 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u64(&mut b, *stream);
             w_i32(&mut b, *mode);
         }
-        Request::StreamEndCapture { stream } => {
+        Request::StreamEndCapture { stream, graph_vh } => {
             w_u8(&mut b, Op::StreamEndCapture as u8);
             w_u64(&mut b, *stream);
+            w_u64(&mut b, *graph_vh);
         }
-        Request::GraphInstantiate { graph } => {
+        Request::GraphInstantiate { graph, exec_vh } => {
             w_u8(&mut b, Op::GraphInstantiate as u8);
             w_u64(&mut b, *graph);
+            w_u64(&mut b, *exec_vh);
         }
         Request::GraphLaunch { graph_exec, stream } => {
             w_u8(&mut b, Op::GraphLaunch as u8);
@@ -1114,7 +1144,9 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
     let mut c = Cur::new(payload);
     let op = Op::from_u8(c.u8()?).ok_or_else(bad)?;
     Ok(match op {
-        Op::Init => Request::Init,
+        Op::Init => Request::Init {
+            proto_hash: c.u64()?,
+        },
         Op::DeviceGetCount => Request::DeviceGetCount,
         Op::DeviceGetName => Request::DeviceGetName { device: c.i32()? },
         Op::DeviceTotalMem => Request::DeviceTotalMem { device: c.i32()? },
@@ -1139,6 +1171,10 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             function: c.u64()?,
             attrib: c.i32()?,
             value: c.i32()?,
+        },
+        Op::FuncGetAttribute => Request::FuncGetAttribute {
+            function: c.u64()?,
+            attrib: c.i32()?,
         },
         Op::MemAlloc => Request::MemAlloc { bytes: c.u64()? },
         Op::MemFree => Request::MemFree { dptr: c.u64()? },
@@ -1188,8 +1224,14 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             stream: c.u64()?,
             mode: c.i32()?,
         },
-        Op::StreamEndCapture => Request::StreamEndCapture { stream: c.u64()? },
-        Op::GraphInstantiate => Request::GraphInstantiate { graph: c.u64()? },
+        Op::StreamEndCapture => Request::StreamEndCapture {
+            stream: c.u64()?,
+            graph_vh: c.u64()?,
+        },
+        Op::GraphInstantiate => Request::GraphInstantiate {
+            graph: c.u64()?,
+            exec_vh: c.u64()?,
+        },
         Op::GraphLaunch => Request::GraphLaunch {
             graph_exec: c.u64()?,
             stream: c.u64()?,
@@ -1403,7 +1445,8 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::DeviceGetAttribute
         | Op::ThreadExchangeCaptureMode
         | Op::StreamQuery
-        | Op::EventQuery => Response::Count(c.i32()?),
+        | Op::EventQuery
+        | Op::FuncGetAttribute => Response::Count(c.i32()?),
         Op::DeviceGetName => Response::Name(c.string()?),
         Op::DeviceTotalMem => Response::Bytes(c.u64()?),
         Op::CtxCreate | Op::PrimaryCtxRetain => Response::Handle(c.u64()?),
@@ -1477,7 +1520,9 @@ mod tests {
 
     #[test]
     fn request_roundtrips() {
-        roundtrip(Request::Init);
+        roundtrip(Request::Init {
+            proto_hash: 0xdeadbeef,
+        });
         roundtrip(Request::DeviceGetCount);
         roundtrip(Request::DeviceGetName { device: 3 });
         roundtrip(Request::DeviceTotalMem { device: 0 });

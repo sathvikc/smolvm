@@ -64,10 +64,6 @@ pub extern "C" fn cublasDgelsBatched() -> c_int {
     stub("cublasDgelsBatched")
 }
 #[no_mangle]
-pub extern "C" fn cublasDgemv_v2() -> c_int {
-    stub("cublasDgemv_v2")
-}
-#[no_mangle]
 pub extern "C" fn cublasDgeqrfBatched() -> c_int {
     stub("cublasDgeqrfBatched")
 }
@@ -86,10 +82,6 @@ pub extern "C" fn cublasDotEx() -> c_int {
 #[no_mangle]
 pub extern "C" fn cublasDtrsmBatched() -> c_int {
     stub("cublasDtrsmBatched")
-}
-#[no_mangle]
-pub extern "C" fn cublasDtrsm_v2() -> c_int {
-    stub("cublasDtrsm_v2")
 }
 #[no_mangle]
 pub extern "C" fn cublasGetPointerMode_v2() -> c_int {
@@ -112,10 +104,6 @@ pub extern "C" fn cublasSgemmEx() -> c_int {
     stub("cublasSgemmEx")
 }
 #[no_mangle]
-pub extern "C" fn cublasSgemv_v2() -> c_int {
-    stub("cublasSgemv_v2")
-}
-#[no_mangle]
 pub extern "C" fn cublasSgeqrfBatched() -> c_int {
     stub("cublasSgeqrfBatched")
 }
@@ -130,10 +118,6 @@ pub extern "C" fn cublasSgetrsBatched() -> c_int {
 #[no_mangle]
 pub extern "C" fn cublasStrsmBatched() -> c_int {
     stub("cublasStrsmBatched")
-}
-#[no_mangle]
-pub extern "C" fn cublasStrsm_v2() -> c_int {
-    stub("cublasStrsm_v2")
 }
 #[no_mangle]
 pub extern "C" fn cublasZdotc_v2() -> c_int {
@@ -534,19 +518,6 @@ pub extern "C" fn cudaStreamGetPriority(_s: *mut c_void, priority: *mut c_int) -
     }
     0
 }
-/// `cudaLaunchHostFunc` — run a host callback in stream order. Our serving thread
-/// is in-order, so all prior work is done: invoke it immediately.
-#[no_mangle]
-pub extern "C" fn cudaLaunchHostFunc(
-    _s: *mut c_void,
-    func: Option<unsafe extern "C" fn(*mut c_void)>,
-    user_data: *mut c_void,
-) -> c_int {
-    if let Some(f) = func {
-        unsafe { f(user_data) }
-    }
-    0
-}
 #[no_mangle]
 pub extern "C" fn cudaMemcpy2DAsync() -> c_int {
     rt_stub("cudaMemcpy2DAsync")
@@ -660,20 +631,8 @@ pub extern "C" fn cublasDasum_v2() -> c_int {
     stub("cublasDasum_v2")
 }
 #[no_mangle]
-pub extern "C" fn cublasDaxpy_v2() -> c_int {
-    stub("cublasDaxpy_v2")
-}
-#[no_mangle]
-pub extern "C" fn cublasDcopy_v2() -> c_int {
-    stub("cublasDcopy_v2")
-}
-#[no_mangle]
 pub extern "C" fn cublasDgemmBatched() -> c_int {
     stub("cublasDgemmBatched")
-}
-#[no_mangle]
-pub extern "C" fn cublasDger_v2() -> c_int {
-    stub("cublasDger_v2")
 }
 #[no_mangle]
 pub extern "C" fn cublasDnrm2_v2() -> c_int {
@@ -696,18 +655,6 @@ pub extern "C" fn cublasDrot_v2() -> c_int {
     stub("cublasDrot_v2")
 }
 #[no_mangle]
-pub extern "C" fn cublasDscal_v2() -> c_int {
-    stub("cublasDscal_v2")
-}
-#[no_mangle]
-pub extern "C" fn cublasDswap_v2() -> c_int {
-    stub("cublasDswap_v2")
-}
-#[no_mangle]
-pub extern "C" fn cublasDsymm_v2() -> c_int {
-    stub("cublasDsymm_v2")
-}
-#[no_mangle]
 pub extern "C" fn cublasDsymv_v2() -> c_int {
     stub("cublasDsymv_v2")
 }
@@ -718,10 +665,6 @@ pub extern "C" fn cublasDsyr2k_v2() -> c_int {
 #[no_mangle]
 pub extern "C" fn cublasDsyr2_v2() -> c_int {
     stub("cublasDsyr2_v2")
-}
-#[no_mangle]
-pub extern "C" fn cublasDsyrk_v2() -> c_int {
-    stub("cublasDsyrk_v2")
 }
 #[no_mangle]
 pub extern "C" fn cublasDsyr_v2() -> c_int {
@@ -792,20 +735,12 @@ pub extern "C" fn cublasSasum_v2() -> c_int {
     stub("cublasSasum_v2")
 }
 #[no_mangle]
-pub extern "C" fn cublasSaxpy_v2() -> c_int {
-    stub("cublasSaxpy_v2")
-}
-#[no_mangle]
 pub extern "C" fn cublasScasum_v2() -> c_int {
     stub("cublasScasum_v2")
 }
 #[no_mangle]
 pub extern "C" fn cublasScnrm2_v2() -> c_int {
     stub("cublasScnrm2_v2")
-}
-#[no_mangle]
-pub extern "C" fn cublasScopy_v2() -> c_int {
-    stub("cublasScopy_v2")
 }
 #[no_mangle]
 pub extern "C" fn cublasSetMatrixAsync() -> c_int {
@@ -818,10 +753,6 @@ pub extern "C" fn cublasSetVectorAsync() -> c_int {
 #[no_mangle]
 pub extern "C" fn cublasSgemmBatched() -> c_int {
     stub("cublasSgemmBatched")
-}
-#[no_mangle]
-pub extern "C" fn cublasSger_v2() -> c_int {
-    stub("cublasSger_v2")
 }
 #[no_mangle]
 pub extern "C" fn cublasSnrm2_v2() -> c_int {
@@ -844,18 +775,6 @@ pub extern "C" fn cublasSrot_v2() -> c_int {
     stub("cublasSrot_v2")
 }
 #[no_mangle]
-pub extern "C" fn cublasSscal_v2() -> c_int {
-    stub("cublasSscal_v2")
-}
-#[no_mangle]
-pub extern "C" fn cublasSswap_v2() -> c_int {
-    stub("cublasSswap_v2")
-}
-#[no_mangle]
-pub extern "C" fn cublasSsymm_v2() -> c_int {
-    stub("cublasSsymm_v2")
-}
-#[no_mangle]
 pub extern "C" fn cublasSsymv_v2() -> c_int {
     stub("cublasSsymv_v2")
 }
@@ -866,10 +785,6 @@ pub extern "C" fn cublasSsyr2k_v2() -> c_int {
 #[no_mangle]
 pub extern "C" fn cublasSsyr2_v2() -> c_int {
     stub("cublasSsyr2_v2")
-}
-#[no_mangle]
-pub extern "C" fn cublasSsyrk_v2() -> c_int {
-    stub("cublasSsyrk_v2")
 }
 #[no_mangle]
 pub extern "C" fn cublasSsyr_v2() -> c_int {

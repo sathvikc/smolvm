@@ -445,8 +445,16 @@ pub extern "C" fn cudaDeviceSynchronize() -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaDriverGetVersion(version: *mut c_int) -> c_int {
+    static CACHED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    let c = CACHED.load(std::sync::atomic::Ordering::Relaxed);
+    if c != 0 {
+        return set_last(unsafe { out(version, c) });
+    }
     set_last(match with_client(|c| c.driver_get_version()) {
-        Ok(v) => unsafe { out(version, v) },
+        Ok(v) => {
+            CACHED.store(v, std::sync::atomic::Ordering::Relaxed);
+            unsafe { out(version, v) }
+        }
         Err(e) => e,
     })
 }
@@ -472,17 +480,30 @@ pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
     )
 }
 
-/// `cudaMallocManaged` served as plain device memory: bitsandbytes links it
-/// (its paged optimizers host-access managed pointers — those would fault —
-/// but its 4-bit/8-bit compute paths only need the symbol to resolve and the
-/// pointer to be device-valid).
+/// `cudaMallocManaged` — unified memory the CPU and GPU both access by the same
+/// pointer. Through API remoting to a discrete GPU that cannot page-fault into
+/// guest RAM, that is unserviceable: a guest-CPU dereference of a real host
+/// device address reads garbage. So by default we FAIL (writing a NULL
+/// out-pointer), turning silent corruption into an immediate, obvious crash —
+/// this is exactly bitsandbytes' *paged* optimizer path (`get_paged` wraps the
+/// pointer as a host numpy array). `SMOLVM_CUDA_MANAGED=device` restores the
+/// old device-backed behavior for workloads that only ever touch the pointer
+/// on the GPU (never on the CPU); use it only when you know that holds.
 #[no_mangle]
 pub extern "C" fn cudaMallocManaged(
     dev_ptr: *mut *mut c_void,
     size: usize,
     _flags: c_uint,
 ) -> c_int {
-    cudaMalloc(dev_ptr, size)
+    if std::env::var("SMOLVM_CUDA_MANAGED").as_deref() == Ok("device") {
+        return cudaMalloc(dev_ptr, size);
+    }
+    if !dev_ptr.is_null() {
+        unsafe { *dev_ptr = std::ptr::null_mut() };
+    }
+    // cudaErrorNotSupported: host-coherent managed memory can't cross the
+    // forwarding boundary. (SMOLVM_CUDA_MANAGED=device to override.)
+    set_last(801)
 }
 
 /// Managed-memory prefetch hint: nothing to do, our "managed" memory is
@@ -724,13 +745,14 @@ mod guestmem {
     }
 }
 
-/// Bump-allocate `size` bytes (16-aligned) from the shared region.
+/// Bump-allocate `size` bytes (256-aligned: ggml asserts host buffers hit
+/// TENSOR_ALIGNMENT, and 256 also matches cudaHostAlloc's real alignment).
 #[allow(clippy::needless_return)] // `return` is load-bearing across the cfg arms
 fn shm_alloc(size: usize) -> Option<*mut u8> {
     #[cfg(target_os = "linux")]
     {
         let r = shm_region()?;
-        let sz = (size as u64 + 15) & !15;
+        let sz = (size as u64 + 255) & !255;
         let off = SHM_NEXT.fetch_add(sz, Ordering::Relaxed);
         if off + sz > r.len() as u64 {
             return None; // region exhausted → caller falls back
@@ -772,7 +794,7 @@ fn cuda_host_malloc(ptr: *mut *mut c_void, size: usize) -> c_int {
     if let Some(mem) = shm_alloc(size) {
         return set_last(unsafe { out(ptr, mem as *mut c_void) });
     }
-    let layout = match std::alloc::Layout::from_size_align(size, 16) {
+    let layout = match std::alloc::Layout::from_size_align(size, 256) {
         Ok(l) => l,
         Err(_) => return set_last(CUDA_ERROR_INVALID_VALUE),
     };
@@ -1031,6 +1053,26 @@ pub extern "C" fn cudaStreamSynchronize(stream: *mut c_void) -> c_int {
     })
 }
 
+/// `cudaLaunchHostFunc` — a host callback that must run AFTER all prior work on
+/// `stream`. The deferred pipeline means that prior work may not have executed
+/// host-side yet, so we synchronize the stream first; invoking the callback
+/// immediately (as the old stub did) let it observe stale GPU results.
+#[no_mangle]
+pub extern "C" fn cudaLaunchHostFunc(
+    stream: *mut c_void,
+    func: Option<unsafe extern "C" fn(*mut c_void)>,
+    user_data: *mut c_void,
+) -> c_int {
+    let rc = with_client(|c| c.stream_synchronize(stream as u64));
+    if let Err(e) = rc {
+        return set_last(e);
+    }
+    if let Some(f) = func {
+        unsafe { f(user_data) };
+    }
+    CUDA_SUCCESS
+}
+
 // ---- device queries, events, stream/mempool surface (PyTorch runtime API) ----
 //
 // Most of this is forward-to-host or no-op: the host serves every connection on
@@ -1081,11 +1123,36 @@ const A_MAX_ACCESS_POLICY_WINDOW: i32 = 109;
 const A_RESERVED_SHMEM_PER_BLOCK: i32 = 111;
 const A_TIMELINE_SEMAPHORE: i32 = 114;
 
+/// Immutable per-(device, attribute) cache (see cudaDeviceGetAttribute).
+static DEV_ATTRS: Mutex<Option<HashMap<(c_int, c_int), c_int>>> = Mutex::new(None);
+fn dev_attr_cached(device: c_int, attr: c_int) -> Option<c_int> {
+    DEV_ATTRS
+        .lock()
+        .ok()?
+        .get_or_insert_with(HashMap::new)
+        .get(&(device, attr))
+        .copied()
+}
+fn dev_attr_store(device: c_int, attr: c_int, v: c_int) {
+    if let Ok(mut g) = DEV_ATTRS.lock() {
+        g.get_or_insert_with(HashMap::new).insert((device, attr), v);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int {
+    // Device attributes are immutable — memoize to spare a host round-trip on
+    // every repeat (torch queries them thousands of times; a remote server's
+    // network RTT makes each one expensive).
+    if let Some(v) = dev_attr_cached(device, attr) {
+        return set_last(unsafe { out(value, v) });
+    }
     set_last(
         match with_client(|c| c.device_get_attribute(attr, device)) {
-            Ok(v) => unsafe { out(value, v) },
+            Ok(v) => {
+                dev_attr_store(device, attr, v);
+                unsafe { out(value, v) }
+            }
             Err(e) => e,
         },
     )
@@ -1199,6 +1266,121 @@ const _: () = {
     assert!(std::mem::offset_of!(CudaDeviceProp, reserved_shared_mem_per_block) == 720);
     assert!(std::mem::size_of::<CudaDeviceProp>() == 1032);
 };
+
+/// CUDA 13 entry point: 13.x renamed the symbol back from `_v2` AND changed
+/// the struct (1008 bytes, clock-rate fields removed, everything after
+/// `canMapHostMemory` shifted). Callers compiled against 13.x land here;
+/// 12.x callers keep `_v2` and its layout. Offsets measured from the 13.3
+/// headers (scratchpad probe), values fetched like the 12.x path.
+#[no_mangle]
+pub extern "C" fn cudaGetDeviceProperties(prop: *mut c_void, device: c_int) -> c_int {
+    if prop.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    unsafe { std::ptr::write_bytes(prop as *mut u8, 0, 1008) };
+    set_last(
+        with_state(|s| {
+            let a = |s: &mut ShimState, attr: i32, dflt: i32| {
+                s.client.device_get_attribute(attr, device).unwrap_or(dflt)
+            };
+            let name = s.client.device_get_name(device).unwrap_or_default();
+            let uuid = s.client.device_get_uuid(device).unwrap_or([0; 16]);
+            let total = s.client.device_total_mem(device).unwrap_or(0);
+            let base = prop as *mut u8;
+            let wi = |off: usize, v: i32| unsafe { base.add(off).cast::<i32>().write_unaligned(v) };
+            let wu = |off: usize, v: u64| unsafe { base.add(off).cast::<u64>().write_unaligned(v) };
+            let nb = name.as_bytes();
+            let n = nb.len().min(255);
+            unsafe {
+                std::ptr::copy_nonoverlapping(nb.as_ptr(), base, n);
+                std::ptr::copy_nonoverlapping(uuid.as_ptr(), base.add(256), 16);
+            }
+            wu(288, total); // totalGlobalMem
+            wu(296, a(s, A_MAX_SHMEM_PER_BLOCK, 49152) as u64);
+            wi(304, a(s, A_MAX_REGS_PER_BLOCK, 65536));
+            wi(308, a(s, A_WARP_SIZE, 32));
+            wu(312, 2147483647); // memPitch
+            wi(320, a(s, A_MAX_THREADS_PER_BLOCK, 1024));
+            wi(324, a(s, A_MAX_BLOCK_DIM_X, 1024));
+            wi(328, a(s, A_MAX_BLOCK_DIM_Y, 1024));
+            wi(332, a(s, A_MAX_BLOCK_DIM_Z, 64));
+            wi(336, a(s, A_MAX_GRID_DIM_X, 2147483647));
+            wi(340, a(s, A_MAX_GRID_DIM_Y, 65535));
+            wi(344, a(s, A_MAX_GRID_DIM_Z, 65535));
+            wu(352, a(s, A_TOTAL_CONST_MEM, 65536) as u64);
+            wi(360, a(s, A_COMPUTE_MAJOR, 8));
+            wi(364, a(s, A_COMPUTE_MINOR, 6));
+            wu(368, 512); // textureAlignment
+            wu(376, 32); // texturePitchAlignment
+            wi(384, a(s, A_MP_COUNT, 1));
+            wi(392, 1); // canMapHostMemory
+            wi(560, a(s, A_CONCURRENT_KERNELS, 1));
+            wi(584, a(s, A_ASYNC_ENGINE_COUNT, 2));
+            wi(588, 1); // unifiedAddressing
+            wi(592, a(s, A_MEMORY_BUS_WIDTH, 0));
+            wi(596, a(s, A_L2_CACHE_SIZE, 0));
+            wi(600, a(s, A_MAX_PERSISTING_L2, 0));
+            wi(604, a(s, A_MAX_THREADS_PER_MP, 1536));
+            wi(608, 1); // streamPrioritiesSupported
+            wi(612, 1); // globalL1CacheSupported
+            wi(616, 1); // localL1CacheSupported
+            wu(624, a(s, A_MAX_SHMEM_PER_MP, 102400) as u64);
+            wi(632, a(s, A_MAX_REGS_PER_MP, 65536));
+            wi(636, a(s, A_MANAGED_MEMORY, 1));
+            wi(656, a(s, A_CONCURRENT_MANAGED_ACCESS, 1));
+            wi(660, a(s, A_COMPUTE_PREEMPTION, 1));
+            wi(668, a(s, A_COOPERATIVE_LAUNCH, 1));
+            wu(672, a(s, A_MAX_SHMEM_PER_BLOCK_OPTIN, 101376) as u64);
+            wi(688, a(s, A_MAX_BLOCKS_PER_MP, 16));
+            wi(692, a(s, A_MAX_ACCESS_POLICY_WINDOW, 0));
+            wu(696, a(s, A_RESERVED_SHMEM_PER_BLOCK, 0) as u64);
+            wi(704, a(s, A_HOST_REGISTER_SUPPORTED, 1));
+            Ok(())
+        })
+        .err()
+        .unwrap_or(CUDA_SUCCESS),
+    )
+}
+
+/// Device-flag scheduling hints have no effect through forwarding.
+#[no_mangle]
+pub extern "C" fn cudaSetDeviceFlags(_flags: c_uint) -> c_int {
+    CUDA_SUCCESS
+}
+
+/// Whole-graph exec update: report "update failed" — ggml (and torch) fall
+/// back to destroying and re-instantiating the graph, which we forward.
+#[no_mangle]
+pub extern "C" fn cudaGraphExecUpdate(
+    _exec: *mut c_void,
+    _graph: *mut c_void,
+    result_info: *mut c_void,
+) -> c_int {
+    if !result_info.is_null() {
+        // cudaGraphExecUpdateResultInfo { result, errorNode, errorFromNode }
+        unsafe { std::ptr::write_bytes(result_info as *mut u8, 0, 24) };
+    }
+    910 // cudaErrorGraphExecUpdateFailure
+}
+
+/// Cooperative launches need grid-wide sync the transport can't fake; the
+/// caller sees NotSupported and picks a non-cooperative path.
+#[no_mangle]
+pub extern "C" fn cudaLaunchCooperativeKernel(
+    _func: *const c_void,
+    _grid: Dim3,
+    _block: Dim3,
+    _args: *mut *mut c_void,
+    _shared: usize,
+    _stream: *mut c_void,
+) -> c_int {
+    set_last(801) // cudaErrorNotSupported
+}
+
+#[no_mangle]
+pub extern "C" fn cublasGetStatusString(_status: c_int) -> *const c_char {
+    c"cublas status (forwarded by smolvm)".as_ptr()
+}
 
 #[no_mangle]
 pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -> c_int {
@@ -1446,15 +1628,17 @@ const CAPTURE_ACTIVE: c_int = 1;
 pub extern "C" fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_int {
     set_last(
         match with_state(|s| {
+            // Fire-and-forget: the host starts capture when this drains, and
+            // the (also-deferred) launches record in order. The capture id is
+            // torch-visible only (its allocator correlates via the local
+            // GetCaptureInfo queries; the host tracks capture by stream), so
+            // mint it locally. Both save a host round-trip per captured graph,
+            // which dominates coldstart over a network (~1400 graphs).
             s.client
-                .stream_begin_capture(stream as u64, mode)
+                .stream_begin_capture_deferred(stream as u64, mode)
                 .map_err(map_err)?;
-            // Fetch the driver's capture id once; the allocator re-reads it
-            // through the local queries below.
-            let (_, id) = s
-                .client
-                .stream_capture_info(stream as u64)
-                .map_err(map_err)?;
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             s.capture = Some((stream as u64, id));
             Ok(())
         }) {
@@ -1471,12 +1655,14 @@ pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_v
     }
     set_last(
         match with_state(|s| {
-            let g = s
-                .client
-                .stream_end_capture(stream as u64)
+            // Mint a virtual graph handle; the host maps it to the real
+            // captured graph when this deferred end drains.
+            let vh = alloc_vhandle();
+            s.client
+                .stream_end_capture_deferred(stream as u64, vh)
                 .map_err(map_err)?;
             s.capture = None;
-            Ok(g)
+            Ok(vh)
         }) {
             Ok(g) => unsafe { out(graph, g as *mut c_void) },
             Err(e) => {
@@ -1549,10 +1735,18 @@ pub extern "C" fn cudaGraphInstantiateWithFlags(
     if graph_exec.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    set_last(match with_client(|c| c.graph_instantiate(graph as u64)) {
-        Ok(e) => unsafe { out(graph_exec, e as *mut c_void) },
-        Err(e) => e,
-    })
+    set_last(
+        match with_client(|c| {
+            // Mint a virtual exec handle; host maps it when this deferred
+            // instantiate drains (graph is itself a virtual graph handle).
+            let exec_vh = alloc_vhandle();
+            c.graph_instantiate_deferred(graph as u64, exec_vh)?;
+            Ok(exec_vh)
+        }) {
+            Ok(e) => unsafe { out(graph_exec, e as *mut c_void) },
+            Err(e) => e,
+        },
+    )
 }
 
 #[no_mangle]
@@ -1570,22 +1764,25 @@ pub extern "C" fn cudaGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) 
 /// empty captures. Filling a caller-provided node array is not supported.
 #[no_mangle]
 pub extern "C" fn cudaGraphGetNodes(
-    graph: *mut c_void,
+    _graph: *mut c_void,
     nodes: *mut *mut c_void,
     num_nodes: *mut usize,
 ) -> c_int {
     if num_nodes.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    match with_client(|c| c.graph_get_node_count(graph as u64)) {
-        Ok(n) => {
-            if !nodes.is_null() {
-                return set_last(CUDA_ERROR_INVALID_VALUE);
-            }
-            set_last(unsafe { out(num_nodes, n as usize) })
-        }
-        Err(e) => set_last(e),
+    // The real node list is never requested (nodes != NULL is rejected below);
+    // torch calls this only with nodes = NULL to check for an EMPTY graph and
+    // warn. A captured decode graph is never empty, so answer the count query
+    // locally with a non-zero value instead of a host round-trip — fetching
+    // the true count cost one RTT per captured graph (~1400), dominating
+    // coldstart over a network. (This can only suppress a cosmetic empty-graph
+    // warning, never cause wrong behavior — unlike the fake-data stubs that
+    // were replaced with real values.)
+    if !nodes.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
     }
+    set_last(unsafe { out(num_nodes, 1usize) })
 }
 
 #[no_mangle]
@@ -1636,7 +1833,12 @@ pub extern "C" fn cudaStreamAddCallback(
     user_data: *mut c_void,
     _flags: c_uint,
 ) -> c_int {
-    // Work up to here has already run, so invoke the callback immediately.
+    // The callback must run after all prior work on `stream`. Under the
+    // deferred pipeline that work may not have executed host-side yet, so
+    // synchronize first — invoking it immediately let it observe stale results.
+    if let Err(e) = with_client(|c| c.stream_synchronize(stream as u64)) {
+        return set_last(e);
+    }
     if let Some(cb) = callback {
         unsafe { cb(stream, CUDA_SUCCESS, user_data) };
     }
@@ -1689,8 +1891,14 @@ pub extern "C" fn cudaMemPoolSetAttribute(
 pub extern "C" fn cudaMemPoolGetAttribute(
     _pool: *mut c_void,
     _attr: c_int,
-    _value: *mut c_void,
+    value: *mut c_void,
 ) -> c_int {
+    // Every mempool attribute is an 8-byte value (thresholds are u64, the
+    // bool/used/reserved counters are i64). Write a defined 0 rather than
+    // leaving the caller's buffer as stack garbage.
+    if !value.is_null() {
+        unsafe { (value as *mut u64).write_unaligned(0) };
+    }
     set_last(CUDA_SUCCESS)
 }
 #[no_mangle]
@@ -1761,20 +1969,62 @@ pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void
     set_last(CUDA_SUCCESS)
 }
 #[no_mangle]
-pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, _func: *const c_void) -> c_int {
+pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, func: *const c_void) -> c_int {
     if attr.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    // cudaFuncAttributes prefix: sharedSizeBytes, constSizeBytes, localSizeBytes
-    // (size_t) then maxThreadsPerBlock, numRegs, ptxVersion, binaryVersion (int).
-    unsafe {
-        std::ptr::write_bytes(attr as *mut u8, 0, 72);
-        let ints = (attr as *mut u8).add(24) as *mut c_int;
-        *ints = 1024; // maxThreadsPerBlock
-        *ints.add(2) = 86; // ptxVersion (sm_86)
-        *ints.add(3) = 86; // binaryVersion
+    // cudaFuncAttributes: sharedSizeBytes, constSizeBytes, localSizeBytes
+    // (size_t @ 0/8/16) then maxThreadsPerBlock, numRegs, ptxVersion,
+    // binaryVersion (i32 @ 24/28/32/36). Forward the real values — the old
+    // fixed fakes (numRegs=0) divided by zero in occupancy math.
+    unsafe { std::ptr::write_bytes(attr as *mut u8, 0, 72) };
+    // Kernel attributes are immutable — memoize the packed 72-byte blob per
+    // function (torch may query per-launch; each miss is 7 host round-trips).
+    static FUNC_ATTRS: Mutex<Option<HashMap<usize, [u8; 72]>>> = Mutex::new(None);
+    if let Ok(mut g) = FUNC_ATTRS.lock() {
+        if let Some(blob) = g.get_or_insert_with(HashMap::new).get(&(func as usize)) {
+            unsafe { std::ptr::copy_nonoverlapping(blob.as_ptr(), attr as *mut u8, 72) };
+            return set_last(CUDA_SUCCESS);
+        }
     }
-    set_last(CUDA_SUCCESS)
+    // CUfunction_attribute: MAX_THREADS_PER_BLOCK=0, SHARED=1, CONST=2,
+    // LOCAL=3, NUM_REGS=4, PTX_VERSION=5, BINARY_VERSION=6.
+    let r = with_state(|s| {
+        let fid = s
+            .funcs
+            .get(&(func as usize))
+            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
+            .fid;
+        let get = |s: &mut ShimState, a: i32| s.client.func_get_attribute(fid, a).unwrap_or(0);
+        let shared = get(s, 1);
+        let cst = get(s, 2);
+        let local = get(s, 3);
+        let max_tpb = get(s, 0);
+        let num_regs = get(s, 4);
+        let ptx = get(s, 5);
+        let bin = get(s, 6);
+        unsafe {
+            let base = attr as *mut u8;
+            (base as *mut usize).write_unaligned(shared.max(0) as usize);
+            (base.add(8) as *mut usize).write_unaligned(cst.max(0) as usize);
+            (base.add(16) as *mut usize).write_unaligned(local.max(0) as usize);
+            let ints = base.add(24) as *mut c_int;
+            *ints = if max_tpb > 0 { max_tpb } else { 1024 };
+            *ints.add(1) = if num_regs > 0 { num_regs } else { 1 }; // never 0 (occupancy div)
+            *ints.add(2) = if ptx > 0 { ptx } else { 86 };
+            *ints.add(3) = if bin > 0 { bin } else { 86 };
+        }
+        Ok(())
+    });
+    if r.is_ok() {
+        if let Ok(mut g) = FUNC_ATTRS.lock() {
+            let mut blob = [0u8; 72];
+            unsafe { std::ptr::copy_nonoverlapping(attr as *const u8, blob.as_mut_ptr(), 72) };
+            g.get_or_insert_with(HashMap::new)
+                .insert(func as usize, blob);
+        }
+    }
+    set_last(r.err().unwrap_or(CUDA_SUCCESS))
 }
 /// Forward the shared-memory opt-in (`cudaFuncAttributeMaxDynamicSharedMemorySize`
 /// = 8, matching the driver's `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`)
@@ -1841,7 +2091,13 @@ pub extern "C" fn cudaHostGetDevicePointer(
     host: *mut c_void,
     _flags: c_uint,
 ) -> c_int {
-    set_last(unsafe { out(p_device, host) }) // unified addressing
+    // Unified-addressing convention: device VA == host VA. Correct for the
+    // memcpy path (the host recognizes guest-RAM addresses and DMAs them).
+    // KNOWN LIMITATION: a mapped host pointer passed as a KERNEL ARG can't be
+    // dereferenced by the host GPU (a guest VA isn't device-addressable) — that
+    // needs true unified memory we don't have. No validated workload does this;
+    // those that would should use explicit cudaMemcpy instead.
+    set_last(unsafe { out(p_device, host) })
 }
 #[no_mangle]
 pub extern "C" fn cudaDeviceCanAccessPeer(can: *mut c_int, _device: c_int, _peer: c_int) -> c_int {

@@ -116,6 +116,27 @@ fn sync_forced(req: &Request, op: Op) -> bool {
     false
 }
 
+/// Bench/diagnostic: `SMOLVM_CUDA_RTT_DELAY_US` sleeps this many microseconds
+/// per host round-trip, modeling a remote server's network RTT. Batched
+/// deferred work pays it once per fence (as a real network would), so the
+/// resulting throughput-vs-latency curve shows how tolerant each mode is of
+/// distance. Read once (env lookups aren't free on the hot path).
+fn rtt_tax() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static US: AtomicI64 = AtomicI64::new(-1);
+    let mut v = US.load(Ordering::Relaxed);
+    if v == -1 {
+        v = std::env::var("SMOLVM_CUDA_RTT_DELAY_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        US.store(v, Ordering::Relaxed);
+    }
+    if v > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(v as u64));
+    }
+}
+
 /// Round-trip one encoded request over a [`Bridge`], growing the response
 /// buffer when the callee reports it too small (the callee stashes the
 /// response; an empty request fetches the stash).
@@ -385,6 +406,7 @@ impl<S: Read + Write> Client<S> {
     /// One sync round-trip over the rings.
     fn ring_roundtrip(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
         self.ring_push(frame)?;
+        rtt_tax();
         self.ring_pop_response()
     }
 
@@ -440,6 +462,7 @@ impl<S: Read + Write> Client<S> {
         self.wbuf.extend_from_slice(&1u32.to_le_bytes());
         self.wbuf.push(crate::proto::FENCE_OP);
         self.flush_wbuf()?;
+        rtt_tax();
         let payload =
             read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-fence"))?;
         if payload.len() >= 4 {
@@ -560,6 +583,7 @@ impl<S: Read + Write> Client<S> {
             // (drain) and the MAX_DEFERRED backstop.
             self.flush_wbuf()?;
             write_msg(&mut self.stream, &encode_request(req))?;
+            rtt_tax();
             read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?
         };
         let (status, resp) = decode_response(op, &payload)?;
@@ -635,11 +659,18 @@ impl<S: Read + Write> Client<S> {
         // Flush, don't fence — see `call`.
         self.flush_wbuf()?;
         write_msg(&mut self.stream, payload)?;
+        rtt_tax();
         read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))
     }
 
     pub fn init(&mut self) -> Result<()> {
-        self.call(&Request::Init, Op::Init).map(|_| ())
+        self.call(
+            &Request::Init {
+                proto_hash: crate::PROTO_HASH,
+            },
+            Op::Init,
+        )
+        .map(|_| ())
     }
 
     pub fn device_get_count(&mut self) -> Result<i32> {
@@ -785,12 +816,23 @@ impl<S: Read + Write> Client<S> {
         .map(|_| ())
     }
 
-    /// Returns the raw `cudaGraph_t` (an opaque host pointer to the guest).
-    pub fn stream_end_capture(&mut self, stream: u64) -> Result<u64> {
-        match self.call(&Request::StreamEndCapture { stream }, Op::StreamEndCapture)? {
-            Response::Handle(h) => Ok(h),
-            _ => Err(CudaRpcError::Protocol("expected Handle")),
-        }
+    /// Fire-and-forget begin-capture: the host starts capture when this drains,
+    /// and subsequent (also-deferred) launches record in order. Saves a host
+    /// round-trip per captured graph (coldstart over a network).
+    pub fn stream_begin_capture_deferred(&mut self, stream: u64, mode: i32) -> Result<()> {
+        self.call_deferred(
+            &Request::StreamBeginCapture { stream, mode },
+            Op::StreamBeginCapture,
+        )
+    }
+
+    /// Fire-and-forget end-capture: the guest supplies a virtual graph handle
+    /// it minted; the host maps it to the real captured graph when it drains.
+    pub fn stream_end_capture_deferred(&mut self, stream: u64, graph_vh: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::StreamEndCapture { stream, graph_vh },
+            Op::StreamEndCapture,
+        )
     }
 
     /// `(capture_status, capture_id)` straight from the host driver.
@@ -804,11 +846,13 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    pub fn graph_instantiate(&mut self, graph: u64) -> Result<u64> {
-        match self.call(&Request::GraphInstantiate { graph }, Op::GraphInstantiate)? {
-            Response::Handle(h) => Ok(h),
-            _ => Err(CudaRpcError::Protocol("expected Handle")),
-        }
+    /// Fire-and-forget instantiate: `graph` is a virtual graph handle; the
+    /// guest supplies a virtual exec handle the host maps to the real exec.
+    pub fn graph_instantiate_deferred(&mut self, graph: u64, exec_vh: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::GraphInstantiate { graph, exec_vh },
+            Op::GraphInstantiate,
+        )
     }
 
     /// Replay an instantiated graph — the hot path (one message replays every
@@ -927,6 +971,16 @@ impl<S: Read + Write> Client<S> {
     /// Per-parameter byte sizes of the kernel's arguments, in declaration order.
     /// Set a `CUfunction_attribute` on the host function (round-trip: the caller
     /// — Triton — checks the status to decide whether the kernel can run).
+    pub fn func_get_attribute(&mut self, function: u64, attrib: i32) -> Result<i32> {
+        match self.call(
+            &Request::FuncGetAttribute { function, attrib },
+            Op::FuncGetAttribute,
+        )? {
+            Response::Count(v) => Ok(v),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
     pub fn func_set_attribute(&mut self, function: u64, attrib: i32, value: i32) -> Result<()> {
         self.call(
             &Request::FuncSetAttribute {
