@@ -205,8 +205,13 @@ impl Op {
 pub enum Request {
     /// Connect handshake. `proto_hash` is the client's wire fingerprint
     /// (`crate::PROTO_HASH`); the host rejects a mismatch (stale binary).
+    /// `resume_token` is 0 for a fresh session, or a token returned by a prior
+    /// `Init` to adopt that (frozen) session's library handle map — this is how
+    /// a forked VM clone reconnects and keeps using its parent's cuBLAS/cuDNN
+    /// descriptors. The response's `Handle` carries this session's own token.
     Init {
         proto_hash: u64,
+        resume_token: u64,
     },
     DeviceGetCount,
     DeviceGetName {
@@ -688,9 +693,13 @@ pub fn read_msg<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
 pub fn encode_request(req: &Request) -> Vec<u8> {
     let mut b = Vec::new();
     match req {
-        Request::Init { proto_hash } => {
+        Request::Init {
+            proto_hash,
+            resume_token,
+        } => {
             w_u8(&mut b, Op::Init as u8);
             w_u64(&mut b, *proto_hash);
+            w_u64(&mut b, *resume_token);
         }
         Request::DeviceGetCount => w_u8(&mut b, Op::DeviceGetCount as u8),
         Request::DeviceGetName { device } => {
@@ -1144,8 +1153,16 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
     let mut c = Cur::new(payload);
     let op = Op::from_u8(c.u8()?).ok_or_else(bad)?;
     Ok(match op {
+        // Decode Init leniently so a *shorter* Init from an older shim still
+        // yields a Request rather than a decode error. A stale shim would
+        // otherwise have its whole connection dropped as a "malformed message",
+        // hiding the real cause; decoding here lets the proto_hash check reject
+        // it *loudly* ("PROTOCOL MISMATCH … rebuild and restage both"). Missing
+        // fields default to 0 — proto_hash is never 0 in practice, so an Init too
+        // short to even carry a hash still mismatches and is rejected.
         Op::Init => Request::Init {
-            proto_hash: c.u64()?,
+            proto_hash: c.u64().unwrap_or(0),
+            resume_token: c.u64().unwrap_or(0),
         },
         Op::DeviceGetCount => Request::DeviceGetCount,
         Op::DeviceGetName => Request::DeviceGetName { device: c.i32()? },
@@ -1449,6 +1466,8 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::FuncGetAttribute => Response::Count(c.i32()?),
         Op::DeviceGetName => Response::Name(c.string()?),
         Op::DeviceTotalMem => Response::Bytes(c.u64()?),
+        // Init hands back this session's lineage token (for fork-clone handoff).
+        Op::Init => Response::Handle(c.u64()?),
         Op::CtxCreate | Op::PrimaryCtxRetain => Response::Handle(c.u64()?),
         Op::ModuleLoadData | Op::ModuleGetFunction => Response::Handle(c.u64()?),
         Op::StreamCreate | Op::EventCreate => Response::Handle(c.u64()?),
@@ -1465,8 +1484,7 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         Op::CublasCreate => Response::Handle(c.u64()?),
         Op::LibCall => Response::LibResult(c.i32()?, c.bytes()?),
         Op::EventElapsedTime => Response::Millis(f32::from_bits(c.u32()?)),
-        Op::Init
-        | Op::StreamBeginCapture
+        Op::StreamBeginCapture
         | Op::GraphLaunch
         | Op::GraphExecDestroy
         | Op::GraphDestroy
@@ -1522,6 +1540,7 @@ mod tests {
     fn request_roundtrips() {
         roundtrip(Request::Init {
             proto_hash: 0xdeadbeef,
+            resume_token: 0x1234,
         });
         roundtrip(Request::DeviceGetCount);
         roundtrip(Request::DeviceGetName { device: 3 });
@@ -1560,6 +1579,49 @@ mod tests {
             ],
         });
         roundtrip(Request::CtxSynchronize);
+    }
+
+    // A stale shim sends a shorter Init (older wire format). It must still
+    // *decode* — with missing fields defaulting to 0 — so the host's proto_hash
+    // check can reject it loudly, rather than the frame failing to decode and
+    // the connection being silently dropped as "malformed" (which hid the real
+    // version-skew cause during the torch bring-up debugging).
+    #[test]
+    fn short_init_decodes_for_loud_rejection() {
+        // Full-length Init (current format).
+        let full = decode_request(&encode_request(&Request::Init {
+            proto_hash: 0xabcd,
+            resume_token: 7,
+        }))
+        .expect("full Init decodes");
+        assert_eq!(
+            full,
+            Request::Init {
+                proto_hash: 0xabcd,
+                resume_token: 7
+            }
+        );
+
+        // Older shim: op + proto_hash only (no resume_token) → resume_token = 0.
+        let mut short = vec![Op::Init as u8];
+        short.extend_from_slice(&0xabcdu64.to_le_bytes());
+        assert_eq!(
+            decode_request(&short).expect("short Init still decodes"),
+            Request::Init {
+                proto_hash: 0xabcd,
+                resume_token: 0
+            }
+        );
+
+        // Pre-handshake shim: just the op byte → proto_hash = 0 (never a real
+        // hash, so it will mismatch and be rejected loudly).
+        assert_eq!(
+            decode_request(&[Op::Init as u8]).expect("bare Init still decodes"),
+            Request::Init {
+                proto_hash: 0,
+                resume_token: 0
+            }
+        );
     }
 
     #[test]

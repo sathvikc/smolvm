@@ -655,6 +655,9 @@ impl PackCreateCmd {
         manifest.network = pack_config.net.unwrap_or(vm.network);
         // CLI --gpu > Smolfile gpu > source VM record gpu > false
         manifest.gpu = pack_config.gpu || vm.gpu.unwrap_or(false);
+        // Preserve the source VM's CUDA-over-vsock flag so the packed run starts
+        // a host CUDA server and bridges the guest's CUDA client to it.
+        manifest.cuda = vm.cuda;
 
         // Entrypoint baseline: VmRecord > /bin/sh default
         manifest.entrypoint = if !vm.entrypoint.is_empty() {
@@ -1475,7 +1478,7 @@ impl PackCreateCmd {
         dest: &std::path::Path,
         progress_prefix: &str,
     ) -> smolvm::Result<()> {
-        use smolvm_protocol::{AgentRequest, FILE_TRANSFER_MAX_TOTAL};
+        use smolvm_protocol::AgentRequest;
         use std::io::Write;
         use std::time::{Duration, Instant};
 
@@ -1499,6 +1502,7 @@ impl PackCreateCmd {
         let start = Instant::now();
         let mut total_bytes = 0u64;
         let mut last_progress = Instant::now();
+        let cap = smolvm::agent::file_transfer_max_total();
         loop {
             if start.elapsed() > LAYER_EXPORT_TIMEOUT {
                 return Err(Error::agent(
@@ -1519,13 +1523,13 @@ impl PackCreateCmd {
                         // paths do (client.rs): a compromised or buggy guest must not
                         // be able to exhaust the host disk with an endless chunk stream.
                         let next_total = total_bytes.saturating_add(data.len() as u64);
-                        if next_total > FILE_TRANSFER_MAX_TOTAL {
+                        if next_total > cap {
                             let _ = std::fs::remove_file(dest);
                             return Err(Error::agent(
                                 "export layer",
                                 format!(
                                     "guest streamed {} bytes, exceeding the {} byte cap",
-                                    next_total, FILE_TRANSFER_MAX_TOTAL
+                                    next_total, cap
                                 ),
                             ));
                         }

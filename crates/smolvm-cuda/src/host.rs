@@ -31,6 +31,14 @@ pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
 /// opaque ids before they reach the guest.
 pub trait Backend: Send {
     fn init(&mut self) -> CuResult<()>;
+    /// Begin a session on this connection and return its lineage token (0 if
+    /// the backend has no handoff support). `resume_token` is 0 for a fresh
+    /// session, or a token from a prior `begin_session` whose (frozen) library
+    /// handle map this connection should adopt — the mechanism a forked VM
+    /// clone uses to keep its parent's cuBLAS/cuDNN descriptors valid.
+    fn begin_session(&mut self, _resume_token: u64) -> u64 {
+        0
+    }
     fn device_get_count(&mut self) -> CuResult<i32>;
     fn device_get_name(&mut self, device: i32) -> CuResult<String>;
     fn device_total_mem(&mut self, device: i32) -> CuResult<u64>;
@@ -267,8 +275,14 @@ struct Session {
     cublas_handles: HashMap<u64, u64>,
     /// Guest-minted virtual graph/exec handles → real (bit-63 tagged). Lets
     /// EndCapture / GraphInstantiate be fire-and-forget: the guest invents the
-    /// handle, the host maps it when it materializes the real one.
-    graph_vhandles: HashMap<u64, u64>,
+    /// handle, the host maps it when it materializes the real one. Shared via
+    /// [`GRAPH_HANDOFF`] so a fork clone inherits a snapshot of its parent's
+    /// captured graphs (the reals are context-scoped, valid across connections).
+    graph_vhandles: std::sync::Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+    /// Real graph/exec handles THIS session created (not inherited). Only these
+    /// are destroyed on reclaim — mirrors `owned_modules`, so a clone dropping
+    /// never frees a graph its (still-live) parent handed it.
+    owned_graph_reals: std::collections::HashSet<u64>,
     /// Live resources this connection created, reclaimed when it ends —
     /// a guest that dies mid-run must not leak GPU memory (device
     /// allocations are the multi-GB hazard; modules/streams/events are
@@ -310,15 +324,14 @@ fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
     for e in std::mem::take(&mut sess.owned_events) {
         let _ = b.event_destroy(e);
     }
-    for (vh, real) in std::mem::take(&mut sess.graph_vhandles) {
-        // Exec handles (used by GraphLaunch) vs graphs — try exec destroy
-        // first, then graph destroy; the wrong one errors harmlessly.
-        let _ = if vh != 0 {
-            b.graph_exec_destroy(real)
-                .or_else(|_| b.graph_destroy(real))
-        } else {
-            Ok(())
-        };
+    for real in std::mem::take(&mut sess.owned_graph_reals) {
+        // Only reals this session created — never a graph inherited from a
+        // still-live parent (those stay in the shared map, owned by the parent).
+        // Exec vs graph is unknown here; try exec destroy first, then graph
+        // destroy — the wrong one errors harmlessly.
+        let _ = b
+            .graph_exec_destroy(real)
+            .or_else(|_| b.graph_destroy(real));
     }
     for _ in 0..std::mem::take(&mut sess.primary_retains) {
         let _ = b.primary_ctx_release(0);
@@ -330,6 +343,32 @@ impl Session {
         self.next_id += 1;
         self.next_id
     }
+}
+
+/// Registry of live sessions' `graph_vhandles` maps, keyed by the lineage token
+/// [`Backend::begin_session`] returns. `Weak` refs so a session's entry
+/// evaporates when its connection closes. Parallels the cuBLAS `HANDOFF` in
+/// `host::gpu`, but lives here because graph vhandles are session state (the
+/// generic dispatch owns them, not the concrete GPU backend). A fork clone
+/// resuming a parent token adopts a snapshot of the parent's captured graphs.
+type GraphVhMap = std::sync::Mutex<HashMap<u64, u64>>;
+static GRAPH_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<GraphVhMap>>>> =
+    std::sync::Mutex::new(None);
+
+/// Copy `resume_token`'s captured-graph map into `dst`, then register `dst`
+/// under `my_token` (the same token the backend minted for cuBLAS handoff, so
+/// both handle families share one lineage). The reals are context-scoped host
+/// handles valid in the shared primary context, so copying vh→real is enough.
+fn graph_handoff_register(dst: &std::sync::Arc<GraphVhMap>, resume_token: u64, my_token: u64) {
+    let mut reg = GRAPH_HANDOFF.lock().unwrap();
+    let reg = reg.get_or_insert_with(HashMap::new);
+    if resume_token != 0 {
+        if let Some(parent) = reg.get(&resume_token).and_then(|w| w.upgrade()) {
+            *dst.lock().unwrap() = parent.lock().unwrap().clone();
+        }
+    }
+    reg.retain(|_, w| w.strong_count() > 0);
+    reg.insert(my_token, std::sync::Arc::downgrade(dst));
 }
 
 /// Serve one CUDA-RPC connection to completion (until the peer closes). Each
@@ -692,10 +731,27 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(sess.streams.get(&stream).copied().unwrap_or(stream))
         }
     }
+    // Modules and functions are raw host handles on the wire (like streams):
+    // the real CUmodule/CUfunction is context-scoped and every connection
+    // retains the same device primary context, so a handle minted on one
+    // connection stays valid on another (this is what lets a forked VM clone
+    // reconnect and keep using its parent's loaded modules). The tables only
+    // translate ids minted by pre-raw guests; a raw value passes through.
+    fn raw_module(sess: &Session, m: u64) -> u64 {
+        sess.modules.get(&m).copied().unwrap_or(m)
+    }
+    fn raw_fn_h(sess: &Session, f: u64) -> u64 {
+        sess.functions.get(&f).copied().unwrap_or(f)
+    }
     fn raw_graph(sess: &Session, h: u64) -> u64 {
         // Virtual graph/exec handle → real; untagged values pass through.
         if h & VHANDLE_TAG != 0 {
-            sess.graph_vhandles.get(&h).copied().unwrap_or(0)
+            sess.graph_vhandles
+                .lock()
+                .unwrap()
+                .get(&h)
+                .copied()
+                .unwrap_or(0)
         } else {
             h
         }
@@ -705,7 +761,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Ok(sess.events.get(&event).copied().unwrap_or(event))
     }
     let r: CuResult<Response> = (|| match req {
-        Request::Init { proto_hash } => {
+        Request::Init {
+            proto_hash,
+            resume_token,
+        } => {
             if proto_hash != crate::PROTO_HASH {
                 eprintln!(
                     "[smolvm-cuda] PROTOCOL MISMATCH: client wire hash {:016x} != server {:016x} \
@@ -717,7 +776,13 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // CUDA_ERROR_NOT_SUPPORTED — surfaced at cuInit, loud and early.
                 Err(CUDA_ERROR_NOT_SUPPORTED)
             } else {
-                b.init().map(|_| Response::Ok)
+                // Adopt the parent's handle map if resuming, and hand back this
+                // session's token so a later fork-clone can resume from us. The
+                // backend hands off its cuBLAS/cuDNN descriptors; mirror that for
+                // the session-level captured-graph map under the same token.
+                let token = b.begin_session(resume_token);
+                graph_handoff_register(&sess.graph_vhandles, resume_token, token);
+                b.init().map(|_| Response::Handle(token))
             }
         }
         Request::DeviceGetCount => b.device_get_count().map(Response::Count),
@@ -754,28 +819,28 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.primary_ctx_release(device).map(|_| Response::Ok)
         }
         Request::ModuleLoadData { image } => {
+            // Return the raw CUmodule as the wire handle (context-scoped, so it
+            // survives a fork-clone reconnect). Still tracked for reclaim.
             let raw = b.module_load_data(&image)?;
             sess.owned_modules.insert(raw);
-            let id = sess.mint();
-            sess.modules.insert(id, raw);
-            Ok(Response::Handle(id))
+            Ok(Response::Handle(raw))
         }
         Request::ModuleGetFunction { module, name } => {
-            let raw_mod = raw(&sess.modules, module)?;
+            let raw_mod = raw_module(sess, module);
+            // Raw CUfunction on the wire: valid across connections in the shared
+            // primary context, so a forked clone keeps its parent's functions.
             let raw_fn = b.module_get_function(raw_mod, &name)?;
-            let id = sess.mint();
-            sess.functions.insert(id, raw_fn);
-            Ok(Response::Handle(id))
+            Ok(Response::Handle(raw_fn))
         }
         Request::ModuleUnload { module } => {
-            let raw_mod = raw(&sess.modules, module)?;
+            let raw_mod = raw_module(sess, module);
             b.module_unload(raw_mod)?;
             sess.owned_modules.remove(&raw_mod);
             sess.modules.remove(&module);
             Ok(Response::Ok)
         }
         Request::FuncGetParamInfo { function } => {
-            let raw_fn = raw(&sess.functions, function)?;
+            let raw_fn = raw_fn_h(sess, function);
             let sizes = b.func_get_param_info(raw_fn)?;
             let mut out = Vec::with_capacity(sizes.len() * 4);
             for s in sizes {
@@ -788,12 +853,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             attrib,
             value,
         } => {
-            let raw_fn = raw(&sess.functions, function)?;
+            let raw_fn = raw_fn_h(sess, function);
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
         }
         Request::FuncGetAttribute { function, attrib } => {
-            let raw_fn = raw(&sess.functions, function)?;
+            let raw_fn = raw_fn_h(sess, function);
             b.func_get_attribute(raw_fn, attrib).map(Response::Count)
         }
         Request::MemAlloc { bytes } => {
@@ -841,7 +906,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             stream,
             params,
         } => {
-            let raw_fn = raw(&sess.functions, function)?;
+            let raw_fn = raw_fn_h(sess, function);
             let raw_str = raw_stream(sess, stream)?;
             b.launch_kernel(raw_fn, grid, block, shared_bytes, raw_str, &params)
                 .map(|_| Response::Ok)
@@ -869,7 +934,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let raw = raw_stream(sess, stream)?;
             let g = b.stream_end_capture(raw)?;
             if graph_vh & VHANDLE_TAG != 0 {
-                sess.graph_vhandles.insert(graph_vh, g);
+                sess.graph_vhandles.lock().unwrap().insert(graph_vh, g);
+                sess.owned_graph_reals.insert(g);
             }
             Ok(Response::Handle(g))
         }
@@ -882,7 +948,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let real_graph = raw_graph(sess, graph);
             let e = b.graph_instantiate(real_graph)?;
             if exec_vh & VHANDLE_TAG != 0 {
-                sess.graph_vhandles.insert(exec_vh, e);
+                sess.graph_vhandles.lock().unwrap().insert(exec_vh, e);
+                sess.owned_graph_reals.insert(e);
             }
             Ok(Response::Handle(e))
         }
@@ -893,13 +960,23 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::GraphExecDestroy { graph_exec } => {
             let real = raw_graph(sess, graph_exec);
-            sess.graph_vhandles.remove(&graph_exec);
-            b.graph_exec_destroy(real).map(|_| Response::Ok)
+            sess.graph_vhandles.lock().unwrap().remove(&graph_exec);
+            // Only free if we created it; an inherited exec belongs to the
+            // still-live parent (or a sibling clone) and must not be freed here.
+            if sess.owned_graph_reals.remove(&real) {
+                b.graph_exec_destroy(real).map(|_| Response::Ok)
+            } else {
+                Ok(Response::Ok)
+            }
         }
         Request::GraphDestroy { graph } => {
             let real = raw_graph(sess, graph);
-            sess.graph_vhandles.remove(&graph);
-            b.graph_destroy(real).map(|_| Response::Ok)
+            sess.graph_vhandles.lock().unwrap().remove(&graph);
+            if sess.owned_graph_reals.remove(&real) {
+                b.graph_destroy(real).map(|_| Response::Ok)
+            } else {
+                Ok(Response::Ok)
+            }
         }
         Request::GraphGetNodes { graph } => b.graph_get_node_count(graph).map(Response::Bytes),
         Request::MemsetD8Async {
@@ -1691,7 +1768,7 @@ mod tests {
         });
 
         let mut cli = Client::new(client_side);
-        cli.init().unwrap();
+        cli.init(0).unwrap();
         assert_eq!(cli.device_get_count().unwrap(), 1);
         let module = cli.module_load_data(b"<ptx>").unwrap();
         let func = cli.module_get_function(module, "vecadd").unwrap();
@@ -1802,7 +1879,7 @@ mod tests {
         });
 
         let mut cli = Client::new(client_side);
-        cli.init().unwrap();
+        cli.init(0).unwrap();
         let vas = |r: std::ops::Range<usize>| -> Vec<*mut u8> {
             r.map(|i| (hva + i * PAGE) as *mut u8).collect()
         };
@@ -1863,6 +1940,102 @@ mod tests {
         assert_eq!(st, 0);
         std::env::remove_var("SMOLVM_CUDA_VRAM_LIMIT_MB");
     }
+    // Modules and functions are raw host handles on the wire, so a handle minted
+    // on one connection resolves on another (both retain the same primary
+    // context). This is what lets a forked VM clone reconnect on a fresh session
+    // and keep launching the parent's kernels instead of getting INVALID_HANDLE.
+    #[test]
+    fn function_handle_survives_across_sessions() {
+        let mut backend = CpuBackend::default();
+        // Session A loads a module and resolves a function.
+        let mut sess_a = Session::default();
+        let (st, r) = dispatch(
+            &mut sess_a,
+            &mut backend,
+            Request::ModuleLoadData {
+                image: vec![0u8; 8],
+            },
+        );
+        assert_eq!(st, 0);
+        let module = match r {
+            Response::Handle(h) => h,
+            _ => unreachable!("module load returns a handle"),
+        };
+        let (st, r) = dispatch(
+            &mut sess_a,
+            &mut backend,
+            Request::ModuleGetFunction {
+                module,
+                name: "vecadd".into(),
+            },
+        );
+        assert_eq!(st, 0);
+        let function = match r {
+            Response::Handle(h) => h,
+            _ => unreachable!("get-function returns a handle"),
+        };
+        // Session B is a brand-new session (the clone's fresh connection). It
+        // never loaded the module, yet resolving A's function must succeed —
+        // pre-raw-handle code returned INVALID_HANDLE here.
+        let mut sess_b = Session::default();
+        assert!(
+            sess_b.functions.is_empty(),
+            "clone session starts with no local function ids"
+        );
+        let (st, r) = dispatch(
+            &mut sess_b,
+            &mut backend,
+            Request::FuncGetParamInfo { function },
+        );
+        assert_eq!(
+            st, 0,
+            "function from another session must resolve, not fault"
+        );
+        match r {
+            Response::Data(d) => assert_eq!(
+                d,
+                [8u32, 8, 8, 4]
+                    .iter()
+                    .flat_map(|s| s.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                "resolved the right function's param layout"
+            ),
+            other => panic!("expected param data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_handoff_copies_parent_captures_to_clone() {
+        use std::sync::{Arc, Mutex};
+        // High, distinctive tokens so this test can't collide with any token
+        // minted through `dispatch` (CpuBackend hands out 0) in the shared
+        // GRAPH_HANDOFF registry.
+        let vh = VHANDLE_TAG | 0x0000_0000_0000_0007;
+        let real_exec = 0xDEAD_BEEF_u64;
+
+        // Parent captured a graph (vh → real) and registered under its token.
+        let parent: Arc<GraphVhMap> = Arc::new(Mutex::new(HashMap::new()));
+        parent.lock().unwrap().insert(vh, real_exec);
+        graph_handoff_register(&parent, 0, 0xA1A1_0000_0000_0001);
+
+        // Clone resumes the parent's token: it must inherit the vh → real entry
+        // so a GraphLaunch of the guest's (unchanged) virtual handle resolves.
+        let clone: Arc<GraphVhMap> = Arc::new(Mutex::new(HashMap::new()));
+        graph_handoff_register(&clone, 0xA1A1_0000_0000_0001, 0xA1A1_0000_0000_0002);
+        assert_eq!(
+            clone.lock().unwrap().get(&vh).copied(),
+            Some(real_exec),
+            "clone must inherit the parent's captured-graph handle"
+        );
+
+        // Resuming a token whose session is gone yields an empty map, not a fault.
+        let orphan: Arc<GraphVhMap> = Arc::new(Mutex::new(HashMap::new()));
+        graph_handoff_register(&orphan, 0xDEAD_0000_0000_9999, 0xA1A1_0000_0000_0003);
+        assert!(
+            orphan.lock().unwrap().is_empty(),
+            "a dead lineage token hands off nothing"
+        );
+    }
     // The connect handshake rejects a client whose wire fingerprint differs
     // (stale shim/server), so protocol skew fails loudly instead of decoding
     // the wrong bytes and corrupting silently.
@@ -1875,6 +2048,7 @@ mod tests {
             &mut b,
             Request::Init {
                 proto_hash: crate::PROTO_HASH,
+                resume_token: 0,
             },
         );
         assert_eq!(st, 0, "matching proto hash must connect");
@@ -1883,6 +2057,7 @@ mod tests {
             &mut b,
             Request::Init {
                 proto_hash: crate::PROTO_HASH ^ 0x1,
+                resume_token: 0,
             },
         );
         assert_eq!(

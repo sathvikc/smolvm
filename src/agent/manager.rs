@@ -1686,6 +1686,26 @@ impl AgentManager {
             if let Some(ref snap) = features.snapshot_dir {
                 v.push(("SMOLVM_SNAPSHOT_DIR", snap.to_string_lossy().into_owned()));
             }
+            // Shared CUDA daemon: forward an explicit operator setting as-is.
+            // SHARED=1 => smolvm spawns/manages the daemon; DAEMON=X => external.
+            let mut shared_set = false;
+            if let Ok(shared) = std::env::var("SMOLVM_CUDA_SHARED") {
+                v.push(("SMOLVM_CUDA_SHARED", shared));
+                shared_set = true;
+            }
+            if let Ok(daemon) = std::env::var("SMOLVM_CUDA_DAEMON") {
+                v.push(("SMOLVM_CUDA_DAEMON", daemon));
+                shared_set = true;
+            }
+            // Auto-enable the shared daemon for a fork base or a fork clone even
+            // when the operator didn't ask: a clone can only reuse its golden's
+            // GPU context through the one shared daemon, so a per-VM host (its own
+            // process, its own context) would fork into a broken clone. No-op for
+            // non-CUDA machines — the daemon is only ever spawned from the CUDA
+            // host path, which runs only when the machine has `cuda`.
+            if !shared_set && (features.forkable || features.snapshot_dir.is_some()) {
+                v.push(("SMOLVM_CUDA_SHARED", "1".to_string()));
+            }
             v
         };
         self.inner.lock().is_clone = features.snapshot_dir.is_some();
@@ -1816,6 +1836,7 @@ impl AgentManager {
             resources: resources_for_config.clone(),
             ssh_agent_socket: features.ssh_agent_socket,
             cuda: features.cuda,
+            expose_docker: features.expose_docker,
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,

@@ -30,8 +30,58 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Timeout waiting for the agent to become ready.
-const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout waiting for the agent to become ready.
+///
+/// A packed VM assembles its container rootfs *inside the guest* on first boot
+/// (extract OCI layers to /storage, then overlayfs copy-up), so a machine that
+/// carries a large dependency tree — e.g. a ~6 GiB torch + CUDA-wheels overlay —
+/// can legitimately take longer than this to reach its vsock accept loop. Raise
+/// it for such machines with `SMOLVM_AGENT_READY_TIMEOUT_SECS`.
+const AGENT_READY_TIMEOUT_DEFAULT_SECS: u64 = 30;
+
+/// Truthy env-var flag (`1`, `true`, `yes`, case-insensitive).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve the agent-ready timeout, honoring `SMOLVM_AGENT_READY_TIMEOUT_SECS`.
+fn agent_ready_timeout() -> Duration {
+    let secs = std::env::var("SMOLVM_AGENT_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(AGENT_READY_TIMEOUT_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Detach the forked VM child from the terminal. When
+/// `SMOLVM_PACKED_KRUN_STDERR_LOG` names a path, the child's stderr (libkrun's
+/// own log, level from `SMOLVM_KRUN_LOG_LEVEL`) is captured there instead of
+/// discarded — the only way to see a libkrun-level boot failure in a packed run,
+/// since the guest's virtio-console goes to a separate file.
+#[cfg(unix)]
+fn detach_vm_child_stdio() {
+    match std::env::var("SMOLVM_PACKED_KRUN_STDERR_LOG").ok() {
+        Some(p) if !p.trim().is_empty() => {
+            if smolvm::process::detach_stdio_to_stderr_file(std::path::Path::new(p.trim())).is_err()
+            {
+                smolvm::process::detach_stdio();
+            }
+        }
+        _ => smolvm::process::detach_stdio(),
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_vm_child_stdio() {
+    smolvm::process::detach_stdio();
+}
 
 /// Resolve the lib directory containing libkrun/libkrunfw.
 ///
@@ -39,6 +89,22 @@ const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Single-file mode: libs extracted from Mach-O section to cache_dir/lib/.
 /// `smolvm pack run`: uses the host-installed libs.
 fn resolve_lib_dir(cache_dir: &Path, debug: bool) -> smolvm::Result<PathBuf> {
+    // Explicit override (matches the non-packed launcher). Lets a dev run a
+    // packed sidecar with a freshly-built smolvm binary pointed at a known-good
+    // libkrun, instead of the libs embedded in the original stub.
+    if let Ok(dir) = std::env::var(smolvm::data::consts::ENV_SMOLVM_LIB_DIR) {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            let p = PathBuf::from(dir);
+            if p.exists() {
+                if debug {
+                    eprintln!("debug: using libs from SMOLVM_LIB_DIR: {}", p.display());
+                }
+                return Ok(p);
+            }
+        }
+    }
+
     // Two-file mode: libs embedded in stub binary (SMOLLIBS footer)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Ok(Some(lib_dir)) = extract::extract_libs_from_binary(&exe_path, debug) {
@@ -196,6 +262,12 @@ pub struct PackRunCmd {
     /// Enable debug output
     #[arg(long)]
     pub debug: bool,
+
+    /// Enable CUDA-over-vsock: run a host CUDA server and bridge the guest's
+    /// CUDA client to it. Also enabled automatically when the packed machine
+    /// was created with CUDA, or via `SMOLVM_CUDA=1`.
+    #[arg(long)]
+    pub cuda: bool,
 }
 
 impl PackRunCmd {
@@ -297,6 +369,13 @@ impl PackRunCmd {
         let storage_path = runtime_dir.path().join("storage.ext4");
         let vsock_path = runtime_dir.path().join("agent.sock");
 
+        // CUDA-over-vsock: enabled by the packed machine's manifest flag, the
+        // `--cuda` override, or `SMOLVM_CUDA=1`. When on, the parent runs a host
+        // CUDA server on `cuda_sock` and the launcher bridges the guest's vsock
+        // CUDA port to it (the guest's LD_PRELOADed shims connect out).
+        let cuda_enabled = manifest.cuda || self.cuda || env_flag("SMOLVM_CUDA");
+        let cuda_sock = runtime_dir.path().join("cuda.sock");
+
         // Compute auto-sized storage before creating the disk so both the
         // disk file and VmResources use the same value.
         let storage_gib = storage_gib_for_manifest(self.storage, &manifest);
@@ -364,6 +443,7 @@ impl PackRunCmd {
         #[cfg(unix)]
         let child_pid = {
             let vsock_path_clone = vsock_path.clone();
+            let cuda_sock_clone = cuda_sock.clone();
             smolvm::process::fork_session_leader(move || {
                 // Child process: load libkrun via dlopen and launch VM
                 let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
@@ -385,11 +465,16 @@ impl PackRunCmd {
                     overlay_path: overlay_runtime_path.as_deref(),
                     debug: self.debug,
                     console_log: console_log_path,
+                    cuda_socket: if cuda_enabled {
+                        Some(cuda_sock_clone.as_path())
+                    } else {
+                        None
+                    },
                 };
 
                 // Detach from parent's terminal so libkrun doesn't
                 // steal keystrokes or corrupt terminal state.
-                smolvm::process::detach_stdio();
+                detach_vm_child_stdio();
 
                 if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
                     let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
@@ -406,7 +491,8 @@ impl PackRunCmd {
             // These bindings are consumed by the Unix fork closure above; on
             // Windows the BootConfig carries the same data, so silence the
             // unused-variable warnings rather than reshape the surrounding code.
-            let _ = (&packed_mounts, &port_mappings);
+            // `cuda_enabled`/`cuda_sock` drive the unix-only shared-daemon path.
+            let _ = (&packed_mounts, &port_mappings, cuda_enabled, &cuda_sock);
 
             // The overlay file is always created on disk before this point
             // (`setup_vm_overlay`); fall back to the well-known runtime path when
@@ -431,6 +517,7 @@ impl PackRunCmd {
                 resources: resources.clone(),
                 ssh_agent_socket: None,
                 cuda: false,
+                expose_docker: false,
                 dns_filter_hosts: None,
                 packed_layers_dir: Some(layers_dir.to_path_buf()),
                 pack_idmap_source: None,
@@ -519,6 +606,26 @@ impl PackRunCmd {
 
         if self.debug {
             eprintln!("debug: forked VM process with PID {}", child_pid);
+        }
+
+        // Start the host CUDA server in the parent (which owns the run's
+        // lifetime). The guest's LD_PRELOADed shims connect out to vsock port
+        // `ports::CUDA`, which the launcher (in the child) bridges to this
+        // AF_UNIX socket. Started after the fork so the child never inherits any
+        // CUDA-driver state, and before `wait_for_agent` so the socket is
+        // serving well before the guest workload dials in.
+        #[cfg(unix)]
+        if cuda_enabled {
+            match smolvm::cuda_host::start(&cuda_sock) {
+                Ok(()) => {
+                    if self.debug {
+                        eprintln!("debug: CUDA host serving {}", cuda_sock.display());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to start CUDA host server: {e} — CUDA disabled");
+                }
+            }
         }
 
         // Guard ensures the VM child is terminated and runtime dir is
@@ -682,14 +789,15 @@ fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient>
 
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
+    let timeout = agent_ready_timeout();
 
     loop {
-        if start.elapsed() > AGENT_READY_TIMEOUT {
+        if start.elapsed() > timeout {
             return Err(Error::agent(
                 "wait for agent",
                 format!(
                     "agent did not become ready within {} seconds",
-                    AGENT_READY_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ),
             ));
         }
@@ -1022,6 +1130,11 @@ struct PackedRunArgs {
     /// Overlay disk size in GiB
     #[arg(long, value_name = "GiB")]
     overlay: Option<u64>,
+
+    /// Enable CUDA-over-vsock (also implied by the packed machine's manifest or
+    /// `SMOLVM_CUDA=1`).
+    #[arg(long)]
+    cuda: bool,
 }
 
 /// Arguments for the `start` subcommand (persistent daemon).
@@ -1207,6 +1320,7 @@ fn run_ephemeral(
                 force_extract,
                 info: false,
                 debug,
+                cuda: args.cuda,
             };
             cmd.run()
         }
@@ -1366,11 +1480,14 @@ fn run_from_cache(
             overlay_path: overlay_runtime_path.as_deref(),
             debug,
             console_log: console_log_path,
+            // CUDA-over-vsock for the persistent/daemon packed paths is not
+            // wired yet; the `run` path starts the host server.
+            cuda_socket: None,
         };
 
         // Detach from parent's terminal so libkrun doesn't
         // steal keystrokes or corrupt terminal state.
-        smolvm::process::detach_stdio();
+        detach_vm_child_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
@@ -1405,6 +1522,7 @@ fn run_from_cache(
             resources: resources.clone(),
             ssh_agent_socket: None,
             cuda: false,
+            expose_docker: false,
             dns_filter_hosts: None,
             packed_layers_dir: Some(layers_dir.to_path_buf()),
             pack_idmap_source: None,
@@ -1785,12 +1903,15 @@ fn daemon_start(
             overlay_path: overlay_daemon_path.as_deref(),
             debug,
             console_log: console_log_path,
+            // CUDA-over-vsock for the persistent/daemon packed paths is not
+            // wired yet; the `run` path starts the host server.
+            cuda_socket: None,
         };
 
         // Detach from parent's terminal before launching the VM.
         // Without this, libkrun's threads inherit stdin and steal
         // keystrokes from the user's shell.
-        smolvm::process::detach_stdio();
+        detach_vm_child_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);

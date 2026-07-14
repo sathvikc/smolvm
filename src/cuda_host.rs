@@ -47,12 +47,46 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
         .name("cuda-host".into())
         .spawn(move || {
             tracing::info!(path = path_display, "CUDA host server listening");
+            // Shared-daemon mode: relay every guest connection to one CUDA daemon
+            // instead of serving it in-process, so all VMs share that daemon's
+            // single GPU context — the prerequisite for a forked clone to reuse a
+            // golden VM's device memory (which lives in the daemon, not per-VM).
+            //   SMOLVM_CUDA_SHARED=1  — smolvm spawns + manages the daemon.
+            //   SMOLVM_CUDA_DAEMON=X  — relay to an external daemon at address X
+            //                           (a host:port or a unix-socket path); also
+            //                           overrides the managed one.
+            let daemon = match std::env::var("SMOLVM_CUDA_DAEMON").ok() {
+                Some(addr) => Some(addr),
+                // The smolvm-managed daemon is unix-only (see `cuda_daemon`); on
+                // other platforms SMOLVM_CUDA_SHARED just serves in-process.
+                #[cfg(unix)]
+                None if std::env::var("SMOLVM_CUDA_SHARED").as_deref() == Ok("1") => {
+                    match crate::cuda_daemon::ensure_running() {
+                        Ok(sock) => Some(sock.to_string_lossy().into_owned()),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "cuda-host: managed daemon unavailable, serving in-process");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            if let Some(ref addr) = daemon {
+                tracing::info!(daemon = %addr, "cuda-host: shared-daemon proxy mode");
+            }
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
+                        let daemon = daemon.clone();
                         thread::Builder::new()
                             .name("cuda-host-conn".into())
                             .spawn(move || {
+                                if let Some(addr) = daemon {
+                                    if let Err(e) = proxy_to_daemon(stream, &addr) {
+                                        tracing::debug!(error = %e, "CUDA daemon proxy ended");
+                                    }
+                                    return;
+                                }
                                 let mut backend = make_backend();
                                 if let Err(e) = serve(stream, backend.as_mut()) {
                                     tracing::debug!(error = %e, "CUDA host connection ended");
@@ -67,6 +101,52 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
             }
         })?;
 
+    Ok(())
+}
+
+/// Relay one guest connection to the shared CUDA daemon at `addr` (a byte pump
+/// in both directions — the RPC is end-to-end between the guest shim and the
+/// daemon, so smolvm only forwards frames). This is the minimal form of the
+/// shared-host-daemon architecture: every VM's traffic lands in one process, so
+/// they share a single GPU context and device memory.
+fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::io::Result<()> {
+    // A path (managed daemon) → unix socket; otherwise host:port → TCP.
+    if addr.starts_with('/') {
+        #[cfg(unix)]
+        {
+            let daemon = std::os::unix::net::UnixStream::connect(addr)?;
+            return pump(guest, daemon.try_clone()?, daemon);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = guest;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unix-socket CUDA daemon unsupported on this platform; use SMOLVM_CUDA_DAEMON=host:port",
+            ));
+        }
+    }
+    let daemon = std::net::TcpStream::connect(addr)?;
+    let _ = daemon.set_nodelay(true);
+    pump(guest, daemon.try_clone()?, daemon)
+}
+
+/// Byte-pump the guest connection and a daemon connection in both directions.
+fn pump<D>(
+    guest: crate::platform::uds::UdsStream,
+    mut daemon_wr: D,
+    mut daemon_rd: D,
+) -> std::io::Result<()>
+where
+    D: std::io::Read + std::io::Write + Send + 'static,
+{
+    let mut guest_rd = guest.try_clone()?;
+    let mut guest_wr = guest;
+    let up = thread::spawn(move || {
+        let _ = std::io::copy(&mut guest_rd, &mut daemon_wr);
+    });
+    let _ = std::io::copy(&mut daemon_rd, &mut guest_wr);
+    let _ = up.join();
     Ok(())
 }
 

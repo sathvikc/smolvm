@@ -65,6 +65,11 @@ pub struct PackedLaunchConfig<'a> {
     /// Path to redirect VM console output (prevents libkrun from putting
     /// the inherited terminal into raw mode).
     pub console_log: PathBuf,
+    /// Host CUDA-over-vsock server socket. When set, the guest's CUDA client
+    /// (vsock port [`ports::CUDA`]) is bridged to this AF_UNIX path, where a
+    /// `cuda_host` server loaded the real driver. Mirrors the non-packed
+    /// launcher's `cuda_socket`.
+    pub cuda_socket: Option<&'a Path>,
 }
 
 /// The `krun_add_disk2` image-format code for a disk file: `1` (qcow2) when it
@@ -133,8 +138,13 @@ pub fn launch_agent_vm_dynamic(
     // SAFETY: Each FFI call below is individually wrapped in unsafe.
     // All CString/pointer construction is safe Rust outside the unsafe blocks.
 
-    // Set log level
-    let log_level = if config.debug { 3 } else { 0 };
+    // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug).
+    // Honor SMOLVM_KRUN_LOG_LEVEL like the non-packed launcher so a packed VM's
+    // boot can be traced; otherwise fall back to info under --debug.
+    let log_level = std::env::var(crate::data::consts::ENV_SMOLVM_KRUN_LOG_LEVEL)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(if config.debug { 3 } else { 0 });
     // SAFETY: set_log_level is a valid function pointer loaded from libkrun
     unsafe { (krun.set_log_level)(log_level) };
 
@@ -465,6 +475,25 @@ pub fn launch_agent_vm_dynamic(
     if unsafe { (krun.add_vsock_port2)(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) } < 0
     {
         free_ctx_on_err!("krun_add_vsock_port2 failed");
+    }
+
+    // Bridge the guest CUDA client (vsock port `ports::CUDA`) to the host CUDA
+    // server socket. `listen=false`: the guest connects out and libkrun forwards
+    // to the AF_UNIX path where `cuda_host::start` is serving. Mirrors the
+    // non-packed launcher; keeps this launcher policy-free (the caller owns the
+    // server lifecycle).
+    if let Some(cuda_sock) = config.cuda_socket {
+        let cuda_sock_c = try_or_free_ctx!(
+            path_to_cstring(cuda_sock),
+            "cuda socket path contains null byte"
+        );
+        // SAFETY: ctx is valid, cuda_sock_c is a valid C string.
+        if unsafe { (krun.add_vsock_port2)(ctx, ports::CUDA, cuda_sock_c.as_ptr(), false) } < 0 {
+            free_ctx_on_err!("krun_add_vsock_port2 (CUDA) failed");
+        }
+        if config.debug {
+            eprintln!("debug: CUDA-over-vsock bridged to {}", cuda_sock.display());
+        }
     }
 
     // Redirect console output to a log file so libkrun doesn't put the

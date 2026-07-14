@@ -1,0 +1,81 @@
+# nfpm config for the official smolvm .deb / .rpm packages.
+# https://nfpm.goreleaser.com — one config produces both formats.
+#
+# Repackages the upstream release tarball (which bundles the smol-machines
+# libkrun fork) into the same layout as packaging/arch/PKGBUILD:
+#   /usr/bin/smolvm                          (wrapper, retargeted by CI)
+#   /usr/lib/smolvm/{smolvm-bin,lib,agent-rootfs}
+#
+# Unlike the PKGBUILD, we deliberately do NOT ship storage-template.ext4 /
+# overlay-template.ext4: those are 20G/10G *sparse* files that neither the deb
+# nor the rpm archiver preserves as sparse — the rpm packager OOMs reading the
+# full logical size, and a .deb/.rpm would expand them to 30G of real zeros on
+# the user's disk at install time. They are only a first-pack optimization; when
+# absent, smolvm formats storage with mkfs.ext4 (hence the e2fsprogs dep).
+#
+# CI extracts the tarball to ./pkgroot, seds the wrapper, and sets
+# NFPM_ARCH (amd64|arm64) + NFPM_VERSION before invoking nfpm.
+name: smolvm
+arch: ${NFPM_ARCH}
+version: ${NFPM_VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: smol-machines <hebinsquared@gmail.com>
+# First line is the deb synopsis / rpm Summary (no trailing period); the rest is
+# the extended description.
+description: |
+  Build and run portable, lightweight, self-contained virtual machines
+  smolvm runs each workload in its own microVM on libkrun, with sub-second boot
+  and OCI-native images. This is the official smol-machines build and bundles
+  the smol-machines libkrun fork.
+vendor: smol-machines
+homepage: https://github.com/smol-machines/smolvm
+license: Apache-2.0
+
+# crun (OCI runtime), jq and e2fsprogs (mkfs.ext4, used to format storage on the
+# first pack since we don't ship the prebuilt template) are the runtime deps most
+# likely to be missing; the rest (util-linux, gzip, tar, libcap) are base. The
+# per-format overrides add the C library (deb: libc6, rpm: glibc) — nfpm does not
+# run the distro's automatic ELF dependency generator, so we declare it.
+depends:
+  - crun
+  - jq
+  - e2fsprogs
+
+overrides:
+  deb:
+    depends:
+      - crun
+      - jq
+      - e2fsprogs
+      - libc6
+  rpm:
+    depends:
+      - crun
+      - jq
+      - e2fsprogs
+      - glibc
+
+contents:
+  - src: ./pkgroot/smolvm
+    dst: /usr/bin/smolvm
+    file_info: { mode: 0755 }
+  - src: ./pkgroot/smolvm-bin
+    dst: /usr/lib/smolvm/smolvm-bin
+    file_info: { mode: 0755 }
+  - src: ./pkgroot/lib
+    dst: /usr/lib/smolvm/lib
+    type: tree
+  - src: ./pkgroot/agent-rootfs
+    dst: /usr/lib/smolvm/agent-rootfs
+    type: tree
+  # DEP-5 machine-readable copyright at the Debian path (satisfies lintian's
+  # no-copyright-file; references common-licenses for Apache-2.0 rather than
+  # embedding the text). Generated into pkgroot by the CI workflow.
+  - src: ./pkgroot/copyright
+    dst: /usr/share/doc/smolvm/copyright
+    file_info: { mode: 0644 }
+  - src: ./pkgroot/README.txt
+    dst: /usr/share/doc/smolvm/README.txt
+    file_info: { mode: 0644 }
