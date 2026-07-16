@@ -49,6 +49,27 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
     let listener = UdsListener::bind(socket_path)?;
     let path_display = socket_path.display().to_string();
 
+    // One-time, launch-time preflight: if this host can't load the CUDA driver,
+    // every guest connection falls back to a CPU-emulation backend that only
+    // services a built-in test kernel, so a real workload (PyTorch, a custom
+    // kernel, cuBLAS) dies deep inside the guest with a cryptic
+    // CUDA_ERROR_NOT_FOUND. Warn the user plainly here instead. Warn-and-continue
+    // rather than fail: the emulation backend is intentionally useful for the
+    // built-in test path and for development on GPU-less hosts (e.g. macOS).
+    // Skipped when relaying to an external daemon, which may own the GPU on a
+    // different host than this process.
+    if std::env::var_os("SMOLVM_CUDA_DAEMON").is_none() {
+        if let Err(e) = GpuBackend::load() {
+            eprintln!(
+                "warning: CUDA remoting is enabled but this host has no usable CUDA GPU \
+                 ({e}); guest CUDA calls will run on a CPU-emulation backend that only \
+                 supports a built-in test kernel — real CUDA/PyTorch workloads will fail. \
+                 Run on a Linux host with an NVIDIA GPU and driver for real acceleration."
+            );
+            tracing::warn!(error = %e, "cuda-host: no usable host GPU at launch; CPU-emulation fallback active");
+        }
+    }
+
     thread::Builder::new()
         .name("cuda-host".into())
         .spawn(move || {
@@ -121,7 +142,10 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
         #[cfg(unix)]
         {
             let daemon = std::os::unix::net::UnixStream::connect(addr)?;
-            return pump(guest, daemon.try_clone()?, daemon);
+            let sd = daemon.try_clone()?;
+            return pump(guest, daemon.try_clone()?, daemon, move || {
+                let _ = sd.shutdown(std::net::Shutdown::Both);
+            });
         }
         #[cfg(not(unix))]
         {
@@ -134,7 +158,10 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
     }
     let daemon = std::net::TcpStream::connect(addr)?;
     let _ = daemon.set_nodelay(true);
-    pump(guest, daemon.try_clone()?, daemon)
+    let sd = daemon.try_clone()?;
+    pump(guest, daemon.try_clone()?, daemon, move || {
+        let _ = sd.shutdown(std::net::Shutdown::Both);
+    })
 }
 
 /// Byte-pump the guest connection and a daemon connection in both directions.
@@ -142,16 +169,25 @@ fn pump<D>(
     guest: crate::platform::uds::UdsStream,
     mut daemon_wr: D,
     mut daemon_rd: D,
+    daemon_shutdown: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<()>
 where
     D: std::io::Read + std::io::Write + Send + 'static,
 {
     let mut guest_rd = guest.try_clone()?;
+    let guest_sd = guest_rd.try_clone()?;
     let mut guest_wr = guest;
     let up = thread::spawn(move || {
         let _ = std::io::copy(&mut guest_rd, &mut daemon_wr);
+        // Guest side ended: unblock the daemon→guest copy below so the proxy
+        // thread exits instead of leaking, blocked on a silent daemon.
+        daemon_shutdown();
     });
     let _ = std::io::copy(&mut daemon_rd, &mut guest_wr);
+    // Daemon side ended — e.g. this connection's clone worker died. Shut the
+    // guest socket down so the guest's blocked read fails LOUDLY (the clone
+    // would otherwise hang forever mid-training) and the up-thread unblocks.
+    let _ = guest_sd.shutdown(std::net::Shutdown::Both);
     let _ = up.join();
     Ok(())
 }

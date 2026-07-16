@@ -77,11 +77,91 @@ jobs:
           path: target/${{ matrix.target }}/release-small/smolvm-agent
 
   # ==========================================================================
+  # Build CUDA guest shims + runner (both architectures)
+  #
+  # The shims are glibc cdylibs (loaded by the workload container's glibc, not
+  # the musl agent); smolvm-cuda-run is a musl guest binary. Built here per arch
+  # — including cross-compiled aarch64 — and handed to build-rootfs, so release
+  # rootfs images ship CUDA auto-staging even though that job runs --no-build-agent.
+  # ==========================================================================
+  build-cuda:
+    name: Build CUDA shims (${{ matrix.arch }})
+    needs: ci
+    # 22.04 (glibc 2.35), NOT ubuntu-latest (24.04 = 2.39): the shims are glibc
+    # cdylibs linked here, so the build host's glibc is their runtime floor. A
+    # 2.39 shim breaks common workload guests (Debian 12 = 2.36, Ubuntu 22.04 =
+    # 2.35). Same reasoning as build-dist / build-libkrun.
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            musl_target: x86_64-unknown-linux-musl
+            gnu_target: x86_64-unknown-linux-gnu
+            linker_pkg: ""
+            musl_linker_env: ""
+            gnu_linker_env: ""
+          - arch: aarch64
+            musl_target: aarch64-unknown-linux-musl
+            gnu_target: aarch64-unknown-linux-gnu
+            linker_pkg: gcc-aarch64-linux-gnu
+            musl_linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+            gnu_linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.musl_target }}, ${{ matrix.gnu_target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cuda-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cuda-${{ matrix.arch }}-cargo-
+
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools ${{ matrix.linker_pkg }}
+
+      # smolvm-cuda-run: guest-side CUDA runner, musl (matches the guest userland).
+      - name: Build smolvm-cuda-run
+        run: |
+          ${{ matrix.musl_linker_env }} \
+          cargo build --profile release-small -p smolvm-cuda-guest --target ${{ matrix.musl_target }}
+
+      # Shims: glibc cdylibs the agent bind-mounts into --cuda workload containers.
+      - name: Build CUDA guest shims
+        run: |
+          ${{ matrix.gnu_linker_env }} \
+          cargo build --release -p smolvm-cudart-shim -p smolvm-cuda-shim --target ${{ matrix.gnu_target }}
+
+      - name: Collect CUDA artifacts
+        run: |
+          mkdir -p /tmp/cuda
+          cp target/${{ matrix.musl_target }}/release-small/smolvm-cuda-run /tmp/cuda/smolvm-cuda-run
+          cp target/${{ matrix.gnu_target }}/release/libcudart.so /tmp/cuda/libcudart-shim.so
+          cp target/${{ matrix.gnu_target }}/release/libcuda.so   /tmp/cuda/libcuda.so.1
+          file /tmp/cuda/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cuda-${{ matrix.arch }}
+          path: /tmp/cuda/
+
+  # ==========================================================================
   # Build agent rootfs (both architectures)
   # ==========================================================================
   build-rootfs:
     name: Build rootfs (${{ matrix.arch }})
-    needs: build-agent
+    needs: [build-agent, build-cuda]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -97,11 +177,33 @@ jobs:
           name: agent-${{ matrix.arch }}
           path: /tmp/agent/
 
+      - name: Download CUDA artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: cuda-${{ matrix.arch }}
+          path: /tmp/cuda/
+
       - name: Build rootfs
         run: |
-          chmod +x /tmp/agent/smolvm-agent
+          chmod +x /tmp/agent/smolvm-agent /tmp/cuda/smolvm-cuda-run
           AGENT_BINARY=/tmp/agent/smolvm-agent \
+          CUDA_GUEST_BINARY=/tmp/cuda/smolvm-cuda-run \
+          CUDART_SHIM_BINARY=/tmp/cuda/libcudart-shim.so \
+          CUDA_DRIVER_SHIM_BINARY=/tmp/cuda/libcuda.so.1 \
             ./scripts/build-agent-rootfs.sh --arch ${{ matrix.arch }} --no-build-agent
+
+      - name: Verify CUDA artifacts bundled
+        run: |
+          for f in \
+            usr/local/lib/smolvm-cuda/libcudart-shim.so \
+            usr/local/lib/smolvm-cuda/libcuda.so.1 \
+            usr/local/bin/smolvm-cuda-run; do
+            if [[ ! -f "target/agent-rootfs/$f" ]]; then
+              echo "::error::missing $f in agent-rootfs (CUDA auto-staging would be disabled)"
+              exit 1
+            fi
+          done
+          echo "CUDA shims + runner present in agent-rootfs"
 
       - name: Package rootfs as tarball
         run: |

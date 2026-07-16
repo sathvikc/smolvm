@@ -102,6 +102,34 @@ pub fn run(sock: &Path) -> io::Result<()> {
                             match stream {
                                 Ok(s) => {
                                     let _ = s.set_nodelay(true); // low-latency RPC
+                                    // Path 3: a REMOTE isolating fork clone (its VM
+                                    // proxies here over TCP) gets a worker process
+                                    // exactly like a local one — the golden's memory
+                                    // and the clone worker both live on THIS GPU
+                                    // host; only the RPC crosses the network.
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::io::AsRawFd;
+                                        let fd = s.as_raw_fd();
+                                        if let Some(token) = peek_clone_token(fd) {
+                                            match spawn_clone_worker(fd, token) {
+                                                Ok(()) => {
+                                                    tracing::info!(
+                                                        token,
+                                                        "routed REMOTE isolating clone to a worker process"
+                                                    );
+                                                    drop(s); // the worker owns it now
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    // See the UDS arm: reject, fail fast.
+                                                    tracing::warn!(error = %e, token, "remote clone-worker spawn failed; rejecting the clone connection");
+                                                    drop(s);
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
                                     spawn_serve(s, &active_tcp);
                                 }
                                 Err(e) => {
@@ -126,7 +154,38 @@ pub fn run(sock: &Path) -> io::Result<()> {
         match stream {
             // Count the connection open for the whole serve loop so a frozen golden
             // (idle but connected) keeps the daemon alive for its clones.
-            Ok(stream) => spawn_serve(stream, &active),
+            Ok(stream) => {
+                // Path 3 (M1): an isolating fork clone is served in its own worker
+                // PROCESS (own context/UVA) so it can hold memory at the golden's
+                // exact VAs. Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = stream.as_raw_fd();
+                    if let Some(token) = peek_clone_token(fd) {
+                        match spawn_clone_worker(fd, token) {
+                            Ok(()) => {
+                                tracing::info!(token, "routed isolating clone to a worker process");
+                                drop(stream); // the worker owns the connection now
+                                continue;
+                            }
+                            Err(e) => {
+                                // REJECT rather than serve in-process: this IS an
+                                // isolating clone (peek matched), and the legacy
+                                // shared path can't serve it — its inherited
+                                // pointers are garbage in a fresh context, so the
+                                // guest would wedge mid-training (seen after a
+                                // daemon restart orphaned a lineage). Closing
+                                // makes the guest fail fast instead.
+                                tracing::warn!(error = %e, token, "clone-worker spawn failed; rejecting the clone connection");
+                                drop(stream);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                spawn_serve(stream, &active);
+            }
             Err(e) => tracing::debug!(error = %e, "CUDA daemon accept error"),
         }
     }
@@ -181,6 +240,586 @@ fn make_backend() -> Box<dyn Backend> {
             Box::<CpuBackend>::default()
         }
     }
+}
+
+/// Path 3 (M1): serve one isolating fork-clone connection in THIS separate worker
+/// process. A per-clone process has its own CUDA primary context and thus its own
+/// UVA space, so it can place memory at the golden's exact virtual addresses
+/// (address-preserving isolation — no per-op pointer translation). The daemon
+/// spawns us with the accepted connection's fd (see the clone routing in
+/// `spawn_serve`). M2 (golden-state reconstruction) and M3 (module/graph rebuild)
+/// hook in before the serve loop; establishing the process boundary comes first.
+pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
+    use std::os::unix::io::FromRawFd;
+    let mut backend = make_backend();
+    // Our own primary context (separate process ⇒ own UVA), so we can place memory
+    // at the golden's exact VAs.
+    let _ = backend.init();
+    let _ = backend.primary_ctx_retain(0);
+    // M2: reconstruct the golden's memory at its exact VAs from the layout the
+    // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
+    // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
+    if let Ok(layout) = std::env::var("SMOLVM_CUDA_CLONE_LAYOUT") {
+        let (n, vmm_trans) = reconstruct_golden_memory(backend.as_mut(), &layout);
+        tracing::info!(
+            maps = n,
+            vmm_handles = vmm_trans.len(),
+            "cuda clone-worker: reconstructed golden memory at its VAs"
+        );
+        // The clone unmaps/releases inherited chunks by their GOLDEN handle
+        // values (torch expandable_segments trims segments under pressure);
+        // untranslated, cuMemRelease segfaults on the foreign-context handle.
+        smolvm_cuda::host::set_vmm_trans(vmm_trans);
+        // Barrier: VMM reconstruction must fully settle before the clone runs, or a
+        // later cuModuleLoadData surfaces a sticky async fault from the copies.
+        if let Err(e) = backend.ctx_synchronize() {
+            tracing::warn!(e, "clone-worker: sync after memory reconstruction failed");
+        }
+    }
+    // M3a: STAGE the golden's modules/functions for LAZY reload in OUR context
+    // (reloading all up front stalls serving ~2s and breaks the clone connection)
+    // + recreate streams/events, then install the translation so the clone's
+    // inherited kernel launches resolve (each module reloads on first use).
+    if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
+        let (mod_images, func_meta, streams, events) =
+            reconstruct_golden_modules(backend.as_mut(), &modpath);
+        let (nm, nf, ns, ne) = (
+            mod_images.len(),
+            func_meta.len(),
+            streams.len(),
+            events.len(),
+        );
+        smolvm_cuda::host::set_handle_trans(mod_images, func_meta, streams, events);
+        let _ = std::fs::remove_file(&modpath);
+        tracing::info!(
+            modules = nm,
+            functions = nf,
+            streams = ns,
+            events = ne,
+            "cuda clone-worker: staged modules for lazy reload + remapped handles"
+        );
+    }
+    // The handed-off connection may be a local UDS (VM on this host) or a TCP
+    // socket (remote client driving this GPU host) — wrap by actual domain.
+    // (getsockname is portable unix; SO_DOMAIN would be Linux-only.)
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: plain getsockname on a valid fd with a correctly-sized out buffer.
+    unsafe {
+        libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len);
+    }
+    let domain = libc::c_int::from(addr.ss_family);
+    tracing::info!(
+        fd,
+        tcp = domain != libc::AF_UNIX,
+        "cuda clone-worker: serving in its own context / UVA space"
+    );
+    if domain == libc::AF_UNIX {
+        // SAFETY: the daemon handed us sole ownership of the accepted fd.
+        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        serve(stream, backend.as_mut())
+    } else {
+        // SAFETY: as above; a TCP connection from the daemon's network listener.
+        let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let _ = stream.set_nodelay(true);
+        serve(stream, backend.as_mut())
+    }
+}
+
+/// IPC-import a golden physical from `fd`, retrying on transient failure with a
+/// ctx_synchronize between attempts. Defense-in-depth: the deterministic e=999
+/// import failure was the CLOEXEC fd handoff (fixed in spawn_clone_worker); this
+/// guards the remaining first-import-in-fresh-context warm-up window.
+#[cfg(unix)]
+fn import_with_retry(b: &mut dyn Backend, fd: i32) -> Result<u64, i32> {
+    let mut last = 0;
+    for attempt in 0..5 {
+        match b.mem_import_handle(fd) {
+            Ok(h) => {
+                if attempt > 0 {
+                    tracing::info!(fd, attempt, "M2: import succeeded on retry");
+                }
+                return Ok(h);
+            }
+            Err(e) => {
+                last = e;
+                let _ = b.ctx_synchronize();
+            }
+        }
+    }
+    Err(last)
+}
+
+/// M2: rebuild the golden's VMM layout in THIS worker's context at the golden's
+/// EXACT VAs. `layout` = `"resv=va:size,…|maps=va:size:fdidx:loaded:ghandle,…"` (hex);
+/// each map's physical was exported by the daemon to fd `4 + fdidx`. We import +
+/// map at the same VA — address-preserving, so inherited pointers and rebuilt
+/// graphs are valid verbatim. (Weights are shared here; private-mutable copy for
+/// full isolation is the next refinement.)
+///
+/// Also returns the golden-handle → worker-handle map (from `ghandle`): the
+/// clone's torch later unmaps/releases inherited chunks by their GOLDEN handle
+/// values, and cuMemRelease on a foreign-context handle SEGFAULTS the worker.
+#[cfg(unix)]
+fn reconstruct_golden_memory(
+    b: &mut dyn Backend,
+    layout: &str,
+) -> (usize, std::collections::HashMap<u64, u64>) {
+    let mut vmm_trans = std::collections::HashMap::new();
+    let (mut resv_s, mut maps_s) = ("", "");
+    for part in layout.split('|') {
+        if let Some(r) = part.strip_prefix("resv=") {
+            resv_s = r;
+        }
+        if let Some(m) = part.strip_prefix("maps=") {
+            maps_s = m;
+        }
+    }
+    let hx = |s: &str| u64::from_str_radix(s, 16).ok();
+    for e in resv_s.split(',').filter(|s| !s.is_empty()) {
+        if let Some((va, size)) = e.split_once(':') {
+            if let (Some(va), Some(size)) = (hx(va), hx(size)) {
+                if let Err(e) = b.mem_address_reserve_fixed(size, 0, va) {
+                    tracing::warn!(e, va, "M2: reserve-fixed failed");
+                }
+            }
+        }
+    }
+    let share_weights = smolvm_cuda::host::path3_share_weights_enabled();
+    let (mut count, mut shared) = (0, 0);
+    for e in maps_s.split(',').filter(|s| !s.is_empty()) {
+        let f: Vec<&str> = e.split(':').collect();
+        if f.len() < 3 {
+            continue;
+        }
+        let (Some(va), Some(size), Ok(idx)) = (hx(f[0]), hx(f[1]), f[2].parse::<i32>()) else {
+            continue;
+        };
+        // 4th field (loaded) marks a fully-H2D-covered weight range; 5th is the
+        // golden's handle value for this chunk (hex).
+        let loaded = f.get(3).map(|s| *s == "1").unwrap_or(false);
+        let golden_h = f.get(4).and_then(|s| hx(s));
+
+        // DENSITY (opt-in, SMOLVM_CUDA_FORK_SHARE_WEIGHTS): a loaded weight range is
+        // read-only during frozen-base fine-tuning (LoRA freezes the base; only the
+        // clone's PRIVATE adapters train), so SHARE the golden's physical at its VA —
+        // every clone imports the same physical, so one weight set lives in VRAM.
+        // Mapped READ-WRITE: unsloth's fix_untrained_tokens writes the embedding at
+        // trainer setup, and that write is identical across clones (same base → same
+        // fix), so sharing stays correct for this use case (verified by each clone
+        // still learning its distinct task). On ANY share failure, fall through to a
+        // private copy — never leave the VA unmapped (a hole faults the clone).
+        if share_weights && loaded {
+            let mut ok = false;
+            if let Ok(gh) = import_with_retry(b, 4 + idx) {
+                if b.mem_map(va, size, 0, gh).is_ok() {
+                    if b.mem_set_access(va, size, 0).is_ok() {
+                        ok = true;
+                    } else {
+                        let _ = b.mem_unmap(va, size); // roll back for the fallback
+                    }
+                }
+                match (ok, golden_h) {
+                    // Keep gh held and record golden→worker: the clone later
+                    // releases this chunk by the GOLDEN's handle value.
+                    (true, Some(g)) => {
+                        vmm_trans.insert(g, gh);
+                    }
+                    // Legacy layout (no handle field) or failure: the va mapping
+                    // holds its own ref, so drop ours.
+                    _ => {
+                        let _ = b.mem_release(gh);
+                    }
+                }
+            }
+            if ok {
+                shared += 1;
+                count += 1;
+                continue;
+            }
+            tracing::warn!(idx, "M2-share: share failed → private-copy fallback");
+            // fall through to the private path (va stays reserved + unmapped)
+        }
+        // Private-mutable, address-preserving: map a PRIVATE physical at the golden
+        // VA, then copy the golden's bytes in via a temp mapping of the imported
+        // physical. Reads see the golden's data; writes hit the clone's own copy,
+        // so a clone can't corrupt the frozen golden.
+        let priv_h = match b.mem_create(size, 0) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(e, "M2: private create failed");
+                continue;
+            }
+        };
+        if let Err(e) = b.mem_map(va, size, 0, priv_h) {
+            tracing::warn!(e, va, "M2: private map failed");
+            continue;
+        }
+        // priv_h stays held (never released here): the clone releases this chunk
+        // post-fork by the GOLDEN's handle value, translated to priv_h.
+        if let Some(g) = golden_h {
+            vmm_trans.insert(g, priv_h);
+        }
+        if let Err(e) = b.mem_set_access(va, size, 0) {
+            tracing::warn!(e, va, "M2: private set_access failed");
+        }
+        match import_with_retry(b, 4 + idx) {
+            Ok(gh) => {
+                if let Ok(tmp) = b.mem_address_reserve(size, 0) {
+                    match b.mem_map(tmp, size, 0, gh) {
+                        Ok(()) => {
+                            if let Err(e) = b.mem_set_access(tmp, size, 0) {
+                                tracing::warn!(e, "M2: temp set_access failed");
+                            }
+                            if let Err(e) = b.memcpy_dtod(va, tmp, size) {
+                                tracing::warn!(e, va, tmp, "M2: dtod copy failed");
+                            }
+                            // The copy must finish before we unmap the temp source,
+                            // or the in-flight copy faults on unmapped memory.
+                            let _ = b.ctx_synchronize();
+                            let _ = b.mem_unmap(tmp, size);
+                        }
+                        Err(e) => tracing::warn!(e, tmp, "M2: temp map failed"),
+                    }
+                    let _ = b.mem_address_free(tmp, size);
+                }
+                let _ = b.mem_release(gh);
+            }
+            Err(e) => tracing::warn!(e, idx, "M2: import failed"),
+        }
+        count += 1;
+    }
+    if share_weights {
+        tracing::info!(shared, private = count - shared, "M2: shared weight ranges");
+    }
+    (count, vmm_trans)
+}
+
+/// M3a: parse the golden's module IMAGES + function METADATA (for LAZY reload in
+/// THIS worker at first use — reloading ~400 modules up front stalls the clone
+/// ~2s and breaks its connection) and RECREATE its streams/events now (few,
+/// cheap). Returns `(mod_images, func_meta, streams, events)`. Reads the blob the
+/// daemon wrote (path in `SMOLVM_CUDA_CLONE_MODULES`):
+/// `[u32 nmods]([u64 h][u32 len][image])* [u32 nfuncs]([u64 fn][u64 mod][u32 len][name])*
+///  [u32 nstreams]([u64 h][u32 flags])* [u32 nevents]([u64 h][u32 flags])*`.
+#[cfg(unix)]
+#[allow(clippy::type_complexity)]
+fn reconstruct_golden_modules(
+    b: &mut dyn Backend,
+    path: &str,
+) -> (
+    Vec<(u64, Vec<u8>)>,
+    Vec<(u64, u64, String)>,
+    Vec<(u64, u64)>,
+    Vec<(u64, u64)>,
+) {
+    let mut mod_images = Vec::new();
+    let mut func_meta = Vec::new();
+    let mut stream_trans = Vec::new();
+    let mut event_trans = Vec::new();
+    let Ok(buf) = std::fs::read(path) else {
+        return (mod_images, func_meta, stream_trans, event_trans);
+    };
+    let mut p = 0usize;
+    macro_rules! need {
+        ($n:expr) => {
+            if p + $n > buf.len() {
+                return (mod_images, func_meta, stream_trans, event_trans);
+            }
+        };
+    }
+    macro_rules! ru32 {
+        () => {{
+            need!(4);
+            let v = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+            p += 4;
+            v
+        }};
+    }
+    macro_rules! ru64 {
+        () => {{
+            need!(8);
+            let v = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+            p += 8;
+            v
+        }};
+    }
+    // Modules: just STAGE the images (reloaded lazily on first use in the worker).
+    let nmods = ru32!();
+    for _ in 0..nmods {
+        let gh = ru64!();
+        let ilen = ru32!() as usize;
+        need!(ilen);
+        mod_images.push((gh, buf[p..p + ilen].to_vec()));
+        p += ilen;
+    }
+    // Functions: stage golden fn → (golden module, name); resolved lazily.
+    let nfuncs = ru32!();
+    for _ in 0..nfuncs {
+        let gf = ru64!();
+        let gm = ru64!();
+        let nlen = ru32!() as usize;
+        need!(nlen);
+        let name = String::from_utf8_lossy(&buf[p..p + nlen]).into_owned();
+        p += nlen;
+        func_meta.push((gf, gm, name));
+    }
+    // Streams + events: recreate each with its golden create flags in OUR context,
+    // mapping the golden's inherited raw handle → our own (same M3a pattern).
+    let nstreams = ru32!();
+    for _ in 0..nstreams {
+        let gs = ru64!();
+        let flags = ru32!();
+        match b.stream_create(flags) {
+            Ok(ws) => stream_trans.push((gs, ws)),
+            Err(e) => tracing::warn!(e, "M3a: stream recreate failed"),
+        }
+    }
+    let nevents = ru32!();
+    for _ in 0..nevents {
+        let ge = ru64!();
+        let flags = ru32!();
+        match b.event_create(flags) {
+            Ok(we) => event_trans.push((ge, we)),
+            Err(e) => tracing::warn!(e, "M3a: event recreate failed"),
+        }
+    }
+    tracing::info!(
+        nmods,
+        nfuncs,
+        nstreams,
+        nevents,
+        streams = stream_trans.len(),
+        events = event_trans.len(),
+        "M3a: staged golden modules/functions for lazy reload + recreated streams/events"
+    );
+    (mod_images, func_meta, stream_trans, event_trans)
+}
+
+/// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an
+/// isolating fork-clone Init (`op == Init`, `resume_token != 0`) that should be
+/// served in a dedicated worker process. `MSG_PEEK` leaves the bytes on the
+/// socket so the worker reads them fresh. Gated behind `SMOLVM_CUDA_FORK_WORKERS` (unset
+/// = legacy shared-context path) so partial Path-3 wiring can't disturb serving.
+#[cfg(unix)]
+fn peek_clone_token(fd: std::os::unix::io::RawFd) -> Option<u64> {
+    if std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_none()
+        || std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_none()
+    {
+        return None;
+    }
+    // framing: [u32 le len][op][proto_hash u64][resume_token u64]
+    let mut buf = [0u8; 21];
+    // The connection is often proxied (guest vsock → per-VM cuda_host proxy →
+    // daemon unix socket), so the 21-byte Init can arrive in pieces AFTER accept.
+    // A one-shot peek that saw a short read here would MISROUTE the isolating
+    // clone to the legacy shared-context path (which fails for expandable_segments
+    // → CUDA_ERROR_UNKNOWN, esp. at larger models). Retry the non-consuming peek
+    // until the full header is buffered (or the peer closes / we time out ~1s).
+    let mut n: isize = 0;
+    for _ in 0..200 {
+        n = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n >= 21 || n == 0 {
+            break; // full header buffered, or peer closed
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if n < 21 || buf[4] != 0x01 {
+        tracing::warn!(
+            n,
+            op = buf[4],
+            "peek_clone_token: not routed (short read / non-Init)"
+        );
+        return None;
+    }
+    let token = u64::from_le_bytes(buf[13..21].try_into().unwrap());
+    (token != 0).then_some(token)
+}
+
+/// Fork-time share-safety check: D2H the chunk and confirm every recorded
+/// upload segment still hashes to its H2D-time CRC. Any mismatch (or D2H
+/// failure) → not shareable.
+#[cfg(unix)]
+fn verify_chunk_content(b: &mut dyn Backend, ch: &smolvm_cuda::host::HandoffChunk) -> bool {
+    match b.memcpy_dtoh(ch.va, ch.size, 0) {
+        Ok(bytes) => ch.segs.iter().all(|&(s, e, crc)| {
+            crc != 0
+                && e as usize <= bytes.len()
+                && smolvm_cuda::host::fnv64(&bytes[s as usize..e as usize]) == crc
+        }),
+        Err(e) => {
+            tracing::warn!(e, va = ch.va, "M2-share: verify D2H failed → private");
+            false
+        }
+    }
+}
+
+/// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
+/// CUDA context, hence its own UVA — so it can place memory at the golden's exact
+/// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
+/// `smolvm _cuda-clone-worker 3`; the daemon then drops its own copy.
+#[cfg(unix)]
+fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    // Gather the golden's VMM layout (reservations + maps→physical handle).
+    let (resvs, maps) = smolvm_cuda::host::layout_handoff_snapshot(token)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no golden layout for token"))?;
+    // Export each map's physical to a POSIX fd (in the golden's shared context) and
+    // build the layout string the worker parses
+    // ("resv=va:size,…|maps=va:size:fdidx:loaded:ghandle,…"; loaded=1 → shareable
+    // weight; ghandle = the golden's
+    // handle value, so the worker can translate the clone's inherited
+    // MemRelease/MemMap handles to its own).
+    let mut backend = make_backend();
+    backend
+        .init()
+        .map_err(|e| io::Error::other(format!("worker-export init: {e}")))?;
+    backend
+        .primary_ctx_retain(0)
+        .map_err(|e| io::Error::other(format!("ctx retain: {e}")))?;
+    // Commit the golden's pending device work so its writes are visible in the
+    // physical the clone will IPC-import (the golden runs on another thread of the
+    // shared primary context).
+    let _ = backend.ctx_synchronize();
+    let mut layout = String::from("resv=");
+    for (va, size) in &resvs {
+        layout.push_str(&format!("{va:x}:{size:x},"));
+    }
+    layout.push_str("|maps=");
+    let mut export_fds: Vec<i32> = Vec::new();
+    for ch in &maps {
+        if let Ok(efd) = backend.mem_export_handle(ch.handle) {
+            let idx = export_fds.len();
+            export_fds.push(efd);
+            // Share-safety: a candidate chunk is shared only if its device
+            // content still equals what the H2Ds uploaded (any kernel write —
+            // e.g. LoRA adapters placed in freed weight space — must keep the
+            // chunk private or clone writes leak through the shared physical).
+            // Verified once per frozen golden; verdict cached.
+            let safe = match (ch.candidate, ch.verified) {
+                (false, _) => false,
+                (true, Some(v)) => v,
+                (true, None) => {
+                    let v = verify_chunk_content(backend.as_mut(), ch);
+                    smolvm_cuda::host::layout_set_share_verdict(token, ch.va, v);
+                    v
+                }
+            };
+            let ld = u8::from(safe);
+            layout.push_str(&format!(
+                "{:x}:{:x}:{}:{}:{:x},",
+                ch.va, ch.size, idx, ld, ch.handle
+            ));
+        }
+    }
+    // M3a: serialize the golden's modules (images) + functions to a temp file for
+    // the worker to reload + remap. Images are MB-scale, so a file, not env.
+    let mut modpath: Option<String> = None;
+    if let Some((modules, funcs, streams, events)) =
+        smolvm_cuda::host::module_handoff_snapshot(token)
+    {
+        tracing::info!(
+            modules = modules.len(),
+            funcs = funcs.len(),
+            streams = streams.len(),
+            events = events.len(),
+            "M3a: gathered golden modules/functions/streams/events"
+        );
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(modules.len() as u32).to_le_bytes());
+        for (h, img) in &modules {
+            blob.extend_from_slice(&h.to_le_bytes());
+            blob.extend_from_slice(&(img.len() as u32).to_le_bytes());
+            blob.extend_from_slice(img);
+        }
+        blob.extend_from_slice(&(funcs.len() as u32).to_le_bytes());
+        for (h, m, n) in &funcs {
+            blob.extend_from_slice(&h.to_le_bytes());
+            blob.extend_from_slice(&m.to_le_bytes());
+            blob.extend_from_slice(&(n.len() as u32).to_le_bytes());
+            blob.extend_from_slice(n.as_bytes());
+        }
+        // Streams + events: [u64 golden handle][u32 create flags] each.
+        blob.extend_from_slice(&(streams.len() as u32).to_le_bytes());
+        for (h, flags) in &streams {
+            blob.extend_from_slice(&h.to_le_bytes());
+            blob.extend_from_slice(&flags.to_le_bytes());
+        }
+        blob.extend_from_slice(&(events.len() as u32).to_le_bytes());
+        for (h, flags) in &events {
+            blob.extend_from_slice(&h.to_le_bytes());
+            blob.extend_from_slice(&flags.to_le_bytes());
+        }
+        let _ = std::fs::create_dir_all("/tmp/smolvm");
+        // Unique per SPAWN, not per (token, conn_fd): fd numbers are reused as
+        // soon as the daemon closes a spawned worker's copy, so two clones forked
+        // near-simultaneously collide on the same path — and each worker deletes
+        // its blob after staging, leaving the second worker 0 modules (its kernel
+        // launches then use raw golden handles → SIGSEGV in cuLaunchKernel).
+        static SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mp = format!("/tmp/smolvm/clone-mods-{token}-{seq}.bin");
+        if std::fs::write(&mp, &blob).is_ok() {
+            modpath = Some(mp);
+        }
+    }
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("_cuda-clone-worker").arg("3");
+    cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
+    if let Some(mp) = &modpath {
+        cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
+    }
+    // Parent copies of the exported-physical fds, to close once the child has
+    // forked (it inherits its own set). Every open export fd holds a DRIVER
+    // REFERENCE on the golden's physical allocation — leaking them in the
+    // daemon pins the golden's VRAM long after the golden is torn down and its
+    // session reclaimed (found: two dead goldens left ~3.2 GB resident).
+    let parent_fds = export_fds.clone();
+    // SAFETY: dup2 in the forked child (async-signal-safe); fds were inherited at
+    // fork. Connection → fd 3; each exported physical → fd 4+idx.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(conn_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for (i, efd) in export_fds.iter().enumerate() {
+                if libc::dup2(*efd, 4 + i as i32) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            // The export fds from cuMemExportToShareableHandle are O_CLOEXEC. dup2 to
+            // a DIFFERENT fd clears CLOEXEC, but dup2(fd, fd) — when an export fd
+            // already sits at its destination (commonly the first, fd 4) — is a
+            // no-op that does NOT clear it, so that fd would be closed on exec and
+            // the worker's import fails e=999 (a region left uninitialized → a later
+            // read of a weight there faults). Clear CLOEXEC on every handed-off fd.
+            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for i in 0..export_fds.len() as i32 {
+                if libc::fcntl(4 + i, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let spawned = cmd.spawn().map(|_| ());
+    // The child (if any) forked with its own copies; drop ours either way so
+    // the golden's physicals can actually be released at teardown.
+    for efd in parent_fds {
+        // SAFETY: fds we created via mem_export_handle and no longer use.
+        unsafe { libc::close(efd) };
+    }
+    spawned
 }
 
 /// Ensure the shared daemon is running and return its socket path. Serialized by

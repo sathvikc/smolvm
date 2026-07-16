@@ -308,43 +308,60 @@ fi
 # CUDA guest shims: glibc cdylibs the agent bind-mounts into workload
 # containers on `--cuda` (see crates/smolvm-agent/src/cuda.rs). They are loaded
 # by the container's glibc — not by the (musl) agent — so they build for the
-# native gnu target. Best-effort: without them `--cuda` still works, the user
-# just stages shims manually; cross-arch rootfs builds skip them.
-if [[ "$NO_BUILD_AGENT" != "1" && "$(uname -s)" == "Linux" && "$(uname -m)" == "$ALPINE_ARCH" ]] \
+# native gnu target.
+#
+# Two ways to supply them, in priority order:
+#   1. Prebuilt paths via CUDART_SHIM_BINARY + CUDA_DRIVER_SHIM_BINARY (how the
+#      release workflow ships them: built once per arch, incl. cross-compiled
+#      aarch64, then installed here regardless of --no-build-agent).
+#   2. Native `cargo build` fallback (local dev on a matching-arch Linux host).
+# Best-effort: without them `--cuda` still works, the user just stages shims
+# manually.
+CUDART_SHIM_SRC="${CUDART_SHIM_BINARY:-}"
+CUDA_DRIVER_SHIM_SRC="${CUDA_DRIVER_SHIM_BINARY:-}"
+
+if { [[ -z "$CUDART_SHIM_SRC" ]] || [[ -z "$CUDA_DRIVER_SHIM_SRC" ]]; } \
+    && [[ "$NO_BUILD_AGENT" != "1" && "$(uname -s)" == "Linux" && "$(uname -m)" == "$ALPINE_ARCH" ]] \
     && command -v cargo &> /dev/null; then
     echo "Building CUDA guest shims (native gnu target)..."
     if cargo build --release -p smolvm-cudart-shim -p smolvm-cuda-shim \
         --manifest-path "$PROJECT_ROOT/Cargo.toml"; then
-        mkdir -p "$OUTPUT_DIR/usr/local/lib/smolvm-cuda"
-        cp "$PROJECT_ROOT/target/release/libcudart.so" \
-            "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcudart-shim.so"
-        cp "$PROJECT_ROOT/target/release/libcuda.so" \
-            "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcuda.so.1"
-        echo "Installed CUDA guest shims"
-        # Stamp the shims' wire fingerprint into the rootfs so the host can flag a
-        # stale rootfs at boot (internal_boot's warn_if_stale_cuda_shim) instead of
-        # leaving the user with an opaque cuInit failure. Read it from the guest
-        # runner (built from the same smolvm-cuda source as the shims, so the same
-        # PROTO_HASH); fall back to a quick native build of that same binary.
-        PROTO_HASH=""
-        if [[ -n "${CUDA_GUEST_BINARY:-}" && -x "${CUDA_GUEST_BINARY:-}" ]]; then
-            PROTO_HASH="$("$CUDA_GUEST_BINARY" --proto-hash 2>/dev/null || true)"
-        fi
-        if [[ -z "$PROTO_HASH" ]]; then
-            PROTO_HASH="$(cargo run --release -q -p smolvm-cuda-guest \
-                --manifest-path "$PROJECT_ROOT/Cargo.toml" -- --proto-hash 2>/dev/null || true)"
-        fi
-        if [[ -n "$PROTO_HASH" ]]; then
-            printf '%s\n' "$PROTO_HASH" > "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/proto-hash"
-            echo "Stamped CUDA shim proto-hash: $PROTO_HASH"
-        else
-            echo "Could not determine CUDA proto-hash — rootfs left unstamped (boot check skips)"
-        fi
+        CUDART_SHIM_SRC="${CUDART_SHIM_SRC:-$PROJECT_ROOT/target/release/libcudart.so}"
+        CUDA_DRIVER_SHIM_SRC="${CUDA_DRIVER_SHIM_SRC:-$PROJECT_ROOT/target/release/libcuda.so}"
     else
         echo "CUDA guest shim build failed — rootfs ships without auto-staging"
     fi
+fi
+
+if [[ -n "$CUDART_SHIM_SRC" && -f "$CUDART_SHIM_SRC" \
+      && -n "$CUDA_DRIVER_SHIM_SRC" && -f "$CUDA_DRIVER_SHIM_SRC" ]]; then
+    echo "Installing CUDA guest shims..."
+    mkdir -p "$OUTPUT_DIR/usr/local/lib/smolvm-cuda"
+    cp "$CUDART_SHIM_SRC" "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcudart-shim.so"
+    cp "$CUDA_DRIVER_SHIM_SRC" "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcuda.so.1"
+    echo "Installed CUDA guest shims"
+    # Stamp the shims' wire fingerprint into the rootfs so the host can flag a
+    # stale rootfs at boot (internal_boot's warn_if_stale_cuda_shim) instead of
+    # leaving the user with an opaque cuInit failure. Works for both the prebuilt
+    # (release) and native-build paths. Read it from the guest runner (built from
+    # the same smolvm-cuda source as the shims, so the same PROTO_HASH); fall back
+    # to a quick native build of that same binary when cargo is available.
+    PROTO_HASH=""
+    if [[ -n "${CUDA_GUEST_BINARY:-}" && -x "${CUDA_GUEST_BINARY:-}" ]]; then
+        PROTO_HASH="$("$CUDA_GUEST_BINARY" --proto-hash 2>/dev/null || true)"
+    fi
+    if [[ -z "$PROTO_HASH" ]] && command -v cargo &> /dev/null; then
+        PROTO_HASH="$(cargo run --release -q -p smolvm-cuda-guest \
+            --manifest-path "$PROJECT_ROOT/Cargo.toml" -- --proto-hash 2>/dev/null || true)"
+    fi
+    if [[ -n "$PROTO_HASH" ]]; then
+        printf '%s\n' "$PROTO_HASH" > "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/proto-hash"
+        echo "Stamped CUDA shim proto-hash: $PROTO_HASH"
+    else
+        echo "Could not determine CUDA proto-hash — rootfs left unstamped (boot check skips)"
+    fi
 else
-    echo "Skipping CUDA guest shims (cross-arch or no cargo) — auto-staging disabled in this rootfs"
+    echo "Skipping CUDA guest shims (no prebuilt paths, cross-arch, or no cargo) — auto-staging disabled in this rootfs"
 fi
 
 echo ""
