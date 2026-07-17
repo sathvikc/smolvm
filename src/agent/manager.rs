@@ -1721,9 +1721,12 @@ impl AgentManager {
         // otherwise the VMM stays root and reads the shared copy directly.
         let mut uid_drop_active = false;
         if let Some(d) = data_dir.as_deref() {
-            if let Some(result) =
-                crate::process::vm_drop_ids(&registry, d, features.snapshot_dir.as_deref())
-            {
+            if let Some(result) = crate::process::vm_drop_ids(
+                &registry,
+                d,
+                features.snapshot_dir.as_deref(),
+                features.uid_share_dir.as_deref(),
+            ) {
                 // The drop is active — allocation MUST succeed or we refuse to boot
                 // (fail closed; never silently run the VMM over-privileged).
                 let (uid, gid) = result.map_err(|e| {
@@ -1822,6 +1825,7 @@ impl AgentManager {
             // the machine's resources (the embedded SDK/CLI path sets the latter).
             cuda: features.cuda || resources_for_config.cuda,
             expose_docker: features.expose_docker,
+            published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
