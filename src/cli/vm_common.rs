@@ -687,6 +687,9 @@ pub struct ForkLaunch {
     pub snapshot_dir: Option<std::path::PathBuf>,
     /// Control socket path (set together with `forkable`).
     pub control_socket: Option<std::path::PathBuf>,
+    /// Clone boot only: share the golden's loaded CUDA weights instead of
+    /// copying them (`machine fork --share-weights`).
+    pub share_weights: bool,
 }
 
 /// Fork parameters for starting `name` as a forkable base (memfd RAM + a control
@@ -696,6 +699,7 @@ pub fn forkable_launch(name: &str) -> ForkLaunch {
         forkable: true,
         control_socket: Some(smolvm::agent::fork::control_socket_path(name)),
         snapshot_dir: None,
+        share_weights: false,
     }
 }
 
@@ -710,6 +714,7 @@ pub fn fork_vm(
     clone: &str,
     clone_forkable: bool,
     pinned_ports: &[(u16, u16)],
+    share_weights: bool,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
@@ -737,6 +742,7 @@ pub fn fork_vm(
         /* from_snapshot */ true,
         ForkLaunch {
             snapshot_dir: Some(prep.snapshot_dir.clone()),
+            share_weights,
             ..Default::default()
         },
     );
@@ -935,6 +941,7 @@ pub fn start_vm_named(
     features.forkable = fork.forkable;
     features.snapshot_dir = fork.snapshot_dir;
     features.control_socket = fork.control_socket;
+    features.cuda_share_weights = fork.share_weights;
     // A machine created from a local image archive/dir persists a `local:…`
     // reference; re-derive its virtiofs mount dir so the guest assembles the
     // rootfs from it instead of pulling.
@@ -1072,22 +1079,18 @@ pub fn start_vm_named(
         // container and hang every later `machine exec`, so skip the (re)launch
         // entirely when restoring from a snapshot — the forked container is
         // inherited as-is.
-        let mut cmd = record.entrypoint.clone();
-        cmd.extend(record.cmd.clone());
+        let _ = img;
         if !from_snapshot {
-            let mount_bindings =
-                crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
-            let bg_config = smolvm::agent::RunConfig::new(img, cmd)
-                .with_env(exec_env.clone())
-                .with_workdir(record.workdir.clone())
-                .with_user(record.user.clone())
-                .with_mounts(mount_bindings)
-                .with_persistent_overlay(Some(name.to_string()));
-            if let Err(e) = client.run_container_detached(bg_config) {
+            if let Err(e) = smolvm::workload::launch_image_workload(
+                &mut client,
+                name,
+                &record,
+                exec_env.clone(),
+            ) {
                 if let Err(stop_err) = manager.stop() {
                     tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
                 }
-                return Err(smolvm::Error::agent("start background CMD", format!("{e}")));
+                return Err(e);
             }
         } else {
             tracing::info!(

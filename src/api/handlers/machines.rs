@@ -468,11 +468,18 @@ pub async fn create_machine(
         } else {
             Some(manifest.image)
         };
+        // CLI-parity precedence: a request-supplied workload overrides the
+        // artifact's baked (entrypoint, cmd).
+        let (ep, cmd) = if req.entrypoint.is_empty() && req.cmd.is_empty() {
+            (manifest.entrypoint, manifest.cmd)
+        } else {
+            (req.entrypoint.clone(), req.cmd.clone())
+        };
         (
             image,
             Some(canonical),
-            manifest.entrypoint,
-            manifest.cmd,
+            ep,
+            cmd,
             env_parsed,
             manifest.workdir,
             manifest.cpus,
@@ -485,8 +492,8 @@ pub async fn create_machine(
         (
             req.image.clone(),
             None,
-            vec![],
-            vec![],
+            req.entrypoint.clone(),
+            req.cmd.clone(),
             vec![],
             None,
             crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
@@ -651,6 +658,7 @@ pub async fn create_machine(
         memory_mb: Some(mem),
         network: Some(network),
         gpu: Some(req.gpu),
+        cuda: Some(req.cuda),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
         allowed_cidrs: req.allowed_cidrs.clone(),
@@ -692,8 +700,8 @@ pub async fn create_machine(
         source_smolmachine,
         entrypoint,
         cmd,
-        env,
-        workdir,
+        env: merge_request_env(env, &req.env),
+        workdir: req.workdir.clone().or(workdir),
         // Record secrets = packed refs from --from (validated Untrusted above)
         // merged with request refs (validated Untrusted at ~line 333); request
         // refs win on key collision. Both sources are store-only, so RecordReplay
@@ -958,10 +966,29 @@ pub async fn start_machine(
                 .collect::<Vec<_>>()
         };
         let overlay_id = name.clone();
-        let launch = with_machine_client_traced(&entry, None, move |c| {
-            if c.query(&image)?.is_none() {
-                c.pull_with_registry_config(&image)?;
+        // Pull the image FIRST, as a FATAL step. A pull failure — the image /
+        // tag doesn't exist, is private without access, or the machine has no
+        // network to reach the registry — is a permanent, user-fixable
+        // condition. Failing the start here surfaces it to the control as a
+        // clear 4xx and marks the machine `error`, instead of proceeding to
+        // `Running` below and leaving a `started` ZOMBIE whose every exec then
+        // fails (and, once billing is on, meters a machine that never worked).
+        // A cached image (`query` returns Some) skips the pull, so this is a
+        // no-op on the stop→restart path. Mirrors how the smolmachine source
+        // fails a bad artifact at create.
+        let image_pull = image.clone();
+        with_machine_client_traced(&entry, None, move |c| {
+            if c.query(&image_pull)?.is_none() {
+                c.pull_with_registry_config(&image_pull)?;
             }
+            Ok(())
+        })
+        .await?;
+        // Launch the workload container. Best-effort past the pull: a transient
+        // crun/overlay hiccup leaves a reachable (exec-able) VM rather than
+        // failing an otherwise-pullable start — the image is already local, so a
+        // retry or the health loop can bring the workload up.
+        let launch = with_machine_client_traced(&entry, None, move |c| {
             let config = crate::agent::RunConfig::new(image, command)
                 .with_env(env)
                 .with_workdir(workdir)
@@ -1056,6 +1083,7 @@ pub async fn fork_machine(
 ) -> Result<Json<MachineInfo>, ApiError> {
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
+    let req_share_weights = req.share_weights;
 
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
     // the same clone can't race the fork's register + boot. The golden is only
@@ -1105,6 +1133,7 @@ pub async fn fork_machine(
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
         features.snapshot_dir = Some(prep.snapshot_dir);
+        features.cuda_share_weights = req_share_weights;
 
         if let Err(e) = manager.ensure_running_via_subprocess(mounts, ports, resources, features) {
             // Boot failed: roll back the clone registration so a failed fork
@@ -1872,6 +1901,20 @@ fn resolve_create_resources(
     )
 }
 
+/// Manifest env is the baseline; request env layers on top and wins on name
+/// collision, so a control plane can override a packed default.
+fn merge_request_env(
+    manifest_env: Vec<(String, String)>,
+    request_env: &[crate::api::types::EnvVar],
+) -> Vec<(String, String)> {
+    let mut merged = manifest_env;
+    for (name, value) in crate::api::types::EnvVar::to_tuples(request_env) {
+        merged.retain(|(existing, _)| existing != &name);
+        merged.push((name, value));
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2028,6 +2071,9 @@ mod tests {
             ports: vec![],
             network: false,
             gpu: false,
+            cuda: false,
+            entrypoint: vec![],
+            cmd: vec![],
             docker_socket: false,
             storage_gb: None,
             overlay_gb: None,
@@ -2041,7 +2087,53 @@ mod tests {
             registry_identity_token: None,
             blob_peers: vec![],
             secrets: Default::default(),
+            env: vec![],
+            workdir: None,
         }
+    }
+
+    #[test]
+    fn request_env_layers_over_manifest_env_and_wins_collisions() {
+        let manifest_env = vec![
+            ("KEEP".to_string(), "manifest".to_string()),
+            ("OVERRIDE".to_string(), "manifest".to_string()),
+        ];
+        let request_env = vec![
+            crate::api::types::EnvVar {
+                name: "OVERRIDE".to_string(),
+                value: "request".to_string(),
+            },
+            crate::api::types::EnvVar {
+                name: "NEW".to_string(),
+                value: "request".to_string(),
+            },
+        ];
+
+        let merged = merge_request_env(manifest_env, &request_env);
+
+        assert_eq!(
+            merged,
+            vec![
+                ("KEEP".to_string(), "manifest".to_string()),
+                ("OVERRIDE".to_string(), "request".to_string()),
+                ("NEW".to_string(), "request".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_request_accepts_env_and_workdir() {
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm",
+            "env": [{"name": "FOO", "value": "bar"}],
+            "workdir": "/app"
+        }))
+        .unwrap();
+
+        assert_eq!(req.env.len(), 1);
+        assert_eq!(req.env[0].name, "FOO");
+        assert_eq!(req.env[0].value, "bar");
+        assert_eq!(req.workdir.as_deref(), Some("/app"));
     }
 
     #[test]

@@ -459,8 +459,11 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     if trace {
         eprintln!("[shim] bring_up: connected fd={fd}");
     }
+    // A fork clone's reconnect handshake waits for its worker's full golden
+    // reconstruction (chunk imports + copies + module staging) — give it real
+    // headroom; a fresh session's handshake stays tight.
     #[cfg(unix)]
-    set_recv_timeout(fd, 10);
+    set_recv_timeout(fd, if resume_token != 0 { 45 } else { 10 });
     let mut client = Client::new(stream);
     let token = client.init(resume_token).map_err(|e| {
         if trace {
@@ -468,6 +471,14 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
         }
         CUDA_ERROR_INITIALIZATION
     })?;
+    // Per-machine GPU pin: guest device 0 maps to host device N and the guest
+    // sees exactly one device. Sent before any device query or ctx retain.
+    if let Some(d) = std::env::var("SMOLVM_CUDA_DEVICE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        let _ = client.set_device_base(d);
+    }
     if trace {
         eprintln!("[shim] bring_up: init ok token={token}");
     }
@@ -572,10 +583,19 @@ fn with_client<T>(
 /// liveness peek can miss it on the very first call (the kernel hasn't surfaced
 /// the reset yet) — so that call fails with a transport error (`999`). This
 /// forces a reconnect and reruns `f`, which then reads from the reconnected
-/// (shared-context) session. Only for idempotent ops (reads, syncs, queries):
-/// `f` runs twice, so it must have no side effects on the first, failed attempt
-/// — which holds here because a transport failure means the op never reached the
-/// host. Takes `Fn` (not `FnOnce`) precisely so it can run twice.
+/// (shared-context) session. For ops safe to rerun after a TRANSPORT failure
+/// (reads, syncs, queries, and sync library calls): the failure means the op
+/// never reached the host, so the retry runs it exactly once. Takes `Fn` (not
+/// `FnOnce`) precisely so it can run twice — closures clone their args per
+/// attempt.
+/// Debug (`SMOLVM_CUDA_SHIM_TRACE=1`): print which generated library wrapper
+/// swallowed an error into its c_int return, with the mapped code.
+fn lib_err_trace(lib: u8, func: u16, code: c_int) {
+    if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+        eprintln!("[lib-err] lib={lib} func={func} code={code}");
+    }
+}
+
 fn with_client_retrying<T>(
     f: impl Fn(&mut Client<Stream>) -> Result<T, CudaRpcError>,
 ) -> Result<T, c_int> {
@@ -660,7 +680,7 @@ pub extern "C" fn cudaDriverGetVersion(version: *mut c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaRuntimeGetVersion(version: *mut c_int) -> c_int {
-    set_last(unsafe { out(version, 12040) })
+    set_last(unsafe { out(version, 13000) })
 }
 
 // ---- memory -----------------------------------------------------------------
@@ -2300,6 +2320,125 @@ pub extern "C" fn cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     let bs = block_size.max(1);
     set_last(unsafe { out(num_blocks, (2048 / bs).clamp(1, 32)) })
 }
+
+// ---- CUDA 13 surface --------------------------------------------------------
+// CUDA 13 renamed several `_v2` entry points back to their base names and cu13
+// wheels (torch 2.11+cu130) bind these from libcudart.so.13 / libcublas*.so.13.
+
+#[no_mangle]
+pub extern "C" fn cudaStreamGetCaptureInfo(
+    stream: *mut c_void,
+    status: *mut c_int,
+    id: *mut u64,
+    graph: *mut *mut c_void,
+    deps: *mut *mut *const c_void,
+    num_deps: *mut usize,
+) -> c_int {
+    cudaStreamGetCaptureInfo_v2(stream, status, id, graph, deps, num_deps)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    num_blocks: *mut c_int,
+    func: *const c_void,
+    block_size: c_int,
+    dynamic_smem: usize,
+) -> c_int {
+    cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+        num_blocks,
+        func,
+        block_size,
+        dynamic_smem,
+        0,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtGetVersion() -> usize {
+    130000
+}
+
+/// Driver entry-point lookup (cudart 13): resolve `symbol` from the staged
+/// driver shim (`libcuda.so.1`) so callers get the same interposed surface as
+/// direct linking. Missing symbols report `SymbolNotFound` via `driver_status`
+/// with a success return, per the cudart contract.
+#[no_mangle]
+pub extern "C" fn cudaGetDriverEntryPointByVersion(
+    symbol: *const c_char,
+    func_ptr: *mut *mut c_void,
+    _cuda_version: c_uint,
+    _flags: u64,
+    driver_status: *mut c_int,
+) -> c_int {
+    extern "C" {
+        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    const RTLD_NOW: c_int = 2;
+    const RTLD_GLOBAL: c_int = 0x100;
+    const ENTRY_POINT_SUCCESS: c_int = 0;
+    const ENTRY_POINT_SYMBOL_NOT_FOUND: c_int = 1;
+    if symbol.is_null() || func_ptr.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let found = unsafe {
+        let lib = dlopen(c"libcuda.so.1".as_ptr(), RTLD_NOW | RTLD_GLOBAL);
+        if lib.is_null() {
+            std::ptr::null_mut()
+        } else {
+            dlsym(lib, symbol)
+        }
+    };
+    unsafe {
+        *func_ptr = found;
+        if !driver_status.is_null() {
+            *driver_status = if found.is_null() {
+                ENTRY_POINT_SYMBOL_NOT_FOUND
+            } else {
+                ENTRY_POINT_SUCCESS
+            };
+        }
+    }
+    set_last(CUDA_SUCCESS)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGetSymbolAddress(
+    _dev_ptr: *mut *mut c_void,
+    _symbol: *const c_void,
+) -> c_int {
+    // Device-global symbol lookup is not remoted; callers treat this as
+    // "symbol unavailable" (cudaErrorInvalidSymbol).
+    set_last(13)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaMemcpyToSymbol(
+    _symbol: *const c_void,
+    _src: *const c_void,
+    _count: usize,
+    _offset: usize,
+    _kind: c_int,
+) -> c_int {
+    set_last(13)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphNodeGetDependencies(
+    _node: *mut c_void,
+    deps: *mut *mut c_void,
+    num_deps: *mut usize,
+) -> c_int {
+    unsafe {
+        if !num_deps.is_null() {
+            if !deps.is_null() && *num_deps > 0 {
+                // No dependency introspection over the wire; report none.
+            }
+            *num_deps = 0;
+        }
+    }
+    set_last(CUDA_SUCCESS)
+}
 #[no_mangle]
 pub extern "C" fn cudaHostRegister(_ptr: *mut c_void, _size: usize, _flags: c_uint) -> c_int {
     set_last(CUDA_SUCCESS)
@@ -2765,14 +2904,14 @@ pub extern "C" fn cudaGetErrorName(error: c_int) -> *const c_char {
 /// Regenerate with `smolvm-cuda-codegen`; do not edit by hand.
 mod gen_cublas {
     #![allow(non_snake_case, clippy::unnecessary_cast, unused_mut, dead_code)]
-    use super::{c_int, c_void, with_client};
+    use super::{c_int, c_void, with_client, with_client_retrying};
     include!("generated/cublas_guest.rs");
 }
 
 /// Code-generated cuDNN forwarding stubs. Regenerate with `smolvm-cuda-codegen`.
 mod gen_cudnn {
     #![allow(non_snake_case, clippy::unnecessary_cast, unused_mut, dead_code)]
-    use super::{c_int, c_void, with_client};
+    use super::{c_int, c_void, with_client, with_client_retrying};
     include!("generated/cudnn_guest.rs");
 }
 
@@ -2879,7 +3018,7 @@ pub extern "C" fn cudnnBackendGetAttribute(
             std::slice::from_raw_parts(array_of_elements as *const u8, cap)
         });
     }
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 3, a)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUDNN_BACKEND, 3, a.clone())) {
         Ok((0, out)) if out.len() >= 8 => {
             let cnt = i64::from_le_bytes(out[..8].try_into().unwrap());
             if !element_count.is_null() {
@@ -2915,7 +3054,7 @@ pub extern "C" fn cudnnBackendGetAttribute(
 #[no_mangle]
 pub extern "C" fn cudnnBackendFinalize(descriptor: *mut c_void) -> c_int {
     let a = (descriptor as u64).to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 4, a)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUDNN_BACKEND, 4, a.clone())) {
         Ok((st, _)) => st,
         Err(_) => 1,
     }
@@ -2999,7 +3138,7 @@ pub extern "C" fn cublasLtCreate(light_handle: *mut *mut c_void) -> c_int {
     if light_handle.is_null() {
         return CUBLAS_STATUS_NOT_INITIALIZED;
     }
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 11, Vec::new())) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUBLASLT, 11, Vec::new())) {
         Ok((0, out)) if out.len() >= 8 => {
             unsafe {
                 *light_handle = u64::from_le_bytes(out[..8].try_into().unwrap()) as *mut c_void
@@ -3014,7 +3153,7 @@ pub extern "C" fn cublasLtCreate(light_handle: *mut *mut c_void) -> c_int {
 #[no_mangle]
 pub extern "C" fn cublasLtDestroy(light_handle: *mut c_void) -> c_int {
     let a = (light_handle as u64).to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 12, a)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUBLASLT, 12, a.clone())) {
         Ok((st, _)) => st,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
@@ -3229,7 +3368,7 @@ pub extern "C" fn cublasLtMatmulAlgoGetHeuristic(
     a.extend_from_slice(&(d_desc as u64).to_le_bytes());
     a.extend_from_slice(&(preference as u64).to_le_bytes());
     a.extend_from_slice(&requested_algo_count.to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 9, a)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUBLASLT, 9, a.clone())) {
         Ok((0, out)) if out.len() >= 8 => {
             LT_HEUR_MEMO
                 .lock()
@@ -3625,7 +3764,7 @@ fn bn_size_call(func: u16, args: Vec<u8>, size_out: *mut usize) -> c_int {
             }
         }
     }
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, func, args)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUDNN_BN, func, args.clone())) {
         Ok((0, out)) if out.len() >= 8 => {
             let sz = u64::from_le_bytes(out[..8].try_into().unwrap()) as usize;
             if !size_out.is_null() {

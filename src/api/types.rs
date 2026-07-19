@@ -92,6 +92,10 @@ pub struct ResourceSpec {
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: Option<bool>,
+    /// Enable CUDA remoting (the guest sees the host NVIDIA GPU through the
+    /// bundled shims). Required on a golden that fork clones will train on.
+    #[serde(default)]
+    pub cuda: Option<bool>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     #[schema(example = 20)]
@@ -459,6 +463,17 @@ pub struct CreateMachineRequest {
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: bool,
+    /// Enable CUDA remoting (host NVIDIA GPU via the bundled shims).
+    #[serde(default)]
+    pub cuda: bool,
+    /// Workload entrypoint. With `cmd`, overrides the image's (or the
+    /// `.smolmachine` artifact's) own entrypoint+cmd, matching the CLI's
+    /// `machine create -- <command>` precedence. Empty = use the image's.
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    /// Workload command run when the machine starts (see `entrypoint`).
+    #[serde(default)]
+    pub cmd: Vec<String>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket in
     /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
     /// Off by default.
@@ -517,6 +532,15 @@ pub struct CreateMachineRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
+    /// Environment variables for the machine's workload (init commands and the
+    /// entrypoint). For `from`/`registry_ref` machines these layer on top of
+    /// the artifact manifest's env; a request variable wins on name collision.
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+    /// Working directory for the machine's workload. Overrides the artifact
+    /// manifest's workdir when set.
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 /// Request to execute a command in a machine.
@@ -699,4 +723,9 @@ pub struct ForkRequest {
     /// not collide with the still-running golden or sibling clones.
     #[serde(default)]
     pub ports: Vec<PortSpec>,
+    /// Share the golden's loaded CUDA weights with this clone instead of
+    /// copying them (one base copy in VRAM across sibling clones). Correct when
+    /// the base stays frozen (LoRA/QLoRA fine-tuning, inference).
+    #[serde(default)]
+    pub share_weights: bool,
 }
