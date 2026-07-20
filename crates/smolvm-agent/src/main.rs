@@ -3660,7 +3660,20 @@ pub fn resolve_main_container(persistent_overlay_id: Option<&str>) -> Option<Str
     }
 
     if is_container_running(&cid) {
-        return Some(cid);
+        // A restored fork clone's keep-alive container is alive (its process
+        // came back with the golden's RAM) but runs from the golden's
+        // pre-fork overlay mount, whose virtiofs lowerdirs are stale in the
+        // clone — joining it fails every exec with ESTALE. Only hand the
+        // container out if its overlay still answers lookups; otherwise
+        // recycle it so the caller re-establishes container + overlay fresh
+        // (the remount keeps the CoW-inherited upper layer).
+        if storage::persistent_overlay_mount_is_healthy(&workload_id) {
+            return Some(cid);
+        }
+        info!(container_id = %cid, "main container's overlay mount is stale (restored fork state); recycling");
+        let _ = std::fs::remove_file(&id_path);
+        let _ = crun::CrunCommand::delete(&cid, true).output();
+        return None;
     }
 
     // Stale: container died. Clean up the ID file and crun state.
@@ -4797,6 +4810,35 @@ fn handle_run_background(
         );
     };
 
+    // Run the background command DETACHED inside the machine's long-lived
+    // keep-alive container (via `crun exec --detach`), NOT as a separate
+    // `crun run` container. The old separate-container path
+    // (`spawn_in_overlay`) shared the overlay's merged mount and per-overlay
+    // OCI bundle with the keep-alive container; the two conflicted and the
+    // background container died within seconds — so a documented "long-lived
+    // daemon" (dev server, agent) never survived (QA 2026-07-19, F-12).
+    // Running inside the keep-alive container makes the background process a
+    // child of the container's PID 1, sharing the exact namespace/filesystem
+    // every foreground exec sees, and it lives for the machine's lifetime.
+    #[cfg(target_os = "linux")]
+    {
+        match run_background_in_keepalive(
+            overlay_id,
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            unprivileged,
+        ) {
+            Ok(resp) => return resp,
+            Err(e) => {
+                warn!(error = %e, "keep-alive background exec failed; falling back to a fresh container");
+            }
+        }
+    }
+
     match storage::spawn_in_overlay(
         image,
         command,
@@ -4814,6 +4856,96 @@ fn handle_run_background(
         },
         Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
     }
+}
+
+/// Launch a background command detached inside the machine's keep-alive
+/// container, establishing the keep-alive container first if needed. Mirrors
+/// [`run_in_keepalive_container`]'s container resolution, then `crun exec
+/// --detach` instead of a foreground exec.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_background_in_keepalive(
+    overlay_id: &str,
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    unprivileged: bool,
+) -> Result<AgentResponse, Box<dyn std::error::Error>> {
+    let mut launch = ResolvedLaunch::resolve(
+        image,
+        command.to_vec(),
+        env.to_vec(),
+        workdir.map(str::to_string),
+        user.map(str::to_string),
+    )?;
+
+    let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
+        Some(c) => (c, storage::persistent_overlay_rootfs(overlay_id)),
+        None => {
+            let prepared = storage::prepare_for_run_persistent(image, overlay_id)?;
+            storage::setup_mounts(&prepared.rootfs_path, mounts)?;
+            let cid = ensure_main_container(
+                &prepared.rootfs_path,
+                overlay_id,
+                mounts,
+                unprivileged,
+                &launch,
+            )?;
+            (cid, std::path::PathBuf::from(&prepared.rootfs_path))
+        }
+    };
+
+    // `crun exec --user` needs a numeric uid[:gid]; resolve any username
+    // against the container's /etc/passwd, same as the foreground path.
+    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // Capture the detached process's PID via a pid-file so the response
+    // honors the run-background contract (the host client parses a PID from
+    // stdout). Unique per launch to avoid collisions between concurrent
+    // background execs on the same machine.
+    let pid_file = std::path::PathBuf::from(format!(
+        "/tmp/smolvm-bg-{}-{}.pid",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let status = crun::CrunCommand::exec_detached(
+        &cid,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        Some(&pid_file),
+    )
+    .user(launch.user.as_deref())
+    .stdin_null()
+    .discard_output()
+    .status()?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&pid_file);
+        return Err(format!(
+            "crun exec --detach failed (exit {})",
+            status.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let _ = std::fs::remove_file(&pid_file);
+
+    Ok(AgentResponse::Completed {
+        exit_code: 0,
+        stdout: format!("{pid}").into_bytes(),
+        stderr: Vec::new(),
+    })
 }
 
 /// Non-streaming exec/run returns the whole output in a single wire frame. If it
@@ -4866,6 +4998,7 @@ fn cap_exec_response(resp: AgentResponse) -> AgentResponse {
 /// cluster) survive into later execs for the machine's lifetime. Returns the
 /// captured result; the caller falls back to a fresh container on error.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn run_in_keepalive_container(
     overlay_id: &str,
     image: &str,
@@ -4875,7 +5008,9 @@ fn run_in_keepalive_container(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     unprivileged: bool,
+    timeout_ms: Option<u64>,
     stdin_data: Option<&str>,
+    client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<AgentResponse, Box<dyn std::error::Error>> {
     use std::io::Write as _;
 
@@ -4914,40 +5049,70 @@ fn run_in_keepalive_container(
     launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let output = if let Some(data) = stdin_data {
-        let mut child = crun::CrunCommand::exec(
-            &cid,
-            &launch.env,
-            &launch.command,
-            launch.workdir.as_deref(),
-            false,
-        )
-        .user(launch.user.as_deref())
-        .capture_output()
-        .stdin_piped()
-        .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(data.as_bytes());
-        }
-        child.wait_with_output()?
+    // Spawn the exec, wire stdin, then wait with the SAME timeout + client
+    // liveness contract every other exec path uses. The keep-alive path
+    // previously used blocking `.output()` / `wait_with_output()`, which
+    // silently ignored `timeout_ms` — an `exec --timeout N` against an image
+    // machine ran to completion regardless (found by QA 2026-07-19).
+    let mut builder = crun::CrunCommand::exec(
+        &cid,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        false,
+    )
+    .user(launch.user.as_deref())
+    .capture_output();
+    builder = if stdin_data.is_some() {
+        builder.stdin_piped()
     } else {
-        crun::CrunCommand::exec(
-            &cid,
-            &launch.env,
-            &launch.command,
-            launch.workdir.as_deref(),
-            false,
-        )
-        .user(launch.user.as_deref())
-        .capture_output()
-        .stdin_null()
-        .output()?
+        builder.stdin_null()
     };
+    let mut child = builder.spawn()?;
+    if let (Some(data), Some(mut stdin)) = (stdin_data, child.stdin.take()) {
+        let _ = stdin.write_all(data.as_bytes());
+        // Drop closes the pipe → the command sees EOF.
+    }
 
-    Ok(AgentResponse::Completed {
-        exit_code: output.status.code().unwrap_or(-1),
-        stdout: output.stdout,
-        stderr: output.stderr,
+    // Kill only the exec'd process on timeout/disconnect — NOT the keep-alive
+    // container, which hosts the shared namespace for every exec (a timed-out
+    // `exec -- sleep 10` must not destroy the machine's workload).
+    let exec_pid = child.id();
+    let result = crate::process::wait_with_timeout_cleanup_and_liveness(
+        &mut child,
+        timeout_ms,
+        client_fd,
+        || unsafe {
+            libc::kill(exec_pid as libc::pid_t, libc::SIGKILL);
+        },
+    )?;
+
+    Ok(match result {
+        crate::process::WaitResult::Completed { exit_code, output } => AgentResponse::Completed {
+            exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        },
+        crate::process::WaitResult::TimedOut { output, timeout_ms } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(
+                format!("\ncommand timed out after {}ms", timeout_ms).as_bytes(),
+            );
+            AgentResponse::Completed {
+                exit_code: crate::process::TIMEOUT_EXIT_CODE,
+                stdout: output.stdout,
+                stderr,
+            }
+        }
+        crate::process::WaitResult::ClientDisconnected { output } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(b"\nclient disconnected");
+            AgentResponse::Completed {
+                exit_code: 137,
+                stdout: output.stdout,
+                stderr,
+            }
+        }
     })
 }
 
@@ -5005,7 +5170,9 @@ fn handle_run(
                 user,
                 mounts,
                 unprivileged,
+                timeout_ms,
                 stdin_data,
+                client_fd,
             ) {
                 Ok(resp) => return cap_exec_response(resp),
                 Err(e) => {

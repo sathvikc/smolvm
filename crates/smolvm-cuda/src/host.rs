@@ -672,6 +672,12 @@ struct GoldenLayout {
     /// M3a: golden function handle → (module handle, name) — the worker re-resolves
     /// it in its reloaded module and remaps the inherited raw CUfunction handle.
     functions: HashMap<u64, (u64, String)>,
+    /// Function attributes the golden set (`cuFuncSetAttribute`) — chiefly
+    /// FlashAttention's MaxDynamicSharedMemorySize opt-in, applied once at
+    /// library import. Per-context state: a worker's re-resolved function
+    /// reverts to the 48KB default and every large-smem launch fails with
+    /// "invalid argument" until these are replayed.
+    func_attrs: HashMap<u64, Vec<(i32, i32)>>,
     /// M3a: golden stream handle → create flags (the worker recreates + remaps).
     streams: HashMap<u64, u32>,
     /// M3a: golden event handle → create flags (the worker recreates + remaps).
@@ -780,6 +786,17 @@ fn layout_handoff_register(l: &std::sync::Arc<LayoutCell>, my_token: u64) {
     reg.insert(my_token, std::sync::Arc::downgrade(l));
 }
 
+/// The live layout registered under `token`, for a resuming sibling channel to
+/// SHARE (same guest process → one layout; see the Init handler).
+fn layout_handoff_adopt(token: u64) -> Option<std::sync::Arc<LayoutCell>> {
+    LAYOUT_HANDOFF
+        .lock()
+        .unwrap()
+        .as_ref()?
+        .get(&token)?
+        .upgrade()
+}
+
 /// One VMM chunk in the fork handoff (see [`layout_handoff_snapshot`]).
 pub struct HandoffChunk {
     pub va: u64,
@@ -848,7 +865,7 @@ pub fn module_handoff_snapshot(
     token: u64,
 ) -> Option<(
     Vec<(u64, Vec<u8>)>,
-    Vec<(u64, u64, String)>,
+    Vec<FuncMeta>,
     Vec<(u64, u32)>,
     Vec<(u64, u32)>,
     Vec<(u64, u64, GraphSer)>,
@@ -861,7 +878,14 @@ pub fn module_handoff_snapshot(
     let funcs = g
         .functions
         .iter()
-        .map(|(&h, (m, n))| (h, *m, n.clone()))
+        .map(|(&h, (m, n))| {
+            (
+                h,
+                *m,
+                n.clone(),
+                g.func_attrs.get(&h).cloned().unwrap_or_default(),
+            )
+        })
         .collect();
     let streams = g.streams.iter().map(|(&h, &f)| (h, f)).collect();
     let events = g.events.iter().map(|(&h, &f)| (h, f)).collect();
@@ -905,7 +929,7 @@ pub fn replay_lib_handles(b: &mut dyn Backend, handles: &[(u8, u16, u64, Vec<u8>
 // (identity) unless a Path-3 clone worker installed it via `set_handle_trans`.
 type HandleMap = std::cell::RefCell<HashMap<u64, u64>>;
 type ImageMap = std::cell::RefCell<HashMap<u64, Vec<u8>>>;
-type MetaMap = std::cell::RefCell<HashMap<u64, (u64, String)>>;
+type MetaMap = std::cell::RefCell<HashMap<u64, (u64, String, Vec<(i32, i32)>)>>;
 thread_local! {
     static FUNC_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
     static MOD_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
@@ -945,6 +969,13 @@ thread_local! {
 
 pub fn set_worker_alloc_trans(v: Vec<(u64, u64, u64)>) {
     WORKER_ALLOC_TRANS.with(|r| *r.borrow_mut() = v);
+}
+
+/// Non-draining copy of this thread's staged alloc translations, taken by the
+/// clone worker's main thread BEFORE serving so late-attached guest channels
+/// (served on other threads) can be seeded with the same map.
+pub fn worker_alloc_trans_snapshot() -> Vec<(u64, u64, u64)> {
+    WORKER_ALLOC_TRANS.with(|r| r.borrow().clone())
 }
 
 fn take_worker_alloc_trans() -> Vec<(u64, u64, u64)> {
@@ -1005,9 +1036,13 @@ pub fn rebuild_clone_graphs(b: &mut dyn Backend, graphs: Vec<(u64, u64, GraphSer
 /// reloaded / functions re-resolved LAZILY from `mod_images` / `func_meta` at
 /// first use; streams/events are already-recreated golden→worker maps (eager,
 /// few). Clears any prior worker's caches.
+/// One staged golden function: `(golden handle, golden module, name, attribute
+/// replays)` — see [`module_handoff_snapshot`].
+pub type FuncMeta = (u64, u64, String, Vec<(i32, i32)>);
+
 pub fn set_handle_trans(
     mod_images: Vec<(u64, Vec<u8>)>,
-    func_meta: Vec<(u64, u64, String)>,
+    func_meta: Vec<FuncMeta>,
     streams: Vec<(u64, u64)>,
     events: Vec<(u64, u64)>,
 ) {
@@ -1028,7 +1063,7 @@ pub fn set_handle_trans(
     FUNC_META.with(|m| {
         let mut m = m.borrow_mut();
         m.clear();
-        m.extend(func_meta.into_iter().map(|(f, gm, n)| (f, (gm, n))));
+        m.extend(func_meta.into_iter().map(|(f, gm, n, a)| (f, (gm, n, a))));
     });
     put_h(&STREAM_TRANS, streams);
     put_h(&EVENT_TRANS, events);
@@ -1071,6 +1106,24 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
                     image.len(),
                     head.join("")
                 );
+                if std::env::var_os("SMOLVM_CUDA_DUMP_FAILMOD").is_some() {
+                    let p = format!("/tmp/smolvm/failmod-{golden:x}.bin");
+                    let _ = std::fs::write(&p, &image);
+                    // Context health right after the failed load: a poisoned
+                    // (sticky-fault) context errors on sync/alloc too; a healthy
+                    // one pins the failure on cuModuleLoadData itself.
+                    let sync = b.ctx_synchronize().err();
+                    let alloc = match b.mem_alloc(1 << 20) {
+                        Ok(d) => {
+                            let _ = b.mem_free(d);
+                            None
+                        }
+                        Err(e) => Some(e),
+                    };
+                    eprintln!(
+                        "[M3a-lazy] dumped {p}; post-fail probes: sync_err={sync:?} alloc_err={alloc:?}"
+                    );
+                }
             } else if n == 8 {
                 eprintln!("[M3a-lazy] module reload failing repeatedly (e={e}); further reports suppressed");
             }
@@ -1088,7 +1141,7 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
     if let Some(w) = FUNC_TRANS.with(|m| m.borrow().get(&golden).copied()) {
         return w;
     }
-    let Some((gm, name)) = FUNC_META.with(|m| m.borrow().get(&golden).cloned()) else {
+    let Some((gm, name, attrs)) = FUNC_META.with(|m| m.borrow().get(&golden).cloned()) else {
         return golden;
     };
     let wm = xlat_mod(b, gm);
@@ -1097,6 +1150,14 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
     }
     match b.module_get_function(wm, &name) {
         Ok(w) => {
+            // Re-apply the golden's per-function attributes in THIS context —
+            // without FlashAttention's MaxDynamicSharedMemorySize opt-in, its
+            // decode kernels launch with >48KB smem and fail "invalid argument".
+            for &(a, v) in &attrs {
+                if let Err(e) = b.func_set_attribute(w, a, v) {
+                    eprintln!("[M3a-lazy] func attr replay failed: name={name} attr={a} e={e}");
+                }
+            }
             FUNC_TRANS.with(|m| {
                 m.borrow_mut().insert(golden, w);
             });
@@ -1147,6 +1208,59 @@ fn mark_loaded_vmm(layout: &LayoutCell, dptr: u64, nbytes: u64, data: Option<&[u
 
 /// FNV-1a 64-bit content hash (0 remapped to 1 — segment CRC 0 means
 /// "unverifiable", reserved for uploads whose bytes dispatch can't see).
+/// Process-wide module-image cache key: content hash + length + first/last
+/// bytes (the extra fields guard fnv collisions — a wrong module would be a
+/// silent catastrophe).
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct ModuleCacheKey {
+    fnv: u64,
+    len: u64,
+    head: [u8; 8],
+    tail: [u8; 8],
+}
+
+fn module_cache() -> &'static std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn module_cache_budget() -> u64 {
+    static B: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("SMOLVM_CUDA_MODCACHE_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048u64)
+            * 1024
+            * 1024
+    })
+}
+
+fn module_cache_put(image: &[u8]) {
+    if image.len() < 64 {
+        return;
+    }
+    let mut c = module_cache().lock().unwrap();
+    let used: u64 = c.values().map(|v| v.len() as u64).sum();
+    if used + image.len() as u64 > module_cache_budget() {
+        return; // over budget: first-come wins; the big early fatbins matter most
+    }
+    let key = ModuleCacheKey {
+        fnv: fnv64(image),
+        len: image.len() as u64,
+        head: image[..8].try_into().unwrap(),
+        tail: image[image.len() - 8..].try_into().unwrap(),
+    };
+    c.entry(key)
+        .or_insert_with(|| std::sync::Arc::new(image.to_vec()));
+}
+
+fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
+    module_cache().lock().unwrap().get(key).cloned()
+}
+
 pub fn fnv64(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in data {
@@ -1401,6 +1515,17 @@ fn translate_dptrs(trans: &[(u64, u64, u64)], req: Request) -> Request {
     }
 }
 
+/// Oplog helper: for LibCall payloads, decode "(lib,func)" for attribution.
+fn libcall_tag(p: &[u8]) -> String {
+    if p.first() == Some(&0xA0) && p.len() >= 4 {
+        let lib = p[1];
+        let func = u16::from_le_bytes([p[2], p[3]]);
+        format!(" lib={lib} func={func}")
+    } else {
+        String::new()
+    }
+}
+
 /// Serve one CUDA-RPC connection to completion (until the peer closes). Each
 /// request is dispatched to `backend`; returns on clean EOF.
 pub fn serve<S: Read + Write>(stream: S, backend: &mut dyn Backend) -> std::io::Result<()> {
@@ -1428,7 +1553,13 @@ fn serve_inner<S: Read + Write>(
             Some(&crate::proto::QUIET_PREFIX) => {
                 let req = decode_request(&payload[1..])?;
                 if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
-                    eprintln!("[op~] 0x{:02x} len={}", payload[1], payload.len());
+                    eprintln!(
+                        "[op~] p{} 0x{:02x} len={}{}",
+                        std::process::id(),
+                        payload[1],
+                        payload.len(),
+                        libcall_tag(&payload[1..])
+                    );
                 }
                 let (status, _) = dispatch(sess, backend, req);
                 if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
@@ -1451,7 +1582,13 @@ fn serve_inner<S: Read + Write>(
             _ => {
                 let req = decode_request(&payload)?;
                 if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
-                    eprintln!("[op] 0x{:02x} len={}", payload[0], payload.len());
+                    eprintln!(
+                        "[op] p{} 0x{:02x} len={}{}",
+                        std::process::id(),
+                        payload[0],
+                        payload.len(),
+                        libcall_tag(&payload)
+                    );
                 }
                 // Transport upgrade: switch this connection to shared-memory
                 // rings and never return to socket framing (the socket then
@@ -1703,7 +1840,13 @@ fn serve_rings<S: Read + Write>(
                     }
                 };
                 if oplog {
-                    eprintln!("[op~] 0x{:02x} len={}", frame[1], frame.len());
+                    eprintln!(
+                        "[op~] p{} 0x{:02x} len={}{}",
+                        std::process::id(),
+                        frame[1],
+                        frame.len(),
+                        libcall_tag(&frame[1..])
+                    );
                 }
                 let (status, _) = dispatch(sess, backend, req);
                 if status != 0 {
@@ -1732,7 +1875,13 @@ fn serve_rings<S: Read + Write>(
                     }
                 };
                 if oplog {
-                    eprintln!("[op] 0x{:02x} len={}", frame[0], frame.len());
+                    eprintln!(
+                        "[op] p{} 0x{:02x} len={}{}",
+                        std::process::id(),
+                        frame[0],
+                        frame.len(),
+                        libcall_tag(&frame)
+                    );
                 }
                 let (status, resp) = dispatch(sess, backend, req);
                 if status != 0 && oplog {
@@ -1954,6 +2103,19 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 graph_handoff_register(&sess.graph_vhandles, resume_token, token);
                 dptr_handoff_register(&sess.alloc_table, token);
                 vmm_handoff_register(&sess.vmm_ranges, token);
+                // A resuming channel belongs to the SAME guest process as its
+                // parent, and GoldenLayout is process-scoped fork-handoff
+                // metadata (modules, upload coverage, library-handle creates).
+                // SHARE the parent's layout instead of registering a fresh one,
+                // or records split across channels: a cuBLAS handle created on
+                // one channel is then missing from the layout the fork stages,
+                // and every clone's replay lacks it (vh-miss →
+                // NOT_INITIALIZED on the clone's first GEMM).
+                if resume_token != 0 {
+                    if let Some(parent) = layout_handoff_adopt(resume_token) {
+                        sess.golden_layout = parent;
+                    }
+                }
                 layout_handoff_register(&sess.golden_layout, token);
                 // Isolation-mode clone: defer copying the parent's buffers until
                 // the first PrimaryCtxRetain, when a context is actually current.
@@ -2011,8 +2173,18 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // too) — maximal isolation at N× the VRAM. Default shares the
                 // read-only weights (copy-on-write) so clones fit alongside the golden.
                 let copy_all = std::env::var_os("SMOLVM_CUDA_FORK_COPY_ALL").is_some();
+                // In a clone WORKER (layout env set), reconstruction already
+                // placed/copied everything; the in-daemon copy branches below
+                // must not run. They originally no-op'd because the worker's
+                // handoff registries were empty — but a LATE-ATTACHED channel
+                // Inits after the primary session re-registered the clone's
+                // own ranges under the same token, and copying those would
+                // snapshot live clone state into stale "private copies"
+                // (VMM ranges are address-preserved in workers: translating
+                // them is wrong even when the copy succeeds).
+                let in_worker = std::env::var_os("SMOLVM_CUDA_CLONE_LAYOUT").is_some();
                 let (mut copied, mut shared, mut cbytes, mut sbytes) = (0u64, 0u64, 0u64, 0u64);
-                if let Some(allocs) = dptr_handoff_snapshot(parent) {
+                if let Some(allocs) = dptr_handoff_snapshot(parent).filter(|_| !in_worker) {
                     for (gdptr, size, loaded) in allocs {
                         if loaded && !copy_all {
                             // Weight/constant: share the parent's copy (read in
@@ -2041,7 +2213,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // an expandable segment mixes weights + activations and can't be
                 // shared read-only. Without this a clone inherits the golden's
                 // raw VMM addresses untranslated (the 0-copies bug).
-                if let Some(vmm) = vmm_handoff_snapshot(parent) {
+                if let Some(vmm) = vmm_handoff_snapshot(parent).filter(|_| !in_worker) {
                     for (gva, size) in vmm {
                         if let Ok(cdptr) = b.mem_alloc(size) {
                             let _ = b.memcpy_dtod(cdptr, gva, size);
@@ -2119,6 +2291,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // survives a fork-clone reconnect). Still tracked for reclaim.
             let raw = b.module_load_data(&image)?;
             sess.owned_modules.insert(raw);
+            // Feed the process-wide image cache so later replicas can load by
+            // hash without re-shipping the bytes (LibCall 6/1).
+            module_cache_put(&image);
             // M3a: keep the image so a Path-3 clone worker can reload the module in
             // its own context and remap this inherited handle.
             if path3_enabled() {
@@ -2166,6 +2341,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             value,
         } => {
             let raw_fn = raw_fn_h(sess, b, function);
+            if path3_enabled() {
+                sess.golden_layout
+                    .lock()
+                    .unwrap()
+                    .func_attrs
+                    .entry(raw_fn)
+                    .or_default()
+                    .push((attrib, value));
+            }
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
         }
@@ -2561,6 +2745,69 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             .map(|_| Response::Ok)
         }
         Request::LibCall { lib, func, args } => {
+            // lib 6 / func 1: module load BY CONTENT HASH — served here (needs
+            // session state), not in the backend. Blob:
+            // [u64 fnv][u64 len][first 8 bytes][last 8 bytes]. HIT → load the
+            // cached image (same bookkeeping as ModuleLoadData) and return the
+            // 8-byte handle; MISS → (0, empty) and the client falls back to a
+            // full ModuleLoadData. Engine loads re-ship hundreds of MB of
+            // identical fatbins per replica without this.
+            if lib == 6 && func == 1 && args.len() >= 32 {
+                let key = ModuleCacheKey {
+                    fnv: u64::from_le_bytes(args[0..8].try_into().unwrap()),
+                    len: u64::from_le_bytes(args[8..16].try_into().unwrap()),
+                    head: args[16..24].try_into().unwrap(),
+                    tail: args[24..32].try_into().unwrap(),
+                };
+                if let Some(image) = module_cache_get(&key) {
+                    let raw = b.module_load_data(&image)?;
+                    sess.owned_modules.insert(raw);
+                    if path3_enabled() {
+                        sess.golden_layout
+                            .lock()
+                            .unwrap()
+                            .modules
+                            .insert(raw, image.to_vec());
+                    }
+                    return Ok(Response::LibResult(0, raw.to_le_bytes().to_vec()));
+                }
+                return Ok(Response::LibResult(0, Vec::new()));
+            }
+            // lib 6 / func 2: classify a pointer — reply [2] iff the session
+            // knows it as device memory (cudaMalloc table, VMM ranges, clone
+            // translations/shared ranges). The guest cudart shim can't see
+            // driver-VMM allocations (torch expandable_segments), so its
+            // cudaPointerGetAttributes mis-reported them as unregistered and
+            // vLLM's CUDA-graph capture (`weak_ref_tensor`) refused them.
+            if lib == 6 && func == 2 && args.len() >= 8 {
+                let p = u64::from_le_bytes(args[0..8].try_into().unwrap());
+                let in_alloc = sess
+                    .alloc_table
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(&b0, &(sz, _))| p >= b0 && p < b0 + sz);
+                let dev = in_alloc
+                    || sess
+                        .owned_dptrs
+                        .iter()
+                        .any(|(&b0, &sz)| p >= b0 && p < b0 + sz)
+                    || sess
+                        .vmm_ranges
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(&b0, &sz)| p >= b0 && p < b0 + sz)
+                    || sess
+                        .dptr_trans
+                        .iter()
+                        .any(|&(b0, sz, _)| p >= b0 && p < b0 + sz)
+                    || sess
+                        .shared_ranges
+                        .iter()
+                        .any(|&(b0, sz)| p >= b0 && p < b0 + sz);
+                return Ok(Response::LibResult(0, vec![if dev { 2 } else { 0 }]));
+            }
             let r = b.lib_call(lib, func, &args, &sess.streams);
             // Path 3: record top-level library-context creates so a clone
             // worker can replay them in ITS process (library handles are

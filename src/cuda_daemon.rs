@@ -77,7 +77,41 @@ fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration) {
 /// thread against a fresh backend — all in this process, so they share one GPU
 /// context. Returns only on listener failure; otherwise exits via the idle
 /// watchdog (or runs until the host shuts down when the timeout is disabled).
+/// Fatal-signal backtrace: the daemon and its clone workers host large unsafe
+/// surfaces (the CUDA driver itself, raw-pointer translation, IPC mappings). A
+/// SIGSEGV/SIGABRT/SIGBUS here previously died SILENTLY — a daemon segfault
+/// under concurrent 7B vLLM engines left a 933-byte log and no evidence. The
+/// handler writes the signal and a native backtrace to stderr (async-signal-
+/// unsafe in principle, but we are crashing anyway — best-effort output beats
+/// none) and then re-raises with the default action so wait() sees the truth.
+#[cfg(unix)]
+pub(crate) fn install_crash_handler(role: &'static str) {
+    static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let _ = ROLE.set(role);
+    unsafe extern "C" fn on_fatal(sig: libc::c_int) {
+        let role = ROLE.get().copied().unwrap_or("cuda-proc");
+        eprintln!("[{role}] FATAL signal {sig}; backtrace:");
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    for sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGILL] {
+        // SAFETY: installing a handler that only formats + re-raises.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_fatal as *const () as usize;
+            sa.sa_flags = libc::SA_ONSTACK;
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Serve the shared CUDA daemon on `sock` (spawned as `smolvm _cuda-daemon`).
 pub fn run(sock: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    install_crash_handler("cuda-daemon");
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -119,7 +153,7 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                             continue;
                                         }
                                     }
-                                    spawn_serve(s, &active_tcp);
+                                    spawn_serve(s, &active_tcp, None);
                                 }
                                 Err(e) => {
                                     tracing::debug!(error = %e, "CUDA daemon TCP accept error")
@@ -152,14 +186,18 @@ pub fn run(sock: &Path) -> io::Result<()> {
                 // would silently serve it a reconstructed COPY of its memory.
                 // Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
                 #[cfg(unix)]
-                {
+                let guest_ram = {
                     use std::os::unix::io::AsRawFd;
+                    let ram = consume_ram_preamble(stream.as_raw_fd());
                     if route_clone_connection(stream.as_raw_fd()) {
                         drop(stream); // worker owns it / rejected
                         continue;
                     }
-                }
-                spawn_serve(stream, &active);
+                    ram
+                };
+                #[cfg(not(unix))]
+                let guest_ram = None;
+                spawn_serve(stream, &active, guest_ram);
             }
             Err(e) => tracing::debug!(error = %e, "CUDA daemon accept error"),
         }
@@ -170,7 +208,10 @@ pub fn run(sock: &Path) -> io::Result<()> {
 /// Serve one accepted connection on its own thread with a fresh backend, counting
 /// it against `active` for the idle watchdog. Generic over the stream type so the
 /// local UDS listener and the optional TCP listener share one path.
-fn spawn_serve<S>(stream: S, active: &Arc<AtomicUsize>)
+/// `guest_ram`: daemon-local mappings of the VM's guest RAM (from the RAM
+/// preamble) — installing them enables the ring transport + zero-copy GPA
+/// memcpys for this connection.
+fn spawn_serve<S>(stream: S, active: &Arc<AtomicUsize>, guest_ram: Option<Vec<(u64, u64, u64)>>)
 where
     S: std::io::Read + std::io::Write + Send + 'static,
 {
@@ -180,11 +221,120 @@ where
         .spawn(move || {
             let _guard = guard;
             let mut backend = make_backend();
+            if let Some(regions) = guest_ram {
+                tracing::info!(
+                    count = regions.len(),
+                    "guest-RAM mapped: zero-copy + rings enabled"
+                );
+                backend.set_guest_ram(regions);
+            }
             if let Err(e) = serve(stream, backend.as_mut()) {
                 tracing::debug!(error = %e, "CUDA daemon connection ended");
             }
         })
         .ok();
+}
+
+/// Consume a guest-RAM advertisement preamble if present (peek-based; absent on
+/// old proxies and non-memfd VMs). Maps the advertised regions of
+/// `/proc/<pid>/fd/<memfd>` MAP_SHARED into THIS process and returns them as
+/// `(gpa, daemon_va, len)` for `Backend::set_guest_ram`. Mappings are leaked
+/// (VM-lifetime; bounded by connections-with-adverts). Same-uid access only —
+/// exactly the trust boundary the daemon already has with its VMs.
+#[cfg(unix)]
+fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<Vec<(u64, u64, u64)>> {
+    let mut hdr = [0u8; 20];
+    // SAFETY: MSG_PEEK of the fixed header on a valid fd; loops like
+    // peek_clone_token because proxied bytes can arrive in pieces.
+    let mut n: isize = 0;
+    for _ in 0..200 {
+        n = unsafe {
+            libc::recv(
+                fd,
+                hdr.as_mut_ptr() as *mut libc::c_void,
+                hdr.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n >= 8 && &hdr[..8] != b"SMVGRAM2" {
+            return None; // not ours; leave the bytes untouched
+        }
+        if n >= 20 || n == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if n < 20 || &hdr[..8] != b"SMVGRAM2" {
+        return None;
+    }
+    let pid = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+    let count = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+    if count == 0 || count > 64 {
+        return None;
+    }
+    let total = 20 + count * 28;
+    let mut buf = vec![0u8; total];
+    let mut got = 0usize;
+    while got < total {
+        // SAFETY: plain recv consuming the preamble we just validated.
+        let r = unsafe {
+            libc::recv(
+                fd,
+                buf[got..].as_mut_ptr() as *mut libc::c_void,
+                total - got,
+                0,
+            )
+        };
+        if r <= 0 {
+            return None;
+        }
+        got += r as usize;
+    }
+    // One memfd PER REGION (libkrun's layout): open each via /proc and map
+    // MAP_SHARED at the advertised offset.
+    let mut files: std::collections::HashMap<u32, std::fs::File> = std::collections::HashMap::new();
+    let mut regions = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = 20 + i * 28;
+        let gpa = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+        let fd_no = u32::from_le_bytes(buf[o + 8..o + 12].try_into().unwrap());
+        let off = u64::from_le_bytes(buf[o + 12..o + 20].try_into().unwrap());
+        let len = u64::from_le_bytes(buf[o + 20..o + 28].try_into().unwrap());
+        if len == 0 || off % 4096 != 0 {
+            return None;
+        }
+        use std::os::unix::io::AsRawFd as _;
+        let file = match files.entry(fd_no) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(format!("/proc/{pid}/fd/{fd_no}"))
+                    .ok()?;
+                v.insert(f)
+            }
+        };
+        // SAFETY: MAP_SHARED of the VM's guest-RAM memfd at the advertised
+        // offset; failure aborts the whole advert. Mappings are leaked
+        // (VM-lifetime; bounded by connections that advertise).
+        let va = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                off as i64,
+            )
+        };
+        if va == libc::MAP_FAILED {
+            tracing::warn!(pid, fd_no, off, len, "guest-RAM mmap failed; sockets only");
+            return None;
+        }
+        regions.push((gpa, va as u64, len));
+    }
+    Some(regions)
 }
 
 /// Keeps the daemon's open-connection count accurate: +1 on construction, -1 on
@@ -217,6 +367,15 @@ fn make_backend() -> Box<dyn Backend> {
     }
 }
 
+/// Staged golden handle state retained for late-attached channels:
+/// (module images, function metadata, streams, events).
+type SeedHandles = (
+    Vec<(u64, Vec<u8>)>,
+    Vec<smolvm_cuda::host::FuncMeta>,
+    Vec<(u64, u64)>,
+    Vec<(u64, u64)>,
+);
+
 /// Path 3 (M1): serve one isolating fork-clone connection in THIS separate worker
 /// process. A per-clone process has its own CUDA primary context and thus its own
 /// UVA space, so it can place memory at the golden's exact virtual addresses
@@ -226,6 +385,7 @@ fn make_backend() -> Box<dyn Backend> {
 /// hook in before the serve loop; establishing the process boundary comes first.
 pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     use std::os::unix::io::FromRawFd;
+    install_crash_handler("cuda-clone-worker");
     let mut backend = make_backend();
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
@@ -236,6 +396,12 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let _ = backend.primary_ctx_retain(clone_dev);
+    // Seed state for late-attached guest channels (see the attach listener
+    // below): each attached channel serves on its own thread, and every
+    // translation table is thread-local — new threads must be seeded with
+    // clones of what the main serving thread installed.
+    let mut seed_vmm: Option<std::collections::HashMap<u64, u64>> = None;
+    let mut seed_handles: Option<SeedHandles> = None;
     // M2: reconstruct the golden's memory at its exact VAs from the layout the
     // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
@@ -246,6 +412,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             vmm_handles = vmm_trans.len(),
             "cuda clone-worker: reconstructed golden memory at its VAs"
         );
+        seed_vmm = Some(vmm_trans.clone());
         // The clone unmaps/releases inherited chunks by their GOLDEN handle
         // values (torch expandable_segments trims segments under pressure);
         // untranslated, cuMemRelease segfaults on the foreign-context handle.
@@ -271,6 +438,14 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             graphs.len(),
             lib_handles.len(),
         );
+        // Retained for attached-channel threads (module images are the bulk —
+        // tens of MB per worker; the price of correct late channels).
+        seed_handles = Some((
+            mod_images.clone(),
+            func_meta.clone(),
+            streams.clone(),
+            events.clone(),
+        ));
         smolvm_cuda::host::set_handle_trans(mod_images, func_meta, streams, events);
         // Re-create the golden's top-level cuBLAS/cuBLASLt/cuDNN handles in
         // THIS process and map the clone's inherited values to them — library
@@ -294,6 +469,29 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             lib_handles_seeded = nseeded,
             "cuda clone-worker: staged modules for lazy reload + remapped handles"
         );
+    }
+    // Late-attached guest channels: the guest dials fresh daemon connections
+    // after the fork (first-ever cuBLAS init inside a clone does exactly
+    // this); the daemon forwards each such fd over the control channel and we
+    // serve it on its own thread, seeded with the same translation state.
+    if let Some(ctrl) = std::env::var("SMOLVM_CUDA_CLONE_CTRL")
+        .ok()
+        .and_then(|v| v.parse::<std::os::unix::io::RawFd>().ok())
+    {
+        let seed_alloc = smolvm_cuda::host::worker_alloc_trans_snapshot();
+        let seed = std::sync::Arc::new((seed_vmm, seed_handles, seed_alloc));
+        std::thread::spawn(move || loop {
+            match recv_fd(ctrl) {
+                Ok(nfd) => {
+                    let seed = seed.clone();
+                    std::thread::spawn(move || serve_attached_channel(nfd, clone_dev, &seed));
+                }
+                Err(e) => {
+                    tracing::info!(error = %e, "clone-worker: control channel closed");
+                    break;
+                }
+            }
+        });
     }
     // The handed-off connection may be a local UDS (VM on this host) or a TCP
     // socket (remote client driving this GPU host) — wrap by actual domain.
@@ -319,6 +517,62 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
         let _ = stream.set_nodelay(true);
         serve(stream, backend.as_mut())
+    }
+}
+
+/// Serve one late-attached guest channel inside the clone worker. Own backend
+/// handle, same primary context (same UVA space), thread-local translation
+/// tables seeded from the main serving thread's snapshot so golden handles and
+/// translated allocations resolve identically on this channel.
+#[cfg(unix)]
+#[allow(clippy::type_complexity)]
+fn serve_attached_channel(
+    fd: std::os::unix::io::RawFd,
+    dev: i32,
+    seed: &(
+        Option<std::collections::HashMap<u64, u64>>,
+        Option<SeedHandles>,
+        Vec<(u64, u64, u64)>,
+    ),
+) {
+    use std::os::unix::io::FromRawFd;
+    let mut backend = make_backend();
+    let _ = backend.init();
+    let _ = backend.primary_ctx_retain(dev);
+    let (vmm, handles, alloc) = seed;
+    if let Some(v) = vmm {
+        smolvm_cuda::host::set_vmm_trans(v.clone());
+    }
+    if let Some((m, f, s, e)) = handles {
+        smolvm_cuda::host::set_handle_trans(m.clone(), f.clone(), s.clone(), e.clone());
+    }
+    if !alloc.is_empty() {
+        smolvm_cuda::host::set_worker_alloc_trans(alloc.clone());
+    }
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: plain getsockname on a valid fd with a correctly-sized out buffer.
+    unsafe {
+        libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len);
+    }
+    let domain = libc::c_int::from(addr.ss_family);
+    tracing::info!(
+        fd,
+        tcp = domain != libc::AF_UNIX,
+        "cuda clone-worker: serving attached channel"
+    );
+    let r = if domain == libc::AF_UNIX {
+        // SAFETY: recv_fd handed us sole ownership of the received fd.
+        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        smolvm_cuda::host::serve(stream, backend.as_mut())
+    } else {
+        // SAFETY: as above; a TCP connection forwarded by the daemon.
+        let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let _ = stream.set_nodelay(true);
+        smolvm_cuda::host::serve(stream, backend.as_mut())
+    };
+    if let Err(e) = r {
+        tracing::info!(error = %e, fd, "clone-worker: attached channel ended");
     }
 }
 
@@ -530,6 +784,18 @@ fn reconstruct_golden_memory(
                 Some((hx(d)?, hx(sz)?))
             })
             .collect();
+        // VA guard: reserve every golden non-VMM span at its exact address so
+        // fresh allocations in this worker can never land inside one. The
+        // session's dptr translation is RANGE-based — an untranslated fresh
+        // pointer inside a golden range gets rewritten into the staged copy
+        // (silent corruption) or past its end (async illegal address that
+        // poisons the context: e=700 on every later op — found via QA-1l,
+        // first-ever cuBLAS init inside a clone).
+        for &(b0, sz, _) in &regions {
+            if let Err(e) = b.mem_address_reserve_fixed(sz, 0, b0) {
+                tracing::warn!(e, va = b0, size = sz, "M2-alloc: VA guard reserve failed");
+            }
+        }
         let total: u64 = regions.iter().map(|r| r.1).sum();
         let mut trans: Vec<(u64, u64, u64)> = Vec::new();
         match import_with_retry(b, 4 + sidx) {
@@ -593,7 +859,7 @@ fn reconstruct_golden_modules(
     path: &str,
 ) -> (
     Vec<(u64, Vec<u8>)>,
-    Vec<(u64, u64, String)>,
+    Vec<smolvm_cuda::host::FuncMeta>,
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
@@ -664,7 +930,14 @@ fn reconstruct_golden_modules(
         need!(nlen);
         let name = String::from_utf8_lossy(&buf[p..p + nlen]).into_owned();
         p += nlen;
-        func_meta.push((gf, gm, name));
+        let nattrs = ru32!();
+        let mut attrs = Vec::with_capacity(nattrs as usize);
+        for _ in 0..nattrs {
+            let a = ru32!() as i32;
+            let v = ru32!() as i32;
+            attrs.push((a, v));
+        }
+        func_meta.push((gf, gm, name, attrs));
     }
     // Streams + events: recreate each with its golden create flags in OUR context,
     // mapping the golden's inherited raw handle → our own (same M3a pattern).
@@ -821,14 +1094,20 @@ fn consume_clone_preamble(fd: std::os::unix::io::RawFd) -> Option<(u64, u8)> {
     Some((u64::from_le_bytes(buf[8..16].try_into().unwrap()), buf[16]))
 }
 
-/// Live clone workers keyed by (lineage token, clone id) → worker pid. A
-/// reconnect from a clone whose worker is STILL ALIVE is rejected loudly: a
-/// fresh worker would re-reconstruct from the golden and silently DISCARD the
-/// clone's accumulated GPU state (its training progress). Dead entries are
+/// Live clone workers keyed by (lineage token, clone id) → (worker pid,
+/// control fd). New connections from a clone whose worker is STILL ALIVE are
+/// ATTACHED to that worker over the control fd (SCM_RIGHTS) — guests open
+/// fresh daemon channels after the fork (first-ever cuBLAS init inside a
+/// clone does), and a fresh worker would re-reconstruct from the golden and
+/// silently DISCARD the clone's accumulated GPU state. Dead entries are
 /// replaced (worker crash → a fresh worker is the best recovery available).
 #[cfg(unix)]
-fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64), u32>> {
-    static REG: OnceLock<Mutex<std::collections::HashMap<(u64, u64), u32>>> = OnceLock::new();
+type CloneWorkerEntry = (u32, std::os::unix::io::RawFd);
+#[cfg(unix)]
+fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64), CloneWorkerEntry>>
+{
+    static REG: OnceLock<Mutex<std::collections::HashMap<(u64, u64), CloneWorkerEntry>>> =
+        OnceLock::new();
     REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -845,13 +1124,42 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
     };
     let share_weights = flags & 1 != 0;
     let Some(token) = peek_clone_token(fd) else {
-        // A clone VM's connection whose Init carries no lineage token: fresh
-        // post-fork work (new guest process), served in-daemon like any new
-        // session.
+        // A clone VM's connection whose Init carries no lineage token. The
+        // guest treats CUDA state as process-global, so if this clone already
+        // has a live worker, the channel MUST serve there: a cuBLAS handle
+        // created through an in-daemon session is invisible to the worker's
+        // sessions (vh-miss → NOT_INITIALIZED on the compute channel). Only
+        // when no worker exists is in-daemon serving correct (genuinely
+        // fresh post-fork work before any isolating resume).
+        let reg = clone_worker_registry().lock().unwrap();
+        let live = reg.iter().find_map(|(&(_, cid), &(pid, ctrl))| {
+            // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
+            (cid == clone_id && unsafe { libc::kill(pid as i32, 0) } == 0).then_some((pid, ctrl))
+        });
+        if let Some((pid, ctrl)) = live {
+            match send_fd(ctrl, fd) {
+                Ok(()) => {
+                    tracing::info!(
+                        clone_id,
+                        worker_pid = pid,
+                        "attached token-less clone channel to its live worker"
+                    );
+                    return true; // worker owns an in-flight dup; caller drops its copy
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        clone_id,
+                        worker_pid = pid,
+                        "token-less channel attach failed; serving in-daemon"
+                    );
+                }
+            }
+        }
         return false;
     };
     let mut reg = clone_worker_registry().lock().unwrap();
-    if let Some(&pid) = reg.get(&(token, clone_id)) {
+    if let Some(&(pid, ctrl)) = reg.get(&(token, clone_id)) {
         // Reap first: an exited worker stays a ZOMBIE (the daemon is its parent
         // and nothing waits on it), and kill(pid, 0) reports zombies as alive —
         // without this, one worker death makes every reconnect of that clone
@@ -877,24 +1185,43 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
                 signal = sig,
                 "clone worker had exited; reaped — spawning a fresh worker for the reconnect"
             );
-            reg.remove(&(token, clone_id));
         }
         // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
         else if unsafe { libc::kill(pid as i32, 0) } == 0 {
-            tracing::warn!(
-                token,
-                clone_id,
-                worker_pid = pid,
-                "clone reconnected while its worker is still alive; rejecting — \
-                 a fresh worker would silently reset the clone's GPU state"
-            );
-            return true; // consumed: caller drops the stream (fail fast)
+            // The clone opened ANOTHER channel (guests dial fresh connections
+            // post-fork — e.g. first cuBLAS init). Hand the fd to the live
+            // worker so the channel serves in the clone's context; a fresh
+            // worker would silently reset the clone's GPU state, and serving
+            // in-daemon would split the guest across two UVA spaces.
+            match send_fd(ctrl, fd) {
+                Ok(()) => {
+                    tracing::info!(
+                        token,
+                        clone_id,
+                        worker_pid = pid,
+                        "attached new clone channel to its live worker"
+                    );
+                    return true; // worker owns an in-flight dup; caller drops its copy
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        token,
+                        clone_id,
+                        worker_pid = pid,
+                        "channel attach to live worker failed; rejecting the connection"
+                    );
+                    return true; // consumed: caller drops the stream (fail fast)
+                }
+            }
         }
         reg.remove(&(token, clone_id));
+        // SAFETY: control fd of a dead/reaped worker.
+        unsafe { libc::close(ctrl) };
     }
     match spawn_clone_worker(fd, token, share_weights) {
-        Ok(pid) => {
-            reg.insert((token, clone_id), pid);
+        Ok((pid, ctrl)) => {
+            reg.insert((token, clone_id), (pid, ctrl));
             tracing::info!(
                 token,
                 clone_id,
@@ -912,6 +1239,76 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
         }
     }
     true
+}
+
+/// SCM_RIGHTS-send one fd over a control socketpair (one data byte as payload).
+#[cfg(unix)]
+fn send_fd(chan: std::os::unix::io::RawFd, fd: std::os::unix::io::RawFd) -> io::Result<()> {
+    let mut data = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    // SAFETY: standard sendmsg with a single SCM_RIGHTS cmsg over buffers that
+    // outlive the call; CMSG_* macros compute the layout.
+    unsafe {
+        let mut cmsgbuf = [0u8; 32];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsgbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = libc::CMSG_SPACE(4) as _;
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        (*c).cmsg_level = libc::SOL_SOCKET;
+        (*c).cmsg_type = libc::SCM_RIGHTS;
+        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
+        std::ptr::copy_nonoverlapping(&fd as *const i32 as *const u8, libc::CMSG_DATA(c), 4);
+        if libc::sendmsg(chan, &msg, 0) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Blocking receive of one SCM_RIGHTS fd; `Err` on close/garbage ends the
+/// worker's attach listener.
+#[cfg(unix)]
+fn recv_fd(chan: std::os::unix::io::RawFd) -> io::Result<std::os::unix::io::RawFd> {
+    let mut data = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    // SAFETY: standard recvmsg with room for one SCM_RIGHTS cmsg; buffers
+    // outlive the call.
+    unsafe {
+        let mut cmsgbuf = [0u8; 32];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsgbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = libc::CMSG_SPACE(4) as _;
+        let n = libc::recvmsg(chan, &mut msg, 0);
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "control channel closed",
+            ));
+        }
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        if c.is_null() || (*c).cmsg_type != libc::SCM_RIGHTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control message without an fd",
+            ));
+        }
+        let mut fd: i32 = -1;
+        std::ptr::copy_nonoverlapping(libc::CMSG_DATA(c), &mut fd as *mut i32 as *mut u8, 4);
+        Ok(fd)
+    }
 }
 
 /// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an
@@ -1050,7 +1447,7 @@ fn spawn_clone_worker(
     conn_fd: std::os::unix::io::RawFd,
     token: u64,
     share_weights: bool,
-) -> io::Result<u32> {
+) -> io::Result<(u32, std::os::unix::io::RawFd)> {
     use std::os::unix::process::CommandExt;
     // Gather the golden's VMM layout (reservations + maps→physical handle).
     let (resvs, maps, golden_dev) = smolvm_cuda::host::layout_handoff_snapshot(token)
@@ -1177,11 +1574,18 @@ fn spawn_clone_worker(
             blob.extend_from_slice(img);
         }
         blob.extend_from_slice(&(funcs.len() as u32).to_le_bytes());
-        for (h, m, n) in &funcs {
+        for (h, m, n, attrs) in &funcs {
             blob.extend_from_slice(&h.to_le_bytes());
             blob.extend_from_slice(&m.to_le_bytes());
             blob.extend_from_slice(&(n.len() as u32).to_le_bytes());
             blob.extend_from_slice(n.as_bytes());
+            // Per-function attribute replays ([i32 attr][i32 value] each) —
+            // e.g. FlashAttention's MaxDynamicSharedMemorySize opt-in.
+            blob.extend_from_slice(&(attrs.len() as u32).to_le_bytes());
+            for &(a, v) in attrs {
+                blob.extend_from_slice(&a.to_le_bytes());
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
         }
         // Streams + events: [u64 golden handle][u32 create flags] each.
         blob.extend_from_slice(&(streams.len() as u32).to_le_bytes());
@@ -1244,11 +1648,32 @@ fn spawn_clone_worker(
             modpath = Some(mp);
         }
     }
+    // Control channel for late-attached guest channels: the daemon keeps sp[0]
+    // and SCM_RIGHTS-sends each additional connection fd from the same clone;
+    // the worker inherits sp[1] and serves every received fd in-process.
+    let mut sp = [0i32; 2];
+    // SAFETY: plain socketpair; fds checked below.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sp.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Lift the child end above the dup2 target range (3..4+nexports) so the
+    // fd shuffle in pre_exec can't clobber it before it's dup2'd into place.
+    // SAFETY: F_DUPFD to >=64 on an fd we own; original closed right after.
+    let ctrl_child = unsafe { libc::fcntl(sp[1], libc::F_DUPFD, 64) };
+    // SAFETY: closing our original child-end copy.
+    unsafe { libc::close(sp[1]) };
+    if ctrl_child < 0 {
+        // SAFETY: closing the parent end we created above.
+        unsafe { libc::close(sp[0]) };
+        return Err(io::Error::last_os_error());
+    }
+    let ctrl_slot = 4 + export_fds.len() as i32;
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("_cuda-clone-worker").arg("3");
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
     cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
+    cmd.env("SMOLVM_CUDA_CLONE_CTRL", ctrl_slot.to_string());
     // Per-fork density: this fork asked for --share-weights (preamble flag), so
     // the worker's reconstruction shares the golden's loaded weight physicals
     // instead of copying them. The daemon-wide env remains the global default;
@@ -1291,6 +1716,12 @@ fn spawn_clone_worker(
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            if libc::dup2(ctrl_child, ctrl_slot) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(ctrl_slot, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -1301,7 +1732,16 @@ fn spawn_clone_worker(
         // SAFETY: fds we created via mem_export_handle and no longer use.
         unsafe { libc::close(efd) };
     }
-    spawned
+    // SAFETY: the child inherited its own copy of the control child-end.
+    unsafe { libc::close(ctrl_child) };
+    match spawned {
+        Ok(pid) => Ok((pid, sp[0])),
+        Err(e) => {
+            // SAFETY: no worker took ownership; close the parent control end.
+            unsafe { libc::close(sp[0]) };
+            Err(e)
+        }
+    }
 }
 
 /// Ensure the shared daemon is running and return its socket path. Serialized by

@@ -324,6 +324,13 @@ const REJUVENATE_ATTEMPTS: usize = 3;
 /// `clone` is a validated machine name (alphanumeric + dashes) and `seed` is
 /// hex, so single-quoting both is injection-safe.
 ///
+/// NOTE: this deliberately does NOT touch `/storage/overlays`. The clone's
+/// inherited exec overlay stays under the GOLDEN's id and the restored guest
+/// may still hold it mounted (or have a restored workload container running
+/// from it) — renaming it on disk poisons that live overlayfs mount (ESTALE
+/// in every subsequent container exec). Hosts alias the overlay lookup
+/// instead (`crate::workload::persistent_overlay_owner`).
+///
 /// The script is fail-hard on the *unambiguously per-machine* identity material
 /// (`set -e`): if a clone cannot get its own machine-id or SSH host keys, the
 /// fork must fail rather than vend a clone that impersonates the golden. Steps
@@ -499,6 +506,19 @@ mod tests {
         // are absent (minimal library images).
         assert!(script.contains("set -e"));
         assert!(script.contains("command -v ssh-keygen"));
+    }
+
+    // The rejuvenation script must NOT touch the inherited exec overlay: the
+    // restored guest may still hold it mounted, and renaming a live
+    // overlayfs's backing directories breaks every subsequent container exec
+    // (ESTALE). Overlay adoption is a host-side lookup alias instead.
+    #[test]
+    fn rejuvenation_script_leaves_the_inherited_overlay_alone() {
+        let script = build_rejuvenation_script("clone-a", "deadbeef");
+        assert!(
+            !script.contains("/storage/overlays"),
+            "script must not rename/touch overlay dirs: {script}"
+        );
     }
 
     // Fix 2 (fail-closed): an Err rejuvenation must tear the clone down and

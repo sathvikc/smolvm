@@ -62,6 +62,22 @@ pub fn collect_from_vm_assets(
     staging_dir: &Path,
     opts: &FromVmExportOptions,
 ) -> crate::Result<FromVmAssets> {
+    // A fork clone's disks are CoW qcow2 overlays that only the fork/resume
+    // machinery can assemble — the export helper cold-boots them and libkrun
+    // rejects the stack with an opaque -22 EINVAL (same class as clone
+    // auto-standby wake). Refuse with the real story until overlay-chain boot
+    // is supported.
+    if let Some(ref golden) = vm.golden {
+        return Err(Error::agent(
+            "pack from VM",
+            format!(
+                "machine '{vm_name}' is a fork clone of '{golden}'; its copy-on-write \
+                 disks cannot be exported directly. Export the golden instead, or \
+                 recreate the state in a non-clone machine and export that."
+            ),
+        ));
+    }
+
     let vm_dir = vm_data_dir(vm_name);
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
     let is_image_based = vm.image.is_some();
@@ -166,6 +182,20 @@ impl ExportVm {
         network: bool,
     ) -> crate::Result<Self> {
         let (storage_disk, storage_fmt) = resolve_disk_image(source_vm_dir, STORAGE_DISK_FILENAME);
+        // A machine that has never been started has no disks yet — attaching
+        // the nonexistent image would boot the helper into a cryptic libkrun
+        // EINVAL. Fail with the actionable story instead.
+        if !storage_disk.exists() {
+            return Err(Error::agent(
+                "pack from VM",
+                format!(
+                    "machine '{vm_name}' has no storage disk yet ({}) — it has \
+                     never been started. Start it once so its state exists, or \
+                     pack the image directly with `pack create -I <image>`.",
+                    storage_disk.display()
+                ),
+            ));
+        }
         let scratch_name = format!(
             "pack-fromvm-{}-{}",
             std::process::id(),
@@ -188,7 +218,7 @@ impl ExportVm {
             uid_share_dir: Some(source_vm_dir.to_path_buf()),
             ..Default::default()
         };
-        manager.start_with_full_config(
+        if let Err(e) = manager.start_with_full_config(
             Vec::new(),
             Vec::new(),
             VmResources {
@@ -206,8 +236,12 @@ impl ExportVm {
                 allowed_cidrs: None,
             },
             features,
-        )?;
-        let _ = vm_name;
+        ) {
+            // The Drop cleanup only arms once Self exists — a failed boot must
+            // clean its own scratch dir or every failed export leaks one.
+            let _ = std::fs::remove_dir_all(&data_dir);
+            return Err(e);
+        }
         Ok(Self { manager, data_dir })
     }
 
