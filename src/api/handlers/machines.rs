@@ -366,6 +366,20 @@ pub async fn create_machine(
         }
     }
 
+    // `cmd`/`entrypoint` are the machine's persistent workload, launched only as
+    // a container from an image or `.smolmachine` artifact (registryRef and any
+    // image-pack-ref have already been folded into `from` above). Reject them on
+    // an imageless machine up front — it boots the bare-agent rootfs with nothing
+    // to launch them in, so silently accepting them would strand a caller whose
+    // command never runs (drive an imageless machine via `exec` instead).
+    validate_workload_image_source(
+        req.image.is_some(),
+        req.from.is_some(),
+        &req.cmd,
+        &req.entrypoint,
+    )
+    .map_err(ApiError::BadRequest)?;
+
     // Generate name if not provided, then validate. The on-disk layout uses
     // a hash-derived directory (see `vm_data_dir`) so name length doesn't
     // affect the socket path — only character sanity + a generous length
@@ -509,6 +523,18 @@ pub async fn create_machine(
     // machines. Memory is ballooned, so a generous default does not imply
     // immediate host commitment.
     let (cpus, mem) = resolve_create_resources(&req, manifest_cpus, manifest_mem);
+    // Reject invalid resources up front (as the CLI does at create time), so the
+    // API returns a clear 400 here instead of persisting an unbootable machine
+    // that only fails with a deferred 500 when it is later started.
+    crate::data::resources::VmResources {
+        cpus,
+        memory_mib: mem,
+        storage_gib: req.storage_gb,
+        overlay_gib: req.overlay_gb,
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let network = req.network || manifest_net;
 
     // Reserve the name atomically (prevents concurrent creation)
@@ -671,6 +697,7 @@ pub async fn create_machine(
     // the API surface is refused regardless of server binding — secrets
     // must be configured locally via the CLI.
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    crate::api::handlers::validate_request_env(&req.env)?;
 
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
@@ -802,6 +829,31 @@ fn classify_launch_error(e: String) -> ApiError {
     } else {
         ApiError::Internal(e)
     }
+}
+
+/// Reject `cmd`/`entrypoint` on a create request that names no image source.
+///
+/// A machine's `cmd`/`entrypoint` are launched only as a container workload from
+/// an image or `.smolmachine` artifact (see the image-launch path in
+/// [`start_machine`]). An imageless machine boots the bare-agent rootfs with
+/// nothing to run them in, so accepting them silently would strand a caller whose
+/// command never executes. Callers should fold `registryRef` and any pack-ref
+/// into `from`/`image` before this check so only a genuinely imageless request is
+/// rejected.
+fn validate_workload_image_source(
+    has_image: bool,
+    has_from: bool,
+    cmd: &[String],
+    entrypoint: &[String],
+) -> Result<(), String> {
+    if !has_image && !has_from && (!cmd.is_empty() || !entrypoint.is_empty()) {
+        return Err(
+            "cmd/entrypoint require an image, from, or registryRef; an imageless \
+             machine has no workload to launch them in (use exec instead)"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Start a machine.
@@ -1092,6 +1144,7 @@ pub async fn fork_machine(
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
+    let fork_env = crate::util::parse_env_list(&req.env);
 
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
     // the same clone can't race the fork's register + boot. The golden is only
@@ -1108,9 +1161,10 @@ pub async fn fork_machine(
         let golden_b = golden.clone();
         let clone_b = clone.clone();
         let ports = pinned_ports.clone();
+        let env = fork_env.clone();
         tokio::task::spawn_blocking(move || {
             crate::agent::fork::prepare_fork(
-                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false,
+                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env,
             )
         })
         .await
@@ -1156,15 +1210,23 @@ pub async fn fork_machine(
         // into a (possibly different) tenant. FAIL-CLOSED: if the reset can't be
         // confirmed, tear the booted clone down and fail the fork rather than
         // vend a clone that impersonates the golden.
+        let teardown = || {
+            manager.kill();
+            manager.cleanup_data_dir();
+            let _ = db.remove_vm(&clone_b);
+        };
         crate::agent::fork::fail_closed_on_rejuvenation(
             crate::agent::fork::rejuvenate_clone(&clone_b),
-            || {
-                manager.kill();
-                manager.cleanup_data_dir();
-                let _ = db.remove_vm(&clone_b);
-            },
+            teardown,
         )
         .map_err(|e| format!("clone identity rejuvenation failed: {}", e))?;
+        // Per-fork parameters: same fail-closed contract — a clone that asked
+        // for parameters but can't receive them must not be vended.
+        crate::agent::fork::fail_closed_on_rejuvenation(
+            crate::agent::fork::write_fork_env(&clone_b, &record, &fork_env),
+            teardown,
+        )
+        .map_err(|e| format!("fork env delivery failed: {}", e))?;
 
         let pid = manager.child_pid();
         Ok::<_, String>((manager, pid, record))
@@ -1569,6 +1631,7 @@ pub async fn exec_machine(
     // This avoids a second DB read per request.
     let entry = state.get_machine(&name)?;
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    crate::api::handlers::validate_request_env(&req.env)?;
     let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
     let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
 
@@ -1643,6 +1706,15 @@ pub async fn resize_machine(
     Path(name): Path<String>,
     Json(req): Json<ResizeMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Serialize against start/stop/delete/clone on the same machine: resize
+    // reads the state, then grows the disk files and rewrites the record. Without
+    // the per-machine lifecycle lock a concurrent start could boot the VM between
+    // our "must be stopped" check and the on-disk expansion (and race the record
+    // update), so hold the lock across the whole operation as the other lifecycle
+    // handlers do — the state check below is only meaningful under it.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
     let record = state
         .lookup_vm(&name)
         .await?
@@ -1961,6 +2033,20 @@ mod tests {
             classify_launch_error(e),
             ApiError::PortConflict(_)
         ));
+    }
+
+    #[test]
+    fn validate_workload_image_source_rejects_imageless_workload() {
+        let cmd = vec!["python".to_string(), "app.py".to_string()];
+        let ep = vec!["/bin/sh".to_string()];
+        // Imageless (no image, no from) + a command/entrypoint → rejected.
+        assert!(validate_workload_image_source(false, false, &cmd, &[]).is_err());
+        assert!(validate_workload_image_source(false, false, &[], &ep).is_err());
+        // With an image or a from source, the workload has somewhere to run.
+        assert!(validate_workload_image_source(true, false, &cmd, &[]).is_ok());
+        assert!(validate_workload_image_source(false, true, &cmd, &ep).is_ok());
+        // Imageless with no workload is the ordinary exec-driven machine.
+        assert!(validate_workload_image_source(false, false, &[], &[]).is_ok());
     }
 
     #[test]
