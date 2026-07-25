@@ -360,6 +360,11 @@ pub struct DeleteQuery {
     /// This may orphan the VM process. Default: false.
     #[serde(default)]
     pub force: bool,
+    /// If true, also delete any clones forked from this machine before removing
+    /// it. A fork base cannot be removed while its clones' overlays depend on
+    /// its disks; cascade removes those clones first. Default: false.
+    #[serde(default)]
+    pub cascade: bool,
 }
 
 // ============================================================================
@@ -708,4 +713,13 @@ pub struct ForkRequest {
     /// to read, and merged into the clone's env for later exec sessions.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Per-fork secrets as `SecretRef`s (host env var / absolute file). Merged
+    /// into the clone's persisted `secret_refs`, overriding same-named refs
+    /// inherited from the golden — so each clone gets its OWN secrets, resolved
+    /// fresh on every `exec`, never written to the overlay/artifact or a guest
+    /// file, and isolated from the golden and sibling clones. This is the
+    /// fork-safe path: unlike `env`, the plaintext never lands at rest.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
 }

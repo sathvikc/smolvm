@@ -1218,7 +1218,26 @@ impl RunCmd {
             expose_docker: self.docker_socket || params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir,
-            extra_disks: Vec::new(),
+            extra_disks: std::env::var("SMOLVM_EXTRA_DISK")
+                .ok()
+                .into_iter()
+                .flat_map(|spec| {
+                    spec.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|entry| {
+                            let (path, ro) = match entry.strip_suffix(":ro") {
+                                Some(p) => (p, true),
+                                None => (entry, false),
+                            };
+                            (
+                                std::path::PathBuf::from(path),
+                                ro,
+                                smolvm::data::disk::DiskFormat::Raw,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -2850,12 +2869,37 @@ pub struct ForkCmd {
     /// are — no shared-mount claim files needed.
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
+
+    /// Inject a per-fork secret from a host env var (GUEST_VAR=HOST_VAR),
+    /// resolved fresh on every `exec` in the clone. Unlike `--env`, the value is
+    /// never written to the clone's record, the overlay/pack, or the fork-env
+    /// guest file — and each clone's secrets are its own, invisible to the
+    /// golden and sibling clones.
+    #[arg(
+        long = "secret-env",
+        value_name = "GUEST_VAR=HOST_VAR",
+        help_heading = "Security"
+    )]
+    pub secret_env: Vec<String>,
+
+    /// Inject a per-fork secret from a host file (GUEST_VAR=/abs/path), resolved
+    /// fresh on every `exec` in the clone. Never persisted to the record,
+    /// overlay/pack, or fork-env guest file. See `--secret-env`.
+    #[arg(
+        long = "secret-file",
+        value_name = "GUEST_VAR=PATH",
+        help_heading = "Security"
+    )]
+    pub secret_file: Vec<String>,
 }
 
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
         let fork_env = smolvm::util::parse_env_list(&self.env);
+        // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
+        // they merge into the clone's secret_refs and resolve fresh per exec.
+        let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
         vm_common::fork_vm(
             &self.golden,
             &self.clone,
@@ -2863,6 +2907,7 @@ impl ForkCmd {
             &ports,
             self.share_weights,
             &fork_env,
+            &fork_secrets,
         )
     }
 }
@@ -2907,6 +2952,12 @@ pub struct DeleteCmd {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub force: bool,
+
+    /// Also delete any clones forked from this machine. A fork base cannot be
+    /// removed while its clones' disks depend on it; --cascade removes the
+    /// clones first (children before the base). Implies no confirmation.
+    #[arg(long)]
+    pub cascade: bool,
 }
 
 impl DeleteCmd {
@@ -2921,6 +2972,9 @@ impl DeleteCmd {
                 // dir out from under the live VM. The API delete handler and
                 // `delete_vm`'s own teardown already do this.
                 stop_if_running: true,
+                // Delete dependent clones too when requested, instead of
+                // refusing on a fork base.
+                cascade: self.cascade,
             },
         )
     }

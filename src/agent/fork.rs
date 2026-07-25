@@ -82,6 +82,7 @@ pub fn prepare_fork(
     pinned_ports: &[(u16, u16)],
     clone_forkable: bool,
     fork_env: &[(String, String)],
+    fork_secrets: &std::collections::BTreeMap<String, crate::secrets::SecretRef>,
 ) -> Result<PreparedFork> {
     validate_vm_name(clone, "clone name").map_err(|e| Error::config("clone name", e))?;
     validate_fork_env(fork_env)?;
@@ -227,6 +228,15 @@ pub fn prepare_fork(
             .retain(|(k, _)| !fork_env.iter().any(|(fk, _)| fk == k));
         clone_rec.env.extend(fork_env.iter().cloned());
     }
+    // Per-fork secrets: merge the refs into the clone's persisted `secret_refs`
+    // (overriding same-named refs inherited from the golden), so every `exec`
+    // in the clone resolves them fresh — the fork-safe path where plaintext
+    // never lands in the overlay/artifact or a guest file, and each clone's
+    // secrets are its own, invisible to the golden and sibling clones. Unlike
+    // `fork_env`, these are NOT written to the `fork-env` guest file.
+    for (k, r) in fork_secrets {
+        clone_rec.secret_refs.insert(k.clone(), r.clone());
+    }
     let mut port_remaps = Vec::new();
     if !pinned_ports.is_empty() {
         // User pinned the clone's forwards explicitly — use them as-is.
@@ -259,6 +269,10 @@ pub fn prepare_fork(
         let _ = std::fs::remove_dir_all(&clone_dir);
         let _ = std::fs::remove_dir_all(&snapshot_dir);
     };
+    // Phase timing: fork latency is dominated by one of these two steps; log
+    // each so a slow fork is diagnosable (the golden's RAM checkpoint vs the
+    // clone's disk-overlay creation) instead of a single opaque wall-time.
+    let t_snap = std::time::Instant::now();
     let reply = match control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display())) {
         Ok(r) => r,
         Err(e) => {
@@ -270,11 +284,20 @@ pub fn prepare_fork(
         cleanup();
         return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
     }
+    tracing::info!(
+        elapsed_ms = t_snap.elapsed().as_millis() as u64,
+        "fork: golden RAM checkpoint written"
+    );
 
+    let t_disk = std::time::Instant::now();
     if let Err(e) = clone_fork_disks(&gdir, &clone_dir) {
         cleanup();
         return Err(e);
     }
+    tracing::info!(
+        elapsed_ms = t_disk.elapsed().as_millis() as u64,
+        "fork: clone disk overlays created"
+    );
 
     Ok(PreparedFork {
         snapshot_dir,
