@@ -727,7 +727,7 @@ pub async fn create_machine(
         memory_mb: Some(mem),
         network: Some(network),
         gpu: Some(req.gpu),
-        cuda: Some(req.cuda),
+        cuda: Some(req.cuda || req.auto_graph),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
         allowed_cidrs: normalized_cidrs,
@@ -741,6 +741,10 @@ pub async fn create_machine(
     // must be configured locally via the CLI.
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
     crate::api::handlers::validate_request_env(&req.env)?;
+    let mut workload_env = merge_request_env(env, &req.env);
+    if req.auto_graph {
+        crate::util::enable_cuda_auto_graph_env(&mut workload_env);
+    }
 
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
@@ -770,7 +774,7 @@ pub async fn create_machine(
         source_smolmachine,
         entrypoint,
         cmd,
-        env: merge_request_env(env, &req.env),
+        env: workload_env,
         workdir: req.workdir.clone().or(workdir),
         // Record secrets = packed refs from --from (validated Untrusted above)
         // merged with request refs (validated Untrusted at ~line 333); request
@@ -1969,6 +1973,13 @@ pub async fn resize_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
+/// Where the export subprocess writes its executable stub. `pack create -o X` derives the
+/// real artifact as `X.smolmachine`, so this must NOT already end in that extension or the
+/// CLI rejects it outright.
+fn export_stub_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("export")
+}
+
 /// Export a stopped machine to a `.smolmachine` and push it directly to a
 /// registry.
 ///
@@ -2029,11 +2040,12 @@ pub async fn export_machine(
     // Build the .smolmachine by subprocessing this binary's tested export path.
     // The serve handlers and the pack CLI share the same on-disk SmolvmDb, so
     // `pack create --from-vm <name>` sees the serve-managed machine.
-    let tmp = tempfile::Builder::new()
-        .suffix(".smolmachine")
-        .tempfile()
-        .map_err(|e| ApiError::internal(format!("create temp file: {}", e)))?;
-    let tmp_path = tmp.path().to_path_buf();
+    // `pack create -o X` names the executable STUB and derives the sidecar as
+    // X.smolmachine, rejecting an `-o` that already carries that extension. Stage both
+    // inside a temp dir so the sidecar is cleaned up with the stub rather than left behind.
+    let tmp_dir =
+        tempfile::tempdir().map_err(|e| ApiError::internal(format!("create temp dir: {}", e)))?;
+    let tmp_path = export_stub_path(tmp_dir.path());
     let exe =
         std::env::current_exe().map_err(|e| ApiError::internal(format!("current_exe: {}", e)))?;
 
@@ -2223,9 +2235,31 @@ fn merge_request_env(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::db::SmolvmDb;
     use tempfile::TempDir;
+
+    #[test]
+    fn export_stub_path_is_not_the_sidecar_name() {
+        // Regression: the handler used to hand `pack create` a temp file that already
+        // ended in `.smolmachine`, which the CLI rejects because `-o` names the stub.
+        let dir = std::path::Path::new("/tmp/export-test");
+        let stub = export_stub_path(dir);
+        assert!(
+            stub.extension()
+                .is_none_or(|e| !e.eq_ignore_ascii_case("smolmachine")),
+            "-o must name the stub, not the sidecar: {}",
+            stub.display()
+        );
+        let sidecar = smolvm_pack::sidecar_path_for(&stub);
+        assert_eq!(
+            sidecar.extension().and_then(|e| e.to_str()),
+            Some("smolmachine"),
+            "the derived sidecar must be the .smolmachine artifact"
+        );
+        assert_ne!(stub, sidecar);
+    }
 
     #[test]
     fn classify_fork_error_maps_precondition_failures_to_conflict() {
@@ -2409,6 +2443,7 @@ mod tests {
             network: false,
             gpu: false,
             cuda: false,
+            auto_graph: false,
             entrypoint: vec![],
             cmd: vec![],
             docker_socket: false,
@@ -2471,6 +2506,52 @@ mod tests {
         assert_eq!(req.env[0].name, "FOO");
         assert_eq!(req.env[0].value, "bar");
         assert_eq!(req.workdir.as_deref(), Some("/app"));
+    }
+
+    #[test]
+    fn create_request_auto_graph_is_opt_in() {
+        let enabled: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm",
+            "autoGraph": true
+        }))
+        .unwrap();
+        assert!(enabled.auto_graph);
+
+        let defaulted: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm"
+        }))
+        .unwrap();
+        assert!(!defaulted.auto_graph);
+    }
+
+    #[test]
+    fn auto_graph_policy_overrides_conflicting_request_env() {
+        let mut env = merge_request_env(
+            vec![(
+                crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
+                "0".to_string(),
+            )],
+            &[crate::api::types::EnvVar {
+                name: crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(),
+                value: "0".to_string(),
+            }],
+        );
+
+        crate::util::enable_cuda_auto_graph_env(&mut env);
+
+        assert_eq!(
+            env,
+            vec![
+                (
+                    crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
+                    "1".to_string()
+                ),
+                (
+                    crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(),
+                    "1".to_string(),
+                ),
+            ]
+        );
     }
 
     #[test]
