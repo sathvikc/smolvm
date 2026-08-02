@@ -31,6 +31,42 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 /// crashed creator does not reserve a name forever.
 const CREATE_RESERVATION_TTL_SECS: u64 = 60 * 60;
 
+/// Inputs committed together when one ready fork-pool worker is claimed.
+pub struct ForkPoolSlotClaim<'a> {
+    /// Pool that owns the ready worker.
+    pub pool_name: &'a str,
+    /// New opaque lease identifier.
+    pub lease_id: &'a str,
+    /// Caller-provided retry key, unique within the pool.
+    pub idempotency_key: &'a str,
+    /// Environment installed before the held workload is released.
+    pub assignment: &'a [(String, String)],
+    /// Canonical digest of any files staged before release.
+    pub payload_sha256: Option<&'a str>,
+    /// Reject workers whose `/workspace` is backed by an external mount.
+    pub require_private_workspace: bool,
+    /// Runtime-calibrated active-lease ceiling, applied with the durable limit.
+    pub admission_limit: Option<u32>,
+    /// Lease lifetime renewed by each heartbeat.
+    pub ttl_secs: u64,
+    /// Timestamp used for every record in this transaction.
+    pub now: u64,
+}
+
+fn targets_workspace_tree(target: &str) -> bool {
+    let mut components = Vec::new();
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            value => components.push(value),
+        }
+    }
+    components.first() == Some(&"workspace")
+}
+
 /// Max SQLite connections held open by the pool. WAL allows these to read
 /// concurrently (writes still serialize at the SQLite layer, gated by
 /// `busy_timeout`), so a slow write can no longer block reads — the prior
@@ -801,6 +837,30 @@ impl SmolvmDb {
         })
     }
 
+    /// Return the active/activating lease count and cumulative successful
+    /// completions used by the runtime-only admission controller.
+    pub fn fork_pool_admission_counts(&self, pool_name: &str) -> Result<(u32, u64)> {
+        self.with_read_conn(|conn| {
+            let active = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_leases
+                     WHERE pool_name = ?1 AND state IN ('activating', 'active')",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count active fork leases for admission")?;
+            let completed = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_leases
+                     WHERE pool_name = ?1 AND state = 'completed'",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count completed fork leases for admission")?;
+            Ok((active, completed))
+        })
+    }
+
     /// Reserve a provisioning slot only while the pool still has a ready deficit.
     ///
     /// The deficit check and insert share a transaction, so repeated controller
@@ -962,15 +1022,18 @@ impl SmolvmDb {
     /// The VM's `forkpoint_held` bit is cleared in the same transaction as the
     /// slot claim. A crash after commit can waste this worker, but can never
     /// make a released workload appear ready for a second caller.
-    pub fn claim_fork_pool_slot(
-        &self,
-        pool_name: &str,
-        lease_id: &str,
-        idempotency_key: &str,
-        assignment: &[(String, String)],
-        ttl_secs: u64,
-        now: u64,
-    ) -> Result<ClaimForkPoolSlot> {
+    pub fn claim_fork_pool_slot(&self, claim: ForkPoolSlotClaim<'_>) -> Result<ClaimForkPoolSlot> {
+        let ForkPoolSlotClaim {
+            pool_name,
+            lease_id,
+            idempotency_key,
+            assignment,
+            payload_sha256,
+            require_private_workspace,
+            admission_limit,
+            ttl_secs,
+            now,
+        } = claim;
         self.with_conn(|conn| {
             let tx = conn.transaction().db_err("begin fork pool claim")?;
             if let Some(bytes) = tx
@@ -1006,7 +1069,12 @@ impl SmolvmDb {
                 tx.commit().db_err("commit deleting fork pool claim")?;
                 return Ok(ClaimForkPoolSlot::PoolDeleting);
             }
-            if let Some(max_active) = pool.max_active {
+            let max_active = match (pool.max_active, admission_limit) {
+                (Some(configured), Some(adaptive)) => Some(configured.min(adaptive)),
+                (Some(configured), None) => Some(configured),
+                (None, adaptive) => adaptive,
+            };
+            if let Some(max_active) = max_active {
                 let active: u32 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM fork_leases
@@ -1085,6 +1153,16 @@ impl SmolvmDb {
             };
             let mut vm: VmRecord =
                 serde_json::from_slice(&vm_data).db_err("deserialize pool worker")?;
+            if require_private_workspace
+                && vm
+                    .mounts
+                    .iter()
+                    .any(|(_, target, _)| targets_workspace_tree(target))
+            {
+                tx.commit()
+                    .db_err("commit external-workspace fork claim rejection")?;
+                return Ok(ClaimForkPoolSlot::WorkspaceExternallyMounted);
+            }
             let merged = crate::agent::fork::merge_fork_env(&vm.fork_env, assignment);
             crate::agent::fork::record_fork_activation(&mut vm, assignment, merged);
             let vm_updated = serde_json::to_vec(&vm).db_err("serialize claimed pool worker")?;
@@ -1113,6 +1191,7 @@ impl SmolvmDb {
                 idempotency_key: idempotency_key.to_string(),
                 state: ForkLeaseState::Activating,
                 assignment: assignment.to_vec(),
+                payload_sha256: payload_sha256.map(str::to_owned),
                 created_at: now,
                 updated_at: now,
                 expires_at: now.saturating_add(ttl_secs),
@@ -1963,6 +2042,7 @@ mod tests {
             golden: "golden".into(),
             desired_ready,
             max_active: None,
+            auto_admission: false,
             share_weights: true,
             ready_timeout_secs: 30,
             lease_ttl_secs: 60,
@@ -2030,15 +2110,27 @@ mod tests {
             .unwrap();
         insert_ready_pool_slot(&db, "rollouts", "slot-1");
         let assignment = vec![("EPISODE".into(), "42".into())];
+        let payload_sha256 = "payload-digest";
 
         let first = db
-            .claim_fork_pool_slot("rollouts", "lease-a", "request-a", &assignment, 60, 200)
+            .claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-a",
+                idempotency_key: "request-a",
+                assignment: &assignment,
+                payload_sha256: Some(payload_sha256),
+                require_private_workspace: true,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 200,
+            })
             .unwrap();
         let lease = match first {
             ClaimForkPoolSlot::Claimed(lease) => lease,
             other => panic!("unexpected claim result: {other:?}"),
         };
         assert_eq!(lease.machine_name, "slot-1");
+        assert_eq!(lease.payload_sha256.as_deref(), Some(payload_sha256));
         let vm = db.get_vm("slot-1").unwrap().unwrap();
         assert!(!vm.forkpoint_held);
         assert!(vm
@@ -2047,23 +2139,103 @@ mod tests {
             .any(|(key, value)| key == "EPISODE" && value == "42"));
 
         let retry = db
-            .claim_fork_pool_slot(
-                "rollouts",
-                "unused-new-id",
-                "request-a",
-                &assignment,
-                60,
-                201,
-            )
+            .claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "unused-new-id",
+                idempotency_key: "request-a",
+                assignment: &assignment,
+                payload_sha256: Some(payload_sha256),
+                require_private_workspace: true,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 201,
+            })
             .unwrap();
         assert!(matches!(
             retry,
-            ClaimForkPoolSlot::Existing(ref existing) if existing.id == "lease-a"
+            ClaimForkPoolSlot::Existing(ref existing)
+                if existing.id == "lease-a"
+                    && existing.payload_sha256.as_deref() == Some(payload_sha256)
         ));
         let second_request = db
-            .claim_fork_pool_slot("rollouts", "lease-b", "request-b", &assignment, 60, 201)
+            .claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-b",
+                idempotency_key: "request-b",
+                assignment: &assignment,
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 201,
+            })
             .unwrap();
         assert_eq!(second_request, ClaimForkPoolSlot::NoReadySlot);
+    }
+
+    #[test]
+    fn payload_claim_rejects_external_workspace_without_consuming_slot() {
+        let (_dir, db) = temp_db();
+        db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
+            .unwrap();
+        insert_ready_pool_slot(&db, "rollouts", "slot-1");
+        db.update_vm("slot-1", |vm| {
+            vm.mounts
+                .push(("/host/jobs".into(), "/workspace/jobs".into(), false));
+        })
+        .unwrap();
+
+        let rejected = db
+            .claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-a",
+                idempotency_key: "request-a",
+                assignment: &[],
+                payload_sha256: Some("payload-digest"),
+                require_private_workspace: true,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 200,
+            })
+            .unwrap();
+        assert_eq!(rejected, ClaimForkPoolSlot::WorkspaceExternallyMounted);
+        assert_eq!(
+            db.get_fork_pool_slot("slot-1").unwrap().unwrap().state,
+            ForkPoolSlotState::Ready
+        );
+        assert!(db.get_vm("slot-1").unwrap().unwrap().forkpoint_held);
+
+        let env_only = db
+            .claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-b",
+                idempotency_key: "request-b",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 201,
+            })
+            .unwrap();
+        assert!(matches!(env_only, ClaimForkPoolSlot::Claimed(_)));
+    }
+
+    #[test]
+    fn workspace_mount_targets_are_normalized_component_wise() {
+        for target in [
+            "/workspace",
+            "/workspace/",
+            "/workspace/jobs",
+            "/workspace/./jobs",
+            "/tmp/../workspace/jobs",
+            "workspace/jobs",
+        ] {
+            assert!(targets_workspace_tree(target), "{target}");
+        }
+        for target in ["/data", "/workspace2", "/tmp/workspace", "/workspace/.."] {
+            assert!(!targets_workspace_tree(target), "{target}");
+        }
     }
 
     #[test]
@@ -2080,14 +2252,17 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    db.claim_fork_pool_slot(
-                        "rollouts",
+                    db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                        pool_name: "rollouts",
                         lease_id,
-                        "same-request",
-                        &[("EPISODE".into(), "42".into())],
-                        60,
-                        200,
-                    )
+                        idempotency_key: "same-request",
+                        assignment: &[("EPISODE".into(), "42".into())],
+                        payload_sha256: None,
+                        require_private_workspace: false,
+                        admission_limit: None,
+                        ttl_secs: 60,
+                        now: 200,
+                    })
                     .unwrap()
                 })
             })
@@ -2131,13 +2306,33 @@ mod tests {
         db.insert_fork_pool_if_not_exists(&pool).unwrap();
         insert_ready_pool_slot(&db, "rollouts", "slot-1");
         insert_ready_pool_slot(&db, "rollouts", "slot-2");
-        db.claim_fork_pool_slot("rollouts", "lease-1", "request-1", &[], 60, 200)
-            .unwrap();
+        db.claim_fork_pool_slot(ForkPoolSlotClaim {
+            pool_name: "rollouts",
+            lease_id: "lease-1",
+            idempotency_key: "request-1",
+            assignment: &[],
+            payload_sha256: None,
+            require_private_workspace: false,
+            admission_limit: None,
+            ttl_secs: 60,
+            now: 200,
+        })
+        .unwrap();
         db.mark_fork_lease_active("lease-1", 201).unwrap();
 
         assert_eq!(
-            db.claim_fork_pool_slot("rollouts", "lease-2", "request-2", &[], 60, 202)
-                .unwrap(),
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "lease-2",
+                idempotency_key: "request-2",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 202,
+            })
+            .unwrap(),
             ClaimForkPoolSlot::AtCapacity
         );
         assert_eq!(
@@ -2150,10 +2345,64 @@ mod tests {
             "capacity rejection must not consume a clean worker"
         );
         assert!(matches!(
-            db.claim_fork_pool_slot("rollouts", "ignored", "request-1", &[], 60, 203)
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id: "ignored",
+                idempotency_key: "request-1",
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit: None,
+                ttl_secs: 60,
+                now: 203,
+            })
                 .unwrap(),
             ClaimForkPoolSlot::Existing(lease) if lease.id == "lease-1"
         ));
+    }
+
+    #[test]
+    fn adaptive_limit_is_atomic_and_never_loosens_static_limit() {
+        let (_dir, db) = temp_db();
+        let mut pool = test_pool("rollouts", 3);
+        pool.max_active = Some(2);
+        db.insert_fork_pool_if_not_exists(&pool).unwrap();
+        for machine in ["slot-1", "slot-2", "slot-3"] {
+            insert_ready_pool_slot(&db, "rollouts", machine);
+        }
+
+        let claim = |lease_id: &str, request: &str, admission_limit| {
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id,
+                idempotency_key: request,
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit,
+                ttl_secs: 60,
+                now: 200,
+            })
+            .unwrap()
+        };
+
+        assert!(matches!(
+            claim("lease-1", "request-1", Some(1)),
+            ClaimForkPoolSlot::Claimed(_)
+        ));
+        assert_eq!(
+            claim("lease-2", "request-2", Some(1)),
+            ClaimForkPoolSlot::AtCapacity
+        );
+        assert!(matches!(
+            claim("lease-2", "request-2", Some(3)),
+            ClaimForkPoolSlot::Claimed(_)
+        ));
+        assert_eq!(
+            claim("lease-3", "request-3", Some(3)),
+            ClaimForkPoolSlot::AtCapacity,
+            "dynamic admission may not exceed maxActive"
+        );
     }
 
     #[test]
@@ -2169,7 +2418,17 @@ mod tests {
             ("slot-expire", "lease-expire", "req-expire"),
         ] {
             let claimed = db
-                .claim_fork_pool_slot("rollouts", lease, request, &[], 10, 200)
+                .claim_fork_pool_slot(ForkPoolSlotClaim {
+                    pool_name: "rollouts",
+                    lease_id: lease,
+                    idempotency_key: request,
+                    assignment: &[],
+                    payload_sha256: None,
+                    require_private_workspace: false,
+                    admission_limit: None,
+                    ttl_secs: 10,
+                    now: 200,
+                })
                 .unwrap();
             assert!(
                 matches!(claimed, ClaimForkPoolSlot::Claimed(ref l) if l.machine_name == machine)
@@ -2220,8 +2479,18 @@ mod tests {
         db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
             .unwrap();
         insert_ready_pool_slot(&db, "rollouts", "slot-1");
-        db.claim_fork_pool_slot("rollouts", "lease-1", "request-1", &[], 60, 200)
-            .unwrap();
+        db.claim_fork_pool_slot(ForkPoolSlotClaim {
+            pool_name: "rollouts",
+            lease_id: "lease-1",
+            idempotency_key: "request-1",
+            assignment: &[],
+            payload_sha256: None,
+            require_private_workspace: false,
+            admission_limit: None,
+            ttl_secs: 60,
+            now: 200,
+        })
+        .unwrap();
         db.mark_fork_lease_active("lease-1", 201).unwrap();
 
         assert_eq!(
@@ -2246,8 +2515,18 @@ mod tests {
         db.insert_fork_pool_if_not_exists(&test_pool("rollouts", 1))
             .unwrap();
         insert_ready_pool_slot(&db, "rollouts", "slot-1");
-        db.claim_fork_pool_slot("rollouts", "lease-1", "request-1", &[], 60, 200)
-            .unwrap();
+        db.claim_fork_pool_slot(ForkPoolSlotClaim {
+            pool_name: "rollouts",
+            lease_id: "lease-1",
+            idempotency_key: "request-1",
+            assignment: &[],
+            payload_sha256: None,
+            require_private_workspace: false,
+            admission_limit: None,
+            ttl_secs: 60,
+            now: 200,
+        })
+        .unwrap();
         db.mark_fork_lease_active("lease-1", 201).unwrap();
 
         let failed = db

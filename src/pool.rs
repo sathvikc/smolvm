@@ -13,6 +13,10 @@ pub struct ForkPoolRecord {
     pub desired_ready: u32,
     /// Optional limit on simultaneously active leases.
     pub max_active: Option<u32>,
+    /// Dynamically calibrate the active-lease limit from host/GPU telemetry.
+    /// Absent on records written before automatic admission was introduced.
+    #[serde(default)]
+    pub auto_admission: bool,
     /// Share the golden's immutable CUDA allocations with each worker.
     pub share_weights: bool,
     /// Maximum time to wait for the golden's workload forkpoint.
@@ -120,6 +124,9 @@ pub struct ForkLeaseRecord {
     pub state: ForkLeaseState,
     /// Canonical assignment environment written before guest release.
     pub assignment: Vec<(String, String)>,
+    /// Digest of the canonical pre-release file payload, for retry validation.
+    #[serde(default)]
+    pub payload_sha256: Option<String>,
     /// Unix timestamp when the claim was created.
     pub created_at: u64,
     /// Unix timestamp of the last state transition or heartbeat.
@@ -147,4 +154,51 @@ pub enum ClaimForkPoolSlot {
     PoolNotFound,
     /// Pool deletion began before the claim committed.
     PoolDeleting,
+    /// Payload staging cannot safely target an externally mounted workspace.
+    WorkspaceExternallyMounted,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_lease_without_payload_digest_still_deserializes() {
+        let lease: ForkLeaseRecord = serde_json::from_str(
+            r#"{
+                "id":"lease-1",
+                "pool_name":"pool",
+                "machine_name":"worker",
+                "idempotency_key":"request",
+                "state":"active",
+                "assignment":[],
+                "created_at":1,
+                "updated_at":1,
+                "expires_at":61,
+                "ttl_secs":60,
+                "last_error":null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(lease.payload_sha256, None);
+    }
+
+    #[test]
+    fn legacy_pool_without_auto_admission_stays_full_residency() {
+        let pool: ForkPoolRecord = serde_json::from_str(
+            r#"{
+                "name":"rollouts",
+                "golden":"golden",
+                "desired_ready":8,
+                "max_active":null,
+                "share_weights":true,
+                "ready_timeout_secs":240,
+                "lease_ttl_secs":300,
+                "created_at":1,
+                "deleting":false
+            }"#,
+        )
+        .unwrap();
+        assert!(!pool.auto_admission);
+    }
 }

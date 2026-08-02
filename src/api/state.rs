@@ -67,6 +67,11 @@ pub struct ApiState {
     /// node as unschedulable (HTTP 503) the moment the main runtime stops
     /// making progress, turning a silent wedge into a fast, honest drain signal.
     runtime_heartbeat_ms: std::sync::atomic::AtomicU64,
+    /// Runtime-only CUDA pool admission state. Durable pool configuration lives
+    /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
+    admission: crate::api::admission::AdmissionRegistry,
+    /// Runtime registry for framework-aware fused rollout executors.
+    rollout: crate::api::rollout::RolloutRegistry,
 }
 
 /// Internal machine entry with manager and configuration.
@@ -230,6 +235,8 @@ impl ApiState {
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            admission: crate::api::admission::AdmissionRegistry::default(),
+            rollout: crate::api::rollout::RolloutRegistry::default(),
         })
     }
 
@@ -245,7 +252,20 @@ impl ApiState {
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            admission: crate::api::admission::AdmissionRegistry::default(),
+            rollout: crate::api::rollout::RolloutRegistry::default(),
         }
+    }
+
+    /// Shared lease-aware admission registry used by the pool controller and
+    /// the atomic lease claim path.
+    pub fn admission(&self) -> &crate::api::admission::AdmissionRegistry {
+        &self.admission
+    }
+
+    /// Framework-aware fused rollout executors registered on this node.
+    pub fn rollout(&self) -> &crate::api::rollout::RolloutRegistry {
+        &self.rollout
     }
 
     /// How long the main runtime may go without a supervisor heartbeat before
