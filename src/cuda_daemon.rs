@@ -13,13 +13,18 @@
 use crate::platform::uds::UdsListener;
 use smolvm_cuda::host::{serve, serve_with_options, Backend, CpuBackend, GpuBackend, ServeOptions};
 use std::io;
-use std::os::unix::net::UnixStream;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Stable host-device enumeration shared with device-scoped admission.
+const CUDA_DEVICE_ORDER: &str = "PCI_BUS_ID";
 
 /// Control-socket path for the shared daemon, under the smolvm data dir (so the
 /// daemon and every boot subprocess agree on one location).
@@ -28,6 +33,603 @@ pub fn socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("smolvm"));
     root.join("cuda-daemon.sock")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloneWorkerStatus {
+    Ready,
+    Failed,
+}
+
+fn clone_worker_status_path(vm_pid: u32) -> PathBuf {
+    socket_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("cuda-worker-ready")
+        .join(vm_pid.to_string())
+}
+
+fn encode_clone_worker_status(start_time: u64, status: CloneWorkerStatus) -> String {
+    let status = match status {
+        CloneWorkerStatus::Ready => "ready",
+        CloneWorkerStatus::Failed => "failed",
+    };
+    format!("{start_time} {status}\n")
+}
+
+fn decode_clone_worker_status(value: &str) -> Option<(u64, CloneWorkerStatus)> {
+    let mut fields = value.split_whitespace();
+    let start_time = fields.next()?.parse().ok()?;
+    let status = match fields.next()? {
+        "ready" => CloneWorkerStatus::Ready,
+        "failed" => CloneWorkerStatus::Failed,
+        _ => return None,
+    };
+    fields.next().is_none().then_some((start_time, status))
+}
+
+fn publish_clone_worker_status(vm_pid: u32, status: CloneWorkerStatus) -> io::Result<()> {
+    let start_time = crate::process::process_start_time(vm_pid as i32).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("clone VM process {vm_pid} exited before CUDA worker readiness"),
+        )
+    })?;
+    let path = clone_worker_status_path(vm_pid);
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("CUDA worker status path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".{vm_pid}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, encode_clone_worker_status(start_time, status))?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn prune_dead_clone_worker_statuses() {
+    let Some(directory) = clone_worker_status_path(0).parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Publication uses a same-directory temporary file so rename is
+        // atomic. Do not race that write: only reap a stranded temporary after
+        // it is far older than the sub-millisecond publication window.
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= Duration::from_secs(60));
+            if stale {
+                let _ = std::fs::remove_file(path);
+            }
+            continue;
+        }
+        let live = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+            .zip(
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|value| decode_clone_worker_status(&value))
+                    .map(|(started, _)| started),
+            )
+            .is_some_and(|(pid, started)| {
+                crate::process::is_our_process_strict(pid, Some(started))
+            });
+        if !live {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub(crate) fn wait_for_clone_worker_ready(
+    vm_pid: i32,
+    vm_start_time: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    let vm_pid_u32 = u32::try_from(vm_pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid clone VM pid"))?;
+    let path = clone_worker_status_path(vm_pid_u32);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::fs::read_to_string(&path) {
+            Ok(value) => {
+                if let Some((start_time, status)) = decode_clone_worker_status(&value) {
+                    if start_time == vm_start_time {
+                        let _ = std::fs::remove_file(&path);
+                        return match status {
+                            CloneWorkerStatus::Ready => Ok(()),
+                            CloneWorkerStatus::Failed => Err(io::Error::other(
+                                "CUDA clone worker failed during reconstruction",
+                            )),
+                        };
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if !crate::process::is_our_process_strict(vm_pid, Some(vm_start_time)) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "clone VM exited before its CUDA worker became ready",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "CUDA clone worker did not become ready within {}s",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+const TENSOR_PUBLISH_MAGIC: [u8; 4] = *b"TBP1";
+const TENSOR_CONSUME_MAGIC: [u8; 4] = *b"TBC1";
+const TENSOR_RESPONSE_MAGIC: [u8; 4] = *b"TBR1";
+const MAX_TENSOR_BUNDLE_METADATA: usize = (2 << 20) + 64;
+const MAX_PENDING_TENSOR_BUNDLES: usize = 64;
+const MAX_PENDING_TENSOR_BYTES: u64 = 32 << 30;
+const TENSOR_BUNDLE_TTL: Duration = Duration::from_secs(60);
+static TENSOR_BUNDLE_SERVICE_READY: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+const MAX_MODULE_HANDOFF_BLOB_BYTES: u64 = 32 << 30;
+#[cfg(unix)]
+const EXTERNAL_MODULE_IMAGES_MAGIC: [u8; 4] = *b"MHI2";
+
+#[derive(Debug)]
+struct PendingTensorBundle {
+    allocation: OwnedFd,
+    allocation_size: u64,
+    metadata: Vec<u8>,
+    created: Instant,
+}
+
+fn pending_tensor_bundles(
+) -> &'static Mutex<std::collections::HashMap<Vec<u8>, PendingTensorBundle>> {
+    static BUNDLES: OnceLock<Mutex<std::collections::HashMap<Vec<u8>, PendingTensorBundle>>> =
+        OnceLock::new();
+    BUNDLES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn tensor_bundle_socket_path(cuda_socket: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.tensors", cuda_socket.display()))
+}
+
+/// One immutable device allocation redeemed from a clone worker publication.
+///
+/// The descriptor is owned by the caller. Dropping it releases only this
+/// process's reference; a descriptor already transferred with `SCM_RIGHTS`
+/// remains valid in the receiving process.
+#[cfg(target_os = "linux")]
+pub(crate) struct RedeemedTensorBundle {
+    pub(crate) allocation: OwnedFd,
+    pub(crate) allocation_size: u64,
+    pub(crate) metadata: Vec<u8>,
+}
+
+fn prune_tensor_bundles(
+    bundles: &mut std::collections::HashMap<Vec<u8>, PendingTensorBundle>,
+    now: Instant,
+) {
+    bundles.retain(|_, bundle| now.duration_since(bundle.created) < TENSOR_BUNDLE_TTL);
+}
+
+fn pending_tensor_bytes(bundles: &std::collections::HashMap<Vec<u8>, PendingTensorBundle>) -> u64 {
+    bundles.values().map(|bundle| bundle.allocation_size).sum()
+}
+
+fn fresh_tensor_token() -> io::Result<Vec<u8>> {
+    let mut token = vec![0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
+    Ok(token)
+}
+
+fn encode_tensor_bundle_metadata(bundle: &smolvm_cuda::host::DeviceTensorBundle) -> Vec<u8> {
+    let mut metadata = Vec::with_capacity(8 + bundle.manifest.len() + bundle.tensors.len() * 16);
+    metadata.extend_from_slice(&(bundle.manifest.len() as u32).to_le_bytes());
+    metadata.extend_from_slice(&(bundle.tensors.len() as u32).to_le_bytes());
+    metadata.extend_from_slice(&bundle.manifest);
+    for tensor in &bundle.tensors {
+        metadata.extend_from_slice(&tensor.offset.to_le_bytes());
+        metadata.extend_from_slice(&tensor.size.to_le_bytes());
+    }
+    metadata
+}
+
+fn validate_tensor_bundle_metadata(metadata: &[u8], allocation_size: u64) -> io::Result<()> {
+    if metadata.len() < 8 || metadata.len() > MAX_TENSOR_BUNDLE_METADATA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle metadata length",
+        ));
+    }
+    let manifest_len = u32::from_le_bytes(metadata[0..4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(metadata[4..8].try_into().unwrap()) as usize;
+    let expected = 8usize
+        .checked_add(manifest_len)
+        .and_then(|size| size.checked_add(count.checked_mul(16)?))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "metadata overflow"))?;
+    if expected != metadata.len() || manifest_len > 1 << 20 || count == 0 || count > 65_536 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inconsistent tensor-bundle metadata",
+        ));
+    }
+    let mut prior_end = 0u64;
+    for tensor in metadata[8 + manifest_len..].chunks_exact(16) {
+        let offset = u64::from_le_bytes(tensor[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(tensor[8..16].try_into().unwrap());
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "tensor range overflow"))?;
+        if size == 0 || offset != prior_end || end > allocation_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tensor range falls outside its allocation",
+            ));
+        }
+        prior_end = end;
+    }
+    Ok(())
+}
+
+fn send_fd_header(stream: &UnixStream, fd: i32, header: &[u8; 16]) -> io::Result<()> {
+    let mut iov = libc::iovec {
+        iov_base: header.as_ptr() as *mut libc::c_void,
+        iov_len: header.len(),
+    };
+    // SAFETY: standard sendmsg with one immutable header and one owned fd. The
+    // receiving process gets its own descriptor reference through SCM_RIGHTS.
+    unsafe {
+        let mut cmsgbuf = [0u8; 32];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsgbuf.as_mut_ptr().cast();
+        msg.msg_controllen = libc::CMSG_SPACE(4) as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(4) as _;
+        std::ptr::copy_nonoverlapping((&fd as *const i32).cast::<u8>(), libc::CMSG_DATA(cmsg), 4);
+        let sent = libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if sent as usize != header.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short tensor-bundle control header",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recv_fd_header(stream: &mut UnixStream) -> io::Result<Option<(OwnedFd, [u8; 16])>> {
+    let mut header = [0u8; 16];
+    let mut iov = libc::iovec {
+        iov_base: header.as_mut_ptr().cast(),
+        iov_len: header.len(),
+    };
+    // SAFETY: recvmsg writes within the fixed header/control buffers. A valid
+    // SCM_RIGHTS message transfers ownership of exactly one descriptor.
+    let (received, fd) = unsafe {
+        let mut cmsgbuf = [0u8; 32];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsgbuf.as_mut_ptr().cast();
+        msg.msg_controllen = libc::CMSG_SPACE(4) as _;
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        let received = libc::recvmsg(stream.as_raw_fd(), &mut msg, flags);
+        if received < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if received == 0 {
+            return Ok(None);
+        }
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null()
+            || msg.msg_flags & libc::MSG_CTRUNC != 0
+            || (*cmsg).cmsg_level != libc::SOL_SOCKET
+            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+            || (*cmsg).cmsg_len as usize != libc::CMSG_LEN(4) as usize
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tensor-bundle message did not contain one fd",
+            ));
+        }
+        let mut fd = -1;
+        std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsg), (&mut fd as *mut i32).cast(), 4);
+        (received as usize, fd)
+    };
+    if received < header.len() {
+        stream.read_exact(&mut header[received..])?;
+    }
+    // SAFETY: SCM_RIGHTS returned a new descriptor owned by this process.
+    Ok(Some((unsafe { OwnedFd::from_raw_fd(fd) }, header)))
+}
+
+fn send_tensor_bundle_to_parent(
+    stream: &mut UnixStream,
+    bundle: smolvm_cuda::host::DeviceTensorBundle,
+) -> smolvm_cuda::host::CuResult<Vec<u8>> {
+    let channel_error = |stage: &'static str, error: io::Error| {
+        tracing::warn!(%error, stage, "tensor-bundle publication channel failed");
+        999
+    };
+    let metadata = encode_tensor_bundle_metadata(&bundle);
+    let mut header = [0u8; 16];
+    header[..4].copy_from_slice(&TENSOR_PUBLISH_MAGIC);
+    header[4..8].copy_from_slice(&(metadata.len() as u32).to_le_bytes());
+    header[8..16].copy_from_slice(&bundle.allocation_size.to_le_bytes());
+    send_fd_header(stream, bundle.allocation.as_raw_fd(), &header)
+        .map_err(|error| channel_error("descriptor", error))?;
+    stream
+        .write_all(&metadata)
+        .map_err(|error| channel_error("metadata", error))?;
+    let mut ack = [0u8; 8];
+    stream
+        .read_exact(&mut ack)
+        .map_err(|error| channel_error("acknowledgement", error))?;
+    let status = i32::from_le_bytes(ack[..4].try_into().unwrap());
+    let token_len = u32::from_le_bytes(ack[4..].try_into().unwrap()) as usize;
+    if status != 0 {
+        return Err(status);
+    }
+    if token_len == 0 || token_len > 256 {
+        return Err(999);
+    }
+    let mut token = vec![0u8; token_len];
+    stream
+        .read_exact(&mut token)
+        .map_err(|error| channel_error("token", error))?;
+    Ok(token)
+}
+
+fn tensor_bundle_receiver(mut stream: UnixStream, worker_pid: u32) {
+    loop {
+        let received = match recv_fd_header(&mut stream) {
+            Ok(Some(received)) => received,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, worker_pid, "tensor-bundle worker channel ended");
+                break;
+            }
+        };
+        let (allocation, header) = received;
+        let mut status = 0i32;
+        let mut token = Vec::new();
+        let mut close_after_ack = false;
+        let metadata_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let allocation_size = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let mut metadata = vec![0u8; metadata_len.min(MAX_TENSOR_BUNDLE_METADATA)];
+        if header[..4] != TENSOR_PUBLISH_MAGIC
+            || metadata_len == 0
+            || metadata_len > MAX_TENSOR_BUNDLE_METADATA
+            || allocation_size == 0
+        {
+            status = 1;
+            close_after_ack = true;
+        } else if stream.read_exact(&mut metadata).is_err() {
+            status = 999;
+            close_after_ack = true;
+        } else if validate_tensor_bundle_metadata(&metadata, allocation_size).is_err() {
+            status = 1;
+        } else {
+            let mut bundles = pending_tensor_bundles().lock().unwrap();
+            prune_tensor_bundles(&mut bundles, Instant::now());
+            let capacity_available = bundles.len() < MAX_PENDING_TENSOR_BUNDLES
+                && pending_tensor_bytes(&bundles)
+                    .checked_add(allocation_size)
+                    .is_some_and(|total| total <= MAX_PENDING_TENSOR_BYTES);
+            if !capacity_available {
+                status = 2;
+            } else {
+                for _ in 0..4 {
+                    match fresh_tensor_token() {
+                        Ok(candidate) if !bundles.contains_key(&candidate) => {
+                            token = candidate;
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                if token.is_empty() {
+                    status = 999;
+                } else {
+                    bundles.insert(
+                        token.clone(),
+                        PendingTensorBundle {
+                            allocation,
+                            allocation_size,
+                            metadata,
+                            created: Instant::now(),
+                        },
+                    );
+                }
+            }
+        }
+        let mut ack = [0u8; 8];
+        ack[..4].copy_from_slice(&status.to_le_bytes());
+        ack[4..].copy_from_slice(&(token.len() as u32).to_le_bytes());
+        if stream.write_all(&ack).is_err()
+            || (!token.is_empty() && stream.write_all(&token).is_err())
+            || close_after_ack
+        {
+            if !token.is_empty() {
+                pending_tensor_bundles().lock().unwrap().remove(&token);
+            }
+            break;
+        }
+    }
+}
+
+fn spawn_tensor_bundle_receiver(stream: UnixStream, worker_pid: u32) -> io::Result<()> {
+    thread::Builder::new()
+        .name(format!("cuda-tensor-publisher-{worker_pid}"))
+        .spawn(move || tensor_bundle_receiver(stream, worker_pid))?;
+    Ok(())
+}
+
+fn send_tensor_bundle_to_consumer(
+    stream: &mut UnixStream,
+    bundle: &PendingTensorBundle,
+) -> io::Result<()> {
+    let mut header = [0u8; 16];
+    header[..4].copy_from_slice(&TENSOR_RESPONSE_MAGIC);
+    header[4..8].copy_from_slice(&(bundle.metadata.len() as u32).to_le_bytes());
+    header[8..16].copy_from_slice(&bundle.allocation_size.to_le_bytes());
+    send_fd_header(stream, bundle.allocation.as_raw_fd(), &header)?;
+    stream.write_all(&bundle.metadata)
+}
+
+fn serve_tensor_bundle_consumer(mut stream: UnixStream) -> io::Result<()> {
+    let mut header = [0u8; 6];
+    stream.read_exact(&mut header)?;
+    if header[..4] != TENSOR_CONSUME_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle consume request",
+        ));
+    }
+    let token_len = u16::from_le_bytes(header[4..6].try_into().unwrap()) as usize;
+    if token_len == 0 || token_len > 256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle token length",
+        ));
+    }
+    let mut token = vec![0u8; token_len];
+    stream.read_exact(&mut token)?;
+    let bundle = {
+        let mut bundles = pending_tensor_bundles().lock().unwrap();
+        prune_tensor_bundles(&mut bundles, Instant::now());
+        bundles.remove(&token)
+    }
+    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tensor bundle expired"))?;
+    // Once SCM_RIGHTS starts, the receiver may own a descriptor even when a
+    // later metadata write fails. Never restore the token and risk two
+    // consumers observing one supposedly one-use publication.
+    send_tensor_bundle_to_consumer(&mut stream, &bundle)
+}
+
+#[cfg(target_os = "linux")]
+fn redeem_tensor_bundle_from_stream(
+    mut stream: UnixStream,
+    token: &[u8],
+) -> io::Result<RedeemedTensorBundle> {
+    if token.is_empty() || token.len() > 256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid tensor-bundle token length",
+        ));
+    }
+    stream.write_all(&TENSOR_CONSUME_MAGIC)?;
+    stream.write_all(&(token.len() as u16).to_le_bytes())?;
+    stream.write_all(token)?;
+    let (allocation, header) = recv_fd_header(&mut stream)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "tensor-bundle service closed without a response",
+        )
+    })?;
+    if header[..4] != TENSOR_RESPONSE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle response",
+        ));
+    }
+    let metadata_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    let allocation_size = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    if metadata_len == 0 || metadata_len > MAX_TENSOR_BUNDLE_METADATA || allocation_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tensor-bundle response dimensions",
+        ));
+    }
+    let mut metadata = vec![0u8; metadata_len];
+    stream.read_exact(&mut metadata)?;
+    validate_tensor_bundle_metadata(&metadata, allocation_size)?;
+    Ok(RedeemedTensorBundle {
+        allocation,
+        allocation_size,
+        metadata,
+    })
+}
+
+/// Redeem a clone worker's random one-use publication token into an owned GPU
+/// allocation. This is intentionally crate-private: only smolvm's managed
+/// rollout executor may cross the daemon's bearer-token boundary.
+#[cfg(target_os = "linux")]
+pub(crate) fn redeem_tensor_bundle(token: &[u8]) -> io::Result<RedeemedTensorBundle> {
+    let stream = UnixStream::connect(tensor_bundle_socket_path(&socket_path()))?;
+    redeem_tensor_bundle_from_stream(stream, token)
+}
+
+fn spawn_tensor_bundle_service(cuda_socket: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = tensor_bundle_socket_path(cuda_socket);
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let service_path = path.clone();
+    thread::Builder::new()
+        .name("cuda-tensor-consumer".into())
+        .spawn(move || {
+            for connection in listener.incoming() {
+                match connection {
+                    Ok(stream) => {
+                        let _ = thread::Builder::new()
+                            .name("cuda-tensor-consume".into())
+                            .spawn(move || {
+                                if let Err(error) = serve_tensor_bundle_consumer(stream) {
+                                    tracing::debug!(%error, "tensor-bundle consume failed");
+                                }
+                            });
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "tensor-bundle listener ended");
+                        break;
+                    }
+                }
+            }
+        })?;
+    thread::Builder::new()
+        .name("cuda-tensor-reaper".into())
+        .spawn(|| loop {
+            thread::sleep(Duration::from_secs(5));
+            let mut bundles = pending_tensor_bundles().lock().unwrap();
+            prune_tensor_bundles(&mut bundles, Instant::now());
+        })?;
+    Ok(service_path)
 }
 
 /// Pure policy helper for the managed MPS default.
@@ -423,6 +1025,7 @@ fn spawn_child_reaper() {
             // Long-lived daemons use IDLE_SECS=0, but their completed fork
             // lineages must still release retained descriptors and metadata.
             prune_dead_metadata_layout_waiters();
+            prune_dead_clone_worker_statuses();
             let _ = live_clone_worker_count();
             let _ = live_host_snapshot_count();
             thread::sleep(Duration::from_secs(2));
@@ -586,6 +1189,10 @@ pub(crate) fn install_crash_handler(role: &'static str) {
 
 /// Serve the shared CUDA daemon on `sock` (spawned as `smolvm _cuda-daemon`).
 pub fn run(sock: &Path) -> io::Result<()> {
+    // Admission maps logical CUDA ordinals to NVML devices without loading
+    // libcuda in the control plane. Pinning the daemon to PCI order makes that
+    // mapping deterministic while still honoring CUDA_VISIBLE_DEVICES order.
+    std::env::set_var("CUDA_DEVICE_ORDER", CUDA_DEVICE_ORDER);
     // Become our own process-group leader so a clean-shutdown signal can take the
     // whole group (this daemon + its clone workers) down together without ever
     // touching the shell/ssh session that launched us. The `ensure_running` spawn
@@ -622,6 +1229,16 @@ pub fn run(sock: &Path) -> io::Result<()> {
     #[cfg(unix)]
     install_shutdown_handler(sock);
     let listener = UdsListener::bind(sock)?;
+    match spawn_tensor_bundle_service(sock) {
+        Ok(path) => {
+            TENSOR_BUNDLE_SERVICE_READY.store(true, Ordering::Release);
+            tracing::info!(socket = %path.display(), "device-resident tensor service listening");
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "device-resident tensor publication disabled; CUDA serving remains available"
+        ),
+    }
     // Must precede listener threads and the first GpuBackend::load. Clone
     // workers inherit the endpoint from this daemon. Starting only after the
     // socket is exclusively bound avoids briefly starting MPS in a losing
@@ -1126,14 +1743,58 @@ fn make_backend() -> Box<dyn Backend> {
     }
 }
 
-/// Staged golden handle state retained for late-attached channels:
-/// (module images, function metadata, streams, events).
-type SeedHandles = (
-    Vec<(u64, Vec<u8>)>,
-    Vec<smolvm_cuda::host::FuncMeta>,
-    Vec<(u64, u64)>,
-    Vec<(u64, u64)>,
+/// Per-thread state that cannot use the clone worker's process-global fallback.
+/// Module/function images and stream/event maps are installed process-wide by
+/// `set_handle_trans`, so copying them into every attached channel is wasteful.
+type CloneChannelSeed = (
+    Option<std::collections::HashMap<u64, u64>>,
+    Vec<(u64, u64, u64)>,
 );
+
+struct CloneWorkerReadiness {
+    vm_pid: Option<u32>,
+    published: bool,
+}
+
+impl CloneWorkerReadiness {
+    fn new(vm_pid: Option<u32>) -> Self {
+        Self {
+            vm_pid,
+            published: false,
+        }
+    }
+
+    fn publish_ready(&mut self) {
+        let Some(vm_pid) = self.vm_pid else {
+            return;
+        };
+        match publish_clone_worker_status(vm_pid, CloneWorkerStatus::Ready) {
+            Ok(()) => self.published = true,
+            Err(error) => {
+                tracing::warn!(vm_pid, %error, "failed to publish CUDA clone-worker readiness")
+            }
+        }
+    }
+}
+
+impl Drop for CloneWorkerReadiness {
+    fn drop(&mut self) {
+        let Some(vm_pid) = self.vm_pid else {
+            return;
+        };
+        let path = clone_worker_status_path(vm_pid);
+        if self.published && !path.exists() {
+            return;
+        }
+        if self.published && crate::process::process_start_time(vm_pid as i32).is_none() {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        if let Err(error) = publish_clone_worker_status(vm_pid, CloneWorkerStatus::Failed) {
+            tracing::debug!(vm_pid, %error, "failed to publish CUDA clone-worker failure");
+        }
+    }
+}
 
 /// Path 3 (M1): serve one isolating fork-clone connection in THIS separate worker
 /// process. A per-clone process has its own CUDA primary context and thus its own
@@ -1147,10 +1808,27 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     install_crash_handler("cuda-clone-worker");
     // File-ring transport (per-worker: one worker == one clone VM == one dir).
     smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
+    let clone_procmem = procmem_from_env();
+    let clone_vm_pid = clone_procmem.as_ref().map(|(pid, _)| *pid);
+    let mut readiness = CloneWorkerReadiness::new(clone_vm_pid);
     let mut backend = make_backend();
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
     let _ = backend.init();
+    if let Some(fd) = std::env::var("SMOLVM_CUDA_CLONE_PUBLISH_CTRL")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        // SAFETY: spawn_clone_worker transfers sole ownership of this inherited
+        // descriptor to the worker and clears CLOEXEC before exec.
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let stream = Arc::new(Mutex::new(stream));
+        let publisher: Arc<smolvm_cuda::host::TensorBundlePublisher> = Arc::new(move |bundle| {
+            let mut stream = stream.lock().map_err(|_| 999)?;
+            send_tensor_bundle_to_parent(&mut stream, bundle)
+        });
+        smolvm_cuda::host::set_tensor_bundle_publisher(Some(publisher));
+    }
     // Reconstruct on the GOLDEN's GPU: the exported physical lives there.
     let clone_dev: i32 = std::env::var("SMOLVM_CUDA_CLONE_DEVICE")
         .ok()
@@ -1175,8 +1853,6 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // Clone transport: consume the proc-mem advert (SMVGPVM1) the clone proxy
     // sent right after its clone preamble, so D2H/H2D reach the clone's LIVE
     // guest RAM via /proc/<pid>/mem instead of the ring-copy fallback.
-    let clone_procmem = procmem_from_env();
-    let clone_vm_pid = clone_procmem.as_ref().map(|(pid, _)| *pid);
     if let Some((pid, regions)) = clone_procmem {
         let n = regions.len();
         if regions.is_empty() {
@@ -1198,11 +1874,9 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         }
     }
     // Seed state for late-attached guest channels (see the attach listener
-    // below): each attached channel serves on its own thread, and every
-    // translation table is thread-local — new threads must be seeded with
-    // clones of what the main serving thread installed.
+    // below). VMM handle translation is thread-local; module/function and
+    // stream/event translation have process-global fallbacks.
     let mut seed_vmm: Option<std::collections::HashMap<u64, u64>> = None;
-    let mut seed_handles: Option<SeedHandles> = None;
     // M2: reconstruct the golden's memory at its exact VAs from the layout the
     // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
@@ -1229,9 +1903,64 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // (reloading all up front stalls serving ~2s and breaks the clone connection)
     // + recreate streams/events, then install the translation so the clone's
     // inherited kernel launches resolve (each module reloads on first use).
-    if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
+    #[cfg(target_os = "linux")]
+    let inherited_module_blob =
+        if let Some(value) = std::env::var_os("SMOLVM_CUDA_CLONE_MODULES_FD") {
+            let value = value.into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CUDA module handoff fd is not valid UTF-8",
+                )
+            })?;
+            let module_fd = value.parse::<std::os::fd::RawFd>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CUDA module handoff fd is invalid",
+                )
+            })?;
+            Some(map_module_blob_fd(module_fd)?)
+        } else {
+            None
+        };
+    #[cfg(not(target_os = "linux"))]
+    let inherited_module_blob: Option<smolvm_cuda::host::ModuleHandoffBytes> = None;
+    #[cfg(target_os = "linux")]
+    let inherited_module_images =
+        if let Some(value) = std::env::var_os("SMOLVM_CUDA_CLONE_MODULE_IMAGES_FD") {
+            let value = value.into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CUDA module image-store fd is not valid UTF-8",
+                )
+            })?;
+            let image_fd = value.parse::<std::os::fd::RawFd>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CUDA module image-store fd is invalid",
+                )
+            })?;
+            Some(map_module_blob_fd(image_fd)?)
+        } else {
+            None
+        };
+    #[cfg(not(target_os = "linux"))]
+    let inherited_module_images: Option<smolvm_cuda::host::ModuleHandoffBytes> = None;
+    let module_blob = if inherited_module_blob.is_some() {
+        inherited_module_blob
+    } else if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
+        let result = std::fs::read(&modpath);
+        let _ = std::fs::remove_file(&modpath);
+        Some(smolvm_cuda::host::ModuleHandoffBytes::from_owned(result?))
+    } else {
+        None
+    };
+    if let Some(module_blob) = module_blob {
         let (mod_images, func_meta, streams, events, graphs, lib_handles) =
-            reconstruct_golden_modules(backend.as_mut(), &modpath);
+            reconstruct_golden_modules(
+                backend.as_mut(),
+                &module_blob,
+                inherited_module_images.as_ref(),
+            )?;
         let (nm, nf, ns, ne, ng, nlh) = (
             mod_images.len(),
             func_meta.len(),
@@ -1240,15 +1969,10 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             graphs.len(),
             lib_handles.len(),
         );
-        // Retained for attached-channel threads (module images are the bulk —
-        // tens of MB per worker; the price of correct late channels).
-        seed_handles = Some((
-            mod_images.clone(),
-            func_meta.clone(),
-            streams.clone(),
-            events.clone(),
-        ));
-        smolvm_cuda::host::set_handle_trans(mod_images, func_meta, streams, events);
+        // This installs immutable process-global fallbacks as well as the main
+        // thread's fast-path maps. Attached channels use those fallbacks rather
+        // than deep-copying every module image and function record.
+        smolvm_cuda::host::set_shared_handle_trans(mod_images, func_meta, streams, events);
         // Re-create the golden's top-level cuBLAS/cuBLASLt/cuDNN handles in
         // THIS process and map the clone's inherited values to them — library
         // handles are process-local, so a pre-fork handle would otherwise fail
@@ -1259,7 +1983,6 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         // pointers reference the golden VAs, valid here). Maps the clone's
         // inherited graph/exec handles to the worker's rebuilt reals.
         let nrebuilt = smolvm_cuda::host::rebuild_clone_graphs(backend.as_mut(), graphs);
-        let _ = std::fs::remove_file(&modpath);
         // Pre-warm now (module reloads + graph re-capture into the
         // process-wide registries), while the guest VM is still resuming —
         // serving sessions adopt the results instead of doing this work on
@@ -1287,7 +2010,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         .and_then(|v| v.parse::<std::os::unix::io::RawFd>().ok())
     {
         let seed_alloc = smolvm_cuda::host::worker_alloc_trans_snapshot();
-        let seed = std::sync::Arc::new((seed_vmm, seed_handles, seed_alloc));
+        let seed = std::sync::Arc::new((seed_vmm, seed_alloc));
         Some(spawn_clone_attach_listener(
             ctrl,
             clone_dev,
@@ -1298,6 +2021,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     } else {
         None
     };
+    readiness.publish_ready();
     // The handed-off connection may be a local UDS (VM on this host) or a TCP
     // socket (remote client driving this GPU host) — wrap by actual domain.
     // (getsockname is portable unix; SO_DOMAIN would be Linux-only.)
@@ -1344,11 +2068,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
 fn spawn_clone_attach_listener(
     ctrl: std::os::unix::io::RawFd,
     clone_dev: i32,
-    seed: Arc<(
-        Option<std::collections::HashMap<u64, u64>>,
-        Option<SeedHandles>,
-        Vec<(u64, u64, u64)>,
-    )>,
+    seed: Arc<CloneChannelSeed>,
     active_channels: Arc<AtomicUsize>,
     clone_vm_pid: Option<u32>,
 ) -> io::Result<std::thread::JoinHandle<()>> {
@@ -1395,11 +2115,7 @@ fn clone_worker_idle_expired(
 fn spawn_clone_attach_listener_with_timeout(
     ctrl: std::os::unix::io::RawFd,
     clone_dev: i32,
-    seed: Arc<(
-        Option<std::collections::HashMap<u64, u64>>,
-        Option<SeedHandles>,
-        Vec<(u64, u64, u64)>,
-    )>,
+    seed: Arc<CloneChannelSeed>,
     active_channels: Arc<AtomicUsize>,
     clone_vm_pid: Option<u32>,
     idle_timeout: Duration,
@@ -1488,19 +2204,14 @@ fn clone_worker_idle_timeout_from(value: Option<&str>) -> Duration {
 }
 
 /// Serve one late-attached guest channel inside the clone worker. Own backend
-/// handle, same primary context (same UVA space), thread-local translation
-/// tables seeded from the main serving thread's snapshot so golden handles and
-/// translated allocations resolve identically on this channel.
+/// handle, same primary context (same UVA space), and only the thread-local
+/// translations that lack process-global fallbacks.
 #[cfg(unix)]
 #[allow(clippy::type_complexity)]
 fn serve_attached_channel(
     fd: std::os::unix::io::RawFd,
     dev: i32,
-    seed: &(
-        Option<std::collections::HashMap<u64, u64>>,
-        Option<SeedHandles>,
-        Vec<(u64, u64, u64)>,
-    ),
+    seed: &CloneChannelSeed,
     attached_procmem: Option<ProcMemAdvert>,
 ) {
     use std::os::unix::io::FromRawFd;
@@ -1516,12 +2227,9 @@ fn serve_attached_channel(
     // File-ring transport: attached channels serve on their own threads, and
     // the ring dir is per-worker (thread-local install per serve thread).
     smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
-    let (vmm, handles, alloc) = seed;
+    let (vmm, alloc) = seed;
     if let Some(v) = vmm {
         smolvm_cuda::host::set_vmm_trans(v.clone());
-    }
-    if let Some((m, f, s, e)) = handles {
-        smolvm_cuda::host::set_handle_trans(m.clone(), f.clone(), s.clone(), e.clone());
     }
     if !alloc.is_empty() {
         smolvm_cuda::host::set_worker_alloc_trans(alloc.clone());
@@ -2266,54 +2974,74 @@ fn reconstruct_golden_memory(
     Ok((count, vmm_trans))
 }
 
+#[cfg(target_os = "linux")]
+fn map_module_blob_fd(fd: std::os::fd::RawFd) -> io::Result<smolvm_cuda::host::ModuleHandoffBytes> {
+    // Take an independent owned descriptor before closing the inherited slot.
+    // Every worker maps the same immutable file pages, so staging does not
+    // allocate and copy the entire handoff into private anonymous memory.
+    let owned = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    let duplicate_error = io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    if owned < 0 {
+        return Err(duplicate_error);
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(owned) };
+    let metadata = file.metadata()?;
+    let bytes = metadata.len();
+    if !metadata.file_type().is_file() || bytes == 0 || bytes > MAX_MODULE_HANDOFF_BLOB_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CUDA module handoff source has invalid size or type",
+        ));
+    }
+    let bytes = usize::try_from(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CUDA module handoff source does not fit in address space",
+        )
+    })?;
+    // SAFETY: `file` is a read-only reopen of the daemon-owned unnamed handoff
+    // inode. Its only writable descriptor was dropped before caching, so the
+    // inode cannot be changed or truncated while workers map it.
+    unsafe { smolvm_cuda::host::ModuleHandoffBytes::map_read_only(&file, bytes) }
+}
+
 /// M3a: parse the golden's module IMAGES + function METADATA (for LAZY reload in
 /// THIS worker at first use — reloading ~400 modules up front stalls the clone
 /// ~2s and breaks its connection) and RECREATE its streams/events now (few,
-/// cheap). Returns `(mod_images, func_meta, streams, events)`. Reads the blob the
-/// daemon wrote (path in `SMOLVM_CUDA_CLONE_MODULES`):
+/// cheap). Returns `(mod_images, func_meta, streams, events)`. Parses the blob
+/// inherited from the daemon:
 /// `[u32 nmods]([u64 h][u32 len][image])* [u32 nfuncs]([u64 fn][u64 mod][u32 len][name])*
 ///  [u32 nstreams]([u64 h][u32 flags])* [u32 nevents]([u64 h][u32 flags])*`.
 #[cfg(unix)]
 #[allow(clippy::type_complexity)]
 fn reconstruct_golden_modules(
     b: &mut dyn Backend,
-    path: &str,
-) -> (
-    Vec<(u64, Vec<u8>)>,
+    source: &smolvm_cuda::host::ModuleHandoffBytes,
+    external_module_images: Option<&smolvm_cuda::host::ModuleHandoffBytes>,
+) -> io::Result<(
+    Vec<(u64, smolvm_cuda::host::ModuleHandoffBytes)>,
     Vec<smolvm_cuda::host::FuncMeta>,
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
     Vec<(u8, u16, u64, Vec<u8>)>,
-) {
+)> {
+    let buf = source.as_slice();
     let mut mod_images = Vec::new();
     let mut func_meta = Vec::new();
     let mut stream_trans = Vec::new();
     let mut event_trans = Vec::new();
     let mut graphs: Vec<(u64, u64, smolvm_cuda::host::GraphSer)> = Vec::new();
     let mut lib_handles: Vec<(u8, u16, u64, Vec<u8>)> = Vec::new();
-    let Ok(buf) = std::fs::read(path) else {
-        return (
-            mod_images,
-            func_meta,
-            stream_trans,
-            event_trans,
-            graphs,
-            lib_handles,
-        );
-    };
     let mut p = 0usize;
     macro_rules! need {
         ($n:expr) => {
-            if p + $n > buf.len() {
-                return (
-                    mod_images,
-                    func_meta,
-                    stream_trans,
-                    event_trans,
-                    graphs,
-                    lib_handles,
-                );
+            if p.checked_add($n).is_none_or(|end| end > buf.len()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CUDA module handoff is truncated",
+                ));
             }
         };
     }
@@ -2333,14 +3061,44 @@ fn reconstruct_golden_modules(
             v
         }};
     }
+    let uses_external_images = buf.starts_with(&EXTERNAL_MODULE_IMAGES_MAGIC);
+    if uses_external_images {
+        p += EXTERNAL_MODULE_IMAGES_MAGIC.len();
+        if external_module_images.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CUDA module handoff requires a missing external image store",
+            ));
+        }
+    }
     // Modules: just STAGE the images (reloaded lazily on first use in the worker).
     let nmods = ru32!();
     for _ in 0..nmods {
         let gh = ru64!();
-        let ilen = ru32!() as usize;
-        need!(ilen);
-        mod_images.push((gh, buf[p..p + ilen].to_vec()));
-        p += ilen;
+        if uses_external_images {
+            let offset = usize::try_from(ru64!()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CUDA module image offset does not fit in address space",
+                )
+            })?;
+            let length = ru32!() as usize;
+            let image = external_module_images
+                .and_then(|images| images.slice(offset, length))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "CUDA module image range exceeds its external store",
+                    )
+                })?;
+            mod_images.push((gh, image));
+        } else {
+            let ilen = ru32!() as usize;
+            need!(ilen);
+            // `need!` proved this range is within the immutable source.
+            mod_images.push((gh, source.slice(p, ilen).unwrap()));
+            p += ilen;
+        }
     }
     // Functions: stage golden fn → (golden module, name); resolved lazily.
     let nfuncs = ru32!();
@@ -2477,14 +3235,14 @@ fn reconstruct_golden_modules(
         lib_handles = lib_handles.len(),
         "M3a: staged golden modules/functions for lazy reload + recreated streams/events"
     );
-    (
+    Ok((
         mod_images,
         func_meta,
         stream_trans,
         event_trans,
         graphs,
         lib_handles,
-    )
+    ))
 }
 
 /// Strip a fork-clone connection preamble (magic + clone id) if present,
@@ -2884,6 +3642,22 @@ fn clone_worker_share_env(requested: bool, configured: Option<&str>) -> Option<&
     }
 }
 
+#[cfg(unix)]
+fn clone_worker_spawn_pace(pool_size: Option<u32>) -> Duration {
+    #[cfg(target_os = "linux")]
+    if pool_size.is_some_and(|size| size > 4) {
+        // Launching more than four reconstructed CUDA contexts in one burst
+        // can starve concurrent KVM first-entry long enough to exhaust its
+        // bounded transient-ENOMEM retry window. The old fork/exec path paced
+        // workers accidentally while copying the daemon's page tables; retain
+        // only the measured minimum interval after switching to posix_spawn.
+        return Duration::from_millis(20);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pool_size;
+    Duration::ZERO
+}
+
 /// Decide whether a clone-marked connection should bypass worker routing when
 /// worker mode is disabled. Real channels fall through to ordinary serving;
 /// warm dials carry no Init and must be consumed instead of parking forever.
@@ -2947,6 +3721,11 @@ fn route_clone_connection(
         }
         let tokens = smolvm_cuda::host::layout_tokens();
         if tokens.is_empty() {
+            if let Some((vm_pid, _)) = procmem.as_ref() {
+                if let Err(error) = publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Ready) {
+                    tracing::warn!(vm_pid, %error, "failed to publish empty CUDA clone readiness");
+                }
+            }
             tracing::info!(
                 clone_id,
                 "warm dial: no golden process layouts yet; deferring spawn to first real channel"
@@ -2967,6 +3746,15 @@ fn route_clone_connection(
             }
         }
         let [token] = memory_tokens.as_slice() else {
+            if memory_tokens.is_empty() {
+                if let Some((vm_pid, _)) = procmem.as_ref() {
+                    if let Err(error) =
+                        publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Ready)
+                    {
+                        tracing::warn!(vm_pid, %error, "failed to publish metadata-only CUDA clone readiness");
+                    }
+                }
+            }
             tracing::info!(
                 clone_id,
                 layouts = memory_tokens.len(),
@@ -2990,10 +3778,14 @@ fn route_clone_connection(
                     worker_pid = pid,
                     "warm dial: spawned clone process worker ahead of its first CUDA call"
                 );
+                std::thread::sleep(clone_worker_spawn_pace(options.fork_pool_size));
                 maybe_evict_frozen_golden(*token, options, &reg);
                 true
             }
             Err(e) => {
+                if let Some((vm_pid, _)) = procmem.as_ref() {
+                    let _ = publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Failed);
+                }
                 tracing::warn!(error = %e, token, clone_id, "warm dial: process worker spawn failed");
                 true
             }
@@ -3166,6 +3958,9 @@ fn route_clone_connection(
             maybe_evict_frozen_golden(token, options, &reg);
         }
         Err(e) => {
+            if let Some((vm_pid, _)) = procmem.as_ref() {
+                let _ = publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Failed);
+            }
             // REJECT rather than serve in-process: this IS an isolating clone
             // (preamble matched), and the legacy shared path can't serve it —
             // its inherited pointers are garbage in a fresh context, so the
@@ -3469,6 +4264,26 @@ struct CachedHostSnapshot {
     golden_pid: std::sync::atomic::AtomicU32,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct CachedModuleBlob {
+    file: std::fs::File,
+    bytes: u64,
+    revision: u64,
+    image_file: Option<std::fs::File>,
+    image_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl CachedModuleBlob {
+    fn total_bytes(&self) -> u64 {
+        self.bytes.saturating_add(self.image_bytes)
+    }
+}
+
+#[cfg(target_os = "linux")]
+const MAX_CACHED_MODULE_BLOBS: usize = 32;
+
 #[cfg(unix)]
 impl CachedHostSnapshot {
     fn duplicate_fds(&self) -> io::Result<Vec<std::os::unix::io::RawFd>> {
@@ -3543,6 +4358,215 @@ fn cached_host_snapshot(token: u64) -> Option<Arc<CachedHostSnapshot>> {
     cache.iter().find_map(|(&candidate, snapshot)| {
         smolvm_cuda::host::layout_handoff_same_process(candidate, token).then(|| snapshot.clone())
     })
+}
+
+#[cfg(target_os = "linux")]
+fn module_blob_cache() -> &'static Mutex<std::collections::HashMap<u64, Arc<CachedModuleBlob>>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, Arc<CachedModuleBlob>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(target_os = "linux")]
+fn module_blob_build_gates(
+) -> &'static Mutex<std::collections::HashMap<u64, std::sync::Weak<Mutex<()>>>> {
+    static GATES: OnceLock<Mutex<std::collections::HashMap<u64, std::sync::Weak<Mutex<()>>>>> =
+        OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(target_os = "linux")]
+fn module_blob_build_gate(token: u64) -> Arc<Mutex<()>> {
+    let mut gates = module_blob_build_gates().lock().unwrap();
+    gates.retain(|candidate, gate| {
+        gate.strong_count() > 0 && smolvm_cuda::host::layout_handoff_present(*candidate)
+    });
+    if let Some(gate) = gates.get(&token).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    if let Some(gate) = gates.iter().find_map(|(&candidate, gate)| {
+        smolvm_cuda::host::layout_handoff_same_process(candidate, token)
+            .then(|| gate.upgrade())
+            .flatten()
+    }) {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(token, Arc::downgrade(&gate));
+    gate
+}
+
+#[cfg(target_os = "linux")]
+fn prune_module_blob_cache(cache: &mut std::collections::HashMap<u64, Arc<CachedModuleBlob>>) {
+    let before = cache.len();
+    let before_bytes = cache
+        .values()
+        .fold(0u64, |total, blob| total.saturating_add(blob.total_bytes()));
+    cache.retain(|token, blob| {
+        smolvm_cuda::host::module_handoff_revision(*token) == Some(blob.revision)
+    });
+    if cache.len() != before {
+        let retained_bytes = cache
+            .values()
+            .fold(0u64, |total, blob| total.saturating_add(blob.total_bytes()));
+        tracing::info!(
+            entries = before - cache.len(),
+            bytes = before_bytes.saturating_sub(retained_bytes),
+            "released stale CUDA module handoffs"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cached_module_blob(token: u64) -> Option<Arc<CachedModuleBlob>> {
+    let mut cache = module_blob_cache().lock().unwrap();
+    prune_module_blob_cache(&mut cache);
+    if let Some(blob) = cache.get(&token) {
+        return Some(blob.clone());
+    }
+    cache.iter().find_map(|(&candidate, blob)| {
+        smolvm_cuda::host::layout_handoff_same_process(candidate, token).then(|| blob.clone())
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn prepare_module_blob(
+    token: u64,
+    revision: u64,
+    bytes: &[u8],
+) -> io::Result<Arc<CachedModuleBlob>> {
+    if let Some(blob) = cached_module_blob(token) {
+        return Ok(blob);
+    }
+    let directory = std::env::temp_dir().join("smolvm");
+    std::fs::create_dir_all(&directory)?;
+    let mut writable = tempfile::tempfile_in(&directory)?;
+    writable.write_all(bytes)?;
+    finish_module_blob(token, revision, writable, bytes.len() as u64, None)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_streamed_module_blob(
+    token: u64,
+    revision: u64,
+    snapshot: &CapturedModuleHandoff,
+    oplogs: &CapturedGraphOplogs,
+    module_images: Option<smolvm_cuda::host::ModuleImageStoreSnapshot>,
+) -> io::Result<Arc<CachedModuleBlob>> {
+    if let Some(blob) = cached_module_blob(token) {
+        return Ok(blob);
+    }
+    let directory = std::env::temp_dir().join("smolvm");
+    std::fs::create_dir_all(&directory)?;
+    let mut writable = tempfile::tempfile_in(&directory)?;
+    let bytes = {
+        let mut output = std::io::BufWriter::with_capacity(1 << 20, &mut writable);
+        let bytes = write_module_handoff(&mut output, snapshot, oplogs, module_images.as_ref())?;
+        output.flush()?;
+        bytes
+    };
+    finish_module_blob(token, revision, writable, bytes, module_images)
+}
+
+#[cfg(target_os = "linux")]
+fn finish_module_blob(
+    token: u64,
+    revision: u64,
+    writable: std::fs::File,
+    bytes: u64,
+    module_images: Option<smolvm_cuda::host::ModuleImageStoreSnapshot>,
+) -> io::Result<Arc<CachedModuleBlob>> {
+    let read_path = format!("/proc/self/fd/{}", writable.as_raw_fd());
+    let file = std::fs::OpenOptions::new().read(true).open(read_path)?;
+    let blob = Arc::new(CachedModuleBlob {
+        file,
+        bytes,
+        revision,
+        image_bytes: module_images.as_ref().map_or(0, |store| store.bytes),
+        image_file: module_images.map(|store| store.file),
+    });
+    drop(writable);
+
+    let mut cache = module_blob_cache().lock().unwrap();
+    prune_module_blob_cache(&mut cache);
+    if let Some(existing) = cache.get(&token) {
+        return Ok(existing.clone());
+    }
+    if let Some(existing) = cache.iter().find_map(|(&candidate, cached)| {
+        smolvm_cuda::host::layout_handoff_same_process(candidate, token).then(|| cached.clone())
+    }) {
+        return Ok(existing);
+    }
+    let cached_bytes = cache.values().fold(0u64, |total, entry| {
+        total.saturating_add(entry.total_bytes())
+    });
+    let revision_current = smolvm_cuda::host::module_handoff_revision(token) == Some(revision);
+    if revision_current
+        && cache.len() < MAX_CACHED_MODULE_BLOBS
+        && cached_bytes.saturating_add(blob.total_bytes()) <= MAX_MODULE_HANDOFF_BLOB_BYTES
+    {
+        cache.insert(token, blob.clone());
+    } else if revision_current {
+        tracing::warn!(
+            token,
+            metadata_bytes = blob.bytes,
+            image_bytes = blob.image_bytes,
+            cached_bytes,
+            "CUDA module handoff cache is full; retaining this source for one worker"
+        );
+    }
+    Ok(blob)
+}
+
+#[cfg(target_os = "linux")]
+fn module_blob_for_token(token: u64) -> io::Result<Option<Arc<CachedModuleBlob>>> {
+    if let Some(blob) = cached_module_blob(token) {
+        tracing::info!(
+            token,
+            metadata_bytes = blob.bytes,
+            image_bytes = blob.image_bytes,
+            "reusing serialized CUDA module handoff"
+        );
+        return Ok(Some(blob));
+    }
+
+    // Serialize a lineage at most once even when several clone connections
+    // arrive together. Different lineages retain independent build gates.
+    let gate = module_blob_build_gate(token);
+    let _build = gate.lock().unwrap();
+    if let Some(blob) = cached_module_blob(token) {
+        tracing::info!(
+            token,
+            metadata_bytes = blob.bytes,
+            image_bytes = blob.image_bytes,
+            "reusing serialized CUDA module handoff after concurrent build"
+        );
+        return Ok(Some(blob));
+    }
+    for _ in 0..3 {
+        let Some((revision, snapshot, oplogs)) = capture_module_handoff(token)? else {
+            return Ok(None);
+        };
+        let module_images = smolvm_cuda::host::module_image_store_snapshot(token)?;
+        if smolvm_cuda::host::module_handoff_revision(token) != Some(revision) {
+            continue;
+        }
+        let blob =
+            prepare_streamed_module_blob(token, revision, &snapshot, &oplogs, module_images)?;
+        if smolvm_cuda::host::module_handoff_revision(token) == Some(revision) {
+            tracing::info!(
+                token,
+                revision,
+                metadata_bytes = blob.bytes,
+                image_bytes = blob.image_bytes,
+                "prepared reusable CUDA module handoff"
+            );
+            return Ok(Some(blob));
+        }
+    }
+    Err(io::Error::other(
+        "CUDA module state changed repeatedly while preparing handoff",
+    ))
 }
 
 #[cfg(unix)]
@@ -3622,6 +4646,11 @@ fn live_host_snapshot_count() -> usize {
             smolvm_cuda::host::release_metadata_only_layout(token);
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cache = module_blob_cache().lock().unwrap();
+        prune_module_blob_cache(&mut cache);
+    }
     live
 }
 
@@ -3669,6 +4698,352 @@ fn retain_host_snapshot(
     Ok(())
 }
 
+#[cfg(unix)]
+fn module_handoff_len(value: usize) -> io::Result<[u8; 4]> {
+    Ok(u32::try_from(value)
+        .map_err(|_| io::Error::other("CUDA module handoff field exceeds 4 GiB"))?
+        .to_le_bytes())
+}
+
+#[cfg(unix)]
+type CapturedModuleHandoff = (
+    Vec<(u64, Arc<[u8]>)>,
+    Vec<smolvm_cuda::host::FuncMeta>,
+    Vec<(u64, u32)>,
+    Vec<(u64, u32)>,
+    Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
+    Vec<(u8, u16, u64, Vec<u8>)>,
+);
+
+#[cfg(unix)]
+type CapturedGraphOplogs = Vec<(u64, u64, Vec<Vec<u8>>)>;
+
+#[cfg(unix)]
+fn capture_module_handoff(
+    token: u64,
+) -> io::Result<Option<(u64, CapturedModuleHandoff, CapturedGraphOplogs)>> {
+    let (revision, snapshot, oplogs) = {
+        let mut attempts = 0;
+        loop {
+            let Some(before) = smolvm_cuda::host::module_handoff_revision(token) else {
+                return Ok(None);
+            };
+            let Some(snapshot) = smolvm_cuda::host::module_handoff_snapshot(token) else {
+                return Ok(None);
+            };
+            let oplogs = smolvm_cuda::host::graph_oplogs_snapshot(token);
+            if smolvm_cuda::host::module_handoff_revision(token) == Some(before) {
+                break (before, snapshot, oplogs);
+            }
+            attempts += 1;
+            if attempts == 3 {
+                return Err(io::Error::other(
+                    "CUDA module state changed repeatedly during handoff",
+                ));
+            }
+        }
+    };
+    let (modules, funcs, streams, events, graphs, lib_handles) = snapshot;
+    tracing::info!(
+        revision,
+        modules = modules.len(),
+        funcs = funcs.len(),
+        streams = streams.len(),
+        events = events.len(),
+        graphs = graphs.len(),
+        lib_handles = lib_handles.len(),
+        "M3a: gathered golden modules/functions/streams/events"
+    );
+    Ok(Some((
+        revision,
+        (modules, funcs, streams, events, graphs, lib_handles),
+        oplogs,
+    )))
+}
+
+#[cfg(unix)]
+fn write_module_handoff(
+    mut output: impl Write,
+    snapshot: &CapturedModuleHandoff,
+    oplogs: &CapturedGraphOplogs,
+    #[cfg(target_os = "linux")] module_images: Option<&smolvm_cuda::host::ModuleImageStoreSnapshot>,
+) -> io::Result<u64> {
+    let (modules, funcs, streams, events, graphs, lib_handles) = snapshot;
+    let mut written = 0_u64;
+    macro_rules! put {
+        ($bytes:expr) => {{
+            let bytes: &[u8] = $bytes;
+            written = written
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| io::Error::other("CUDA module handoff size overflow"))?;
+            if written > MAX_MODULE_HANDOFF_BLOB_BYTES {
+                return Err(io::Error::other("CUDA module handoff exceeds cache limit"));
+            }
+            output.write_all(bytes)?;
+        }};
+    }
+
+    #[cfg(target_os = "linux")]
+    if module_images.is_some() {
+        put!(&EXTERNAL_MODULE_IMAGES_MAGIC);
+    }
+    put!(&module_handoff_len(modules.len())?);
+    for (handle, image) in modules {
+        put!(&handle.to_le_bytes());
+        #[cfg(target_os = "linux")]
+        if let Some(store) = module_images {
+            let &(offset, length) = store.ranges.get(handle).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CUDA module image is missing from its append-only store",
+                )
+            })?;
+            if length != image.len() as u64
+                || offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > store.bytes)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CUDA module image store range does not match its captured image",
+                ));
+            }
+            put!(&offset.to_le_bytes());
+            put!(&module_handoff_len(image.len())?);
+            continue;
+        }
+        put!(&module_handoff_len(image.len())?);
+        put!(image);
+    }
+    put!(&module_handoff_len(funcs.len())?);
+    for (handle, module, name, attrs) in funcs {
+        put!(&handle.to_le_bytes());
+        put!(&module.to_le_bytes());
+        put!(&module_handoff_len(name.len())?);
+        put!(name.as_bytes());
+        // Per-function attribute replays ([i32 attr][i32 value] each) —
+        // e.g. FlashAttention's MaxDynamicSharedMemorySize opt-in.
+        put!(&module_handoff_len(attrs.len())?);
+        for &(attribute, value) in attrs {
+            put!(&attribute.to_le_bytes());
+            put!(&value.to_le_bytes());
+        }
+    }
+    // Streams + events: [u64 golden handle][u32 create flags] each.
+    put!(&module_handoff_len(streams.len())?);
+    for (handle, flags) in streams {
+        put!(&handle.to_le_bytes());
+        put!(&flags.to_le_bytes());
+    }
+    put!(&module_handoff_len(events.len())?);
+    for (handle, flags) in events {
+        put!(&handle.to_le_bytes());
+        put!(&flags.to_le_bytes());
+    }
+    // M3b: captured graphs. Per graph: [u64 graph_vh][u64 exec_vh]
+    //   [u32 nnodes]([u64 func][u32*3 grid][u32*3 block][u32 shmem]
+    //                [u32 nparams]([u32 len][bytes])* )*
+    //   [u32 nedges]([u32 from][u32 to])*
+    put!(&module_handoff_len(graphs.len())?);
+    for (graph_vh, exec_vh, graph) in graphs {
+        put!(&graph_vh.to_le_bytes());
+        put!(&exec_vh.to_le_bytes());
+        put!(&module_handoff_len(graph.nodes.len())?);
+        for node in &graph.nodes {
+            put!(&node.func.to_le_bytes());
+            for value in node.grid.iter().chain(node.block.iter()) {
+                put!(&value.to_le_bytes());
+            }
+            put!(&node.shared_mem.to_le_bytes());
+            put!(&module_handoff_len(node.params.len())?);
+            for param in &node.params {
+                put!(&module_handoff_len(param.len())?);
+                put!(param);
+            }
+        }
+        put!(&module_handoff_len(graph.edges.len())?);
+        for &(from, to) in &graph.edges {
+            put!(&from.to_le_bytes());
+            put!(&to.to_le_bytes());
+        }
+    }
+    // Library-handle creates for the worker to replay:
+    //   [u32 n]([u8 lib][u16 func][u64 handle][u32 len][args])*
+    put!(&module_handoff_len(lib_handles.len())?);
+    for (library, function, handle, args) in lib_handles {
+        put!(std::slice::from_ref(library));
+        put!(&function.to_le_bytes());
+        put!(&handle.to_le_bytes());
+        put!(&module_handoff_len(args.len())?);
+        put!(args);
+    }
+    // P3b: capture-replay op-logs. Per graph:
+    //   [u64 graph_vh][u64 exec_vh][u32 nops]([u32 len][op bytes])*
+    put!(&module_handoff_len(oplogs.len())?);
+    for (graph_vh, exec_vh, ops) in oplogs {
+        put!(&graph_vh.to_le_bytes());
+        put!(&exec_vh.to_le_bytes());
+        put!(&module_handoff_len(ops.len())?);
+        for op in ops {
+            put!(&module_handoff_len(op.len())?);
+            put!(op);
+        }
+    }
+    Ok(written)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn serialize_module_handoff(token: u64) -> io::Result<Option<(u64, Vec<u8>)>> {
+    let Some((revision, snapshot, oplogs)) = capture_module_handoff(token)? else {
+        return Ok(None);
+    };
+    let mut blob = Vec::new();
+    write_module_handoff(&mut blob, &snapshot, &oplogs)?;
+    Ok(Some((revision, blob)))
+}
+
+#[cfg(unix)]
+struct PosixSpawnActions(libc::posix_spawn_file_actions_t);
+
+#[cfg(unix)]
+impl PosixSpawnActions {
+    fn new() -> io::Result<Self> {
+        let mut actions = unsafe { std::mem::zeroed() };
+        // SAFETY: `actions` points to writable storage of the libc-declared type.
+        let error = unsafe { libc::posix_spawn_file_actions_init(&mut actions) };
+        if error == 0 {
+            Ok(Self(actions))
+        } else {
+            Err(io::Error::from_raw_os_error(error))
+        }
+    }
+
+    fn dup2(&mut self, source: i32, destination: i32) -> io::Result<()> {
+        // SAFETY: the actions object is initialized and both descriptors are
+        // copied by value into the action list.
+        let error =
+            unsafe { libc::posix_spawn_file_actions_adddup2(&mut self.0, source, destination) };
+        if error == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(error))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PosixSpawnActions {
+    fn drop(&mut self) {
+        // SAFETY: this object is constructed only after a successful init and
+        // destroyed exactly once here.
+        unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
+    }
+}
+
+#[cfg(unix)]
+struct CloneWorkerSpawnFds<'a> {
+    connection: i32,
+    exports: &'a [i32],
+    control: (i32, i32),
+    publish: Option<(i32, i32)>,
+    module: Option<(i32, i32)>,
+    module_images: Option<(i32, i32)>,
+}
+
+/// Launch a clone worker without copying the CUDA daemon's large address space.
+///
+/// `Command::pre_exec` forces fork/exec, whose page-table copy becomes visible
+/// once the daemon retains multi-gigabyte CUDA snapshots. `posix_spawn`
+/// preserves the exact descriptor and environment contract while Linux libc
+/// can use its vfork-style path.
+#[cfg(unix)]
+fn posix_spawn_clone_worker(
+    exe: &Path,
+    env_overrides: &[(std::ffi::OsString, std::ffi::OsString)],
+    fds: CloneWorkerSpawnFds<'_>,
+) -> io::Result<u32> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut actions = PosixSpawnActions::new()?;
+    actions.dup2(fds.connection, 3)?;
+    for (index, source) in fds.exports.iter().copied().enumerate() {
+        actions.dup2(source, 4 + index as i32)?;
+    }
+    actions.dup2(fds.control.0, fds.control.1)?;
+    if let Some((source, slot)) = fds.publish {
+        actions.dup2(source, slot)?;
+    }
+    if let Some((source, slot)) = fds.module {
+        actions.dup2(source, slot)?;
+    }
+    if let Some((source, slot)) = fds.module_images {
+        actions.dup2(source, slot)?;
+    }
+
+    let exe = std::ffi::CString::new(exe.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "clone-worker executable path contains NUL",
+        )
+    })?;
+    let argv_storage = [
+        exe.clone(),
+        std::ffi::CString::new("_cuda-clone-worker").unwrap(),
+        std::ffi::CString::new("3").unwrap(),
+    ];
+    let mut argv = argv_storage
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
+
+    let mut environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+    for (key, value) in env_overrides {
+        environment.insert(key.clone(), value.clone());
+    }
+    let env_storage = environment
+        .into_iter()
+        .map(|(key, value)| {
+            let key = key.as_os_str().as_bytes();
+            let value = value.as_os_str().as_bytes();
+            let mut entry = Vec::with_capacity(key.len() + value.len() + 1);
+            entry.extend_from_slice(key);
+            entry.push(b'=');
+            entry.extend_from_slice(value);
+            std::ffi::CString::new(entry).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "clone-worker environment contains NUL",
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut envp = env_storage
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
+
+    let mut pid = 0;
+    // SAFETY: all C strings and pointer arrays live through the call, are NUL
+    // terminated, and the initialized action list contains valid descriptors.
+    let error = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            exe.as_ptr(),
+            &actions.0,
+            std::ptr::null(),
+            argv.as_mut_ptr(),
+            envp.as_mut_ptr(),
+        )
+    };
+    if error == 0 {
+        u32::try_from(pid).map_err(|_| io::Error::other("clone-worker pid is out of range"))
+    } else {
+        Err(io::Error::from_raw_os_error(error))
+    }
+}
+
 /// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
 /// CUDA context, hence its own UVA — so it can place memory at the golden's exact
 /// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
@@ -3682,7 +5057,6 @@ fn spawn_clone_worker(
     procmem: Option<ProcMemAdvert>,
     options: ServeOptions,
 ) -> io::Result<(u32, std::os::unix::io::RawFd)> {
-    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
     let eviction_mode = std::env::var("SMOLVM_CUDA_GOLDEN_EVICT").ok();
     let configured_sharing = std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").ok();
@@ -3692,6 +5066,25 @@ fn spawn_clone_worker(
         golden_eviction_enabled(eviction_mode.as_deref(), options.fork_pool_size),
         sharing_active,
     );
+    #[cfg(target_os = "linux")]
+    let module_blob_build = if cached_module_blob(token).is_none() {
+        // Capturing module metadata briefly shares the frozen layout lock, but
+        // writing the immutable images is independent of the device-to-host
+        // memory snapshot below. Overlap both first-worker costs; later workers
+        // continue to use the two single-flight caches.
+        match std::thread::Builder::new()
+            .name("cuda-module-handoff".into())
+            .spawn(move || module_blob_for_token(token))
+        {
+            Ok(build) => Some(build),
+            Err(error) => {
+                tracing::warn!(%error, token, "could not parallelize CUDA module handoff");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let (golden_dev, layout, export_fds) = if let Some(cached) = cached_host_snapshot(token) {
         tracing::info!(
             token,
@@ -3959,116 +5352,44 @@ fn spawn_clone_worker(
         }
         (golden_dev, layout, export_fds)
     };
-    // M3a: serialize the golden's modules (images) + functions to a temp file for
-    // the worker to reload + remap. Images are MB-scale, so a file, not env.
-    let mut modpath: Option<String> = None;
-    if let Some((modules, funcs, streams, events, graphs, lib_handles)) =
-        smolvm_cuda::host::module_handoff_snapshot(token)
-    {
-        tracing::info!(
-            modules = modules.len(),
-            funcs = funcs.len(),
-            streams = streams.len(),
-            events = events.len(),
-            graphs = graphs.len(),
-            lib_handles = lib_handles.len(),
-            "M3a: gathered golden modules/functions/streams/events"
-        );
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&(modules.len() as u32).to_le_bytes());
-        for (h, img) in &modules {
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&(img.len() as u32).to_le_bytes());
-            blob.extend_from_slice(img);
-        }
-        blob.extend_from_slice(&(funcs.len() as u32).to_le_bytes());
-        for (h, m, n, attrs) in &funcs {
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&m.to_le_bytes());
-            blob.extend_from_slice(&(n.len() as u32).to_le_bytes());
-            blob.extend_from_slice(n.as_bytes());
-            // Per-function attribute replays ([i32 attr][i32 value] each) —
-            // e.g. FlashAttention's MaxDynamicSharedMemorySize opt-in.
-            blob.extend_from_slice(&(attrs.len() as u32).to_le_bytes());
-            for &(a, v) in attrs {
-                blob.extend_from_slice(&a.to_le_bytes());
-                blob.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        // Streams + events: [u64 golden handle][u32 create flags] each.
-        blob.extend_from_slice(&(streams.len() as u32).to_le_bytes());
-        for (h, flags) in &streams {
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&flags.to_le_bytes());
-        }
-        blob.extend_from_slice(&(events.len() as u32).to_le_bytes());
-        for (h, flags) in &events {
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&flags.to_le_bytes());
-        }
-        // M3b: captured graphs. Per graph: [u64 graph_vh][u64 exec_vh]
-        //   [u32 nnodes]([u64 func][u32*3 grid][u32*3 block][u32 shmem]
-        //                [u32 nparams]([u32 len][bytes])* )*
-        //   [u32 nedges]([u32 from][u32 to])*
-        blob.extend_from_slice(&(graphs.len() as u32).to_le_bytes());
-        for (graph_vh, exec_vh, g) in &graphs {
-            blob.extend_from_slice(&graph_vh.to_le_bytes());
-            blob.extend_from_slice(&exec_vh.to_le_bytes());
-            blob.extend_from_slice(&(g.nodes.len() as u32).to_le_bytes());
-            for nd in &g.nodes {
-                blob.extend_from_slice(&nd.func.to_le_bytes());
-                for x in nd.grid.iter().chain(nd.block.iter()) {
-                    blob.extend_from_slice(&x.to_le_bytes());
+    // Serialize immutable module state once per live lineage. Linux workers
+    // inherit a read-only descriptor for an unnamed file; other Unix hosts keep
+    // the legacy unique-path handoff.
+    #[cfg(target_os = "linux")]
+    let module_blob_result = match module_blob_build {
+        Some(build) => match build.join() {
+            Ok(result) => result,
+            Err(_) => {
+                for &fd in &export_fds {
+                    unsafe { libc::close(fd) };
                 }
-                blob.extend_from_slice(&nd.shared_mem.to_le_bytes());
-                blob.extend_from_slice(&(nd.params.len() as u32).to_le_bytes());
-                for p in &nd.params {
-                    blob.extend_from_slice(&(p.len() as u32).to_le_bytes());
-                    blob.extend_from_slice(p);
-                }
+                return Err(io::Error::other("CUDA module handoff builder panicked"));
             }
-            blob.extend_from_slice(&(g.edges.len() as u32).to_le_bytes());
-            for &(f, t) in &g.edges {
-                blob.extend_from_slice(&f.to_le_bytes());
-                blob.extend_from_slice(&t.to_le_bytes());
+        },
+        None => module_blob_for_token(token),
+    };
+    #[cfg(target_os = "linux")]
+    let module_blob = match module_blob_result {
+        Ok(blob) => blob,
+        Err(error) => {
+            for &fd in &export_fds {
+                unsafe { libc::close(fd) };
             }
+            return Err(error);
         }
-        // Library-handle creates for the worker to replay:
-        //   [u32 n]([u8 lib][u16 func][u64 handle][u32 len][args])*
-        blob.extend_from_slice(&(lib_handles.len() as u32).to_le_bytes());
-        for (lib, func, h, args) in &lib_handles {
-            blob.push(*lib);
-            blob.extend_from_slice(&func.to_le_bytes());
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&(args.len() as u32).to_le_bytes());
-            blob.extend_from_slice(args);
-        }
-        // P3b: capture-replay op-logs. Per graph:
-        //   [u64 graph_vh][u64 exec_vh][u32 nops]([u32 len][op bytes])*
-        let oplogs = smolvm_cuda::host::graph_oplogs_snapshot(token);
-        blob.extend_from_slice(&(oplogs.len() as u32).to_le_bytes());
-        for (graph_vh, exec_vh, ops) in &oplogs {
-            blob.extend_from_slice(&graph_vh.to_le_bytes());
-            blob.extend_from_slice(&exec_vh.to_le_bytes());
-            blob.extend_from_slice(&(ops.len() as u32).to_le_bytes());
-            for op in ops {
-                blob.extend_from_slice(&(op.len() as u32).to_le_bytes());
-                blob.extend_from_slice(op);
-            }
-        }
-        let _ = std::fs::create_dir_all("/tmp/smolvm");
-        // Unique per SPAWN, not per (token, conn_fd): fd numbers are reused as
-        // soon as the daemon closes a spawned worker's copy, so two clones forked
-        // near-simultaneously collide on the same path — and each worker deletes
-        // its blob after staging, leaving the second worker 0 modules (its kernel
-        // launches then use raw golden handles → SIGSEGV in cuLaunchKernel).
+    };
+    #[cfg(not(target_os = "linux"))]
+    let modpath = if let Some((_revision, blob)) = serialize_module_handoff(token)? {
+        let directory = std::env::temp_dir().join("smolvm");
+        std::fs::create_dir_all(&directory)?;
         static SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mp = format!("/tmp/smolvm/clone-mods-{token}-{seq}.bin");
-        if std::fs::write(&mp, &blob).is_ok() {
-            modpath = Some(mp);
-        }
-    }
+        let path = directory.join(format!("clone-mods-{token}-{seq}.bin"));
+        std::fs::write(&path, blob)?;
+        Some(path)
+    } else {
+        None
+    };
     // Control channel for late-attached guest channels: the daemon keeps sp[0]
     // and SCM_RIGHTS-sends each additional connection fd from the same clone;
     // the worker inherits sp[1] and serves every received fd in-process.
@@ -4084,8 +5405,87 @@ fn spawn_clone_worker(
         }
         return Err(error);
     }
+    let publish_enabled = TENSOR_BUNDLE_SERVICE_READY.load(Ordering::Acquire);
+    let mut publish_sp = [-1i32; 2];
+    if publish_enabled
+        && unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, publish_sp.as_mut_ptr()) }
+            != 0
+    {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(sp[0]);
+            libc::close(sp[1]);
+        }
+        for fd in export_fds {
+            unsafe { libc::close(fd) };
+        }
+        return Err(error);
+    }
     let ctrl_slot = 4 + export_fds.len() as i32;
-    let source_minimum = ctrl_slot + 1;
+    let publish_slot = ctrl_slot + 1;
+    #[cfg(target_os = "linux")]
+    let module_slot = publish_slot + i32::from(publish_enabled);
+    #[cfg(target_os = "linux")]
+    let module_images_slot = module_slot + i32::from(module_blob.is_some());
+    #[cfg(target_os = "linux")]
+    let has_module_images = module_blob
+        .as_ref()
+        .is_some_and(|blob| blob.image_file.is_some());
+    #[cfg(target_os = "linux")]
+    let source_minimum = module_images_slot + i32::from(has_module_images);
+    #[cfg(not(target_os = "linux"))]
+    let source_minimum = publish_slot + i32::from(publish_enabled);
+    #[cfg(target_os = "linux")]
+    let module_child = if let Some(blob) = &module_blob {
+        let fd =
+            unsafe { libc::fcntl(blob.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, source_minimum) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(sp[0]);
+                libc::close(sp[1]);
+                if publish_enabled {
+                    libc::close(publish_sp[0]);
+                    libc::close(publish_sp[1]);
+                }
+            }
+            for fd in export_fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(error);
+        }
+        fd
+    } else {
+        -1
+    };
+    #[cfg(target_os = "linux")]
+    let module_images_child = if let Some(file) = module_blob
+        .as_ref()
+        .and_then(|blob| blob.image_file.as_ref())
+    {
+        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, source_minimum) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(sp[0]);
+                libc::close(sp[1]);
+                if publish_enabled {
+                    libc::close(publish_sp[0]);
+                    libc::close(publish_sp[1]);
+                }
+                if module_child >= 0 {
+                    libc::close(module_child);
+                }
+            }
+            for fd in export_fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(error);
+        }
+        fd
+    } else {
+        -1
+    };
     // Lift the control source and every exported-memory source above the whole
     // dup2 destination range. Hundreds of VMM chunks can extend beyond any
     // fixed descriptor floor.
@@ -4096,94 +5496,180 @@ fn spawn_clone_worker(
         let error = io::Error::last_os_error();
         // SAFETY: closing the parent end we created above.
         unsafe { libc::close(sp[0]) };
+        if publish_enabled {
+            unsafe {
+                libc::close(publish_sp[0]);
+                libc::close(publish_sp[1]);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if module_child >= 0 {
+            unsafe { libc::close(module_child) };
+        }
+        #[cfg(target_os = "linux")]
+        if module_images_child >= 0 {
+            unsafe { libc::close(module_images_child) };
+        }
         for fd in export_fds {
             unsafe { libc::close(fd) };
         }
         return Err(error);
     }
+    let publish_child = if publish_enabled {
+        let fd = unsafe { libc::fcntl(publish_sp[1], libc::F_DUPFD_CLOEXEC, source_minimum) };
+        unsafe { libc::close(publish_sp[1]) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(sp[0]);
+                libc::close(ctrl_child);
+                libc::close(publish_sp[0]);
+            }
+            #[cfg(target_os = "linux")]
+            if module_child >= 0 {
+                unsafe { libc::close(module_child) };
+            }
+            #[cfg(target_os = "linux")]
+            if module_images_child >= 0 {
+                unsafe { libc::close(module_images_child) };
+            }
+            for fd in export_fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(error);
+        }
+        fd
+    } else {
+        -1
+    };
     let export_fds = match lift_owned_fds(export_fds, source_minimum) {
         Ok(fds) => fds,
         Err(error) => {
             unsafe {
                 libc::close(sp[0]);
                 libc::close(ctrl_child);
+                if publish_enabled {
+                    libc::close(publish_sp[0]);
+                    libc::close(publish_child);
+                }
+                #[cfg(target_os = "linux")]
+                if module_child >= 0 {
+                    libc::close(module_child);
+                }
+                #[cfg(target_os = "linux")]
+                if module_images_child >= 0 {
+                    libc::close(module_images_child);
+                }
             }
             return Err(error);
         }
     };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("_cuda-clone-worker").arg("3");
-    cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
-    cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
-    cmd.env("SMOLVM_CUDA_CLONE_CTRL", ctrl_slot.to_string());
+    let mut worker_env = vec![
+        (
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_LAYOUT"),
+            std::ffi::OsString::from(layout),
+        ),
+        (
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_DEVICE"),
+            std::ffi::OsString::from(golden_dev.to_string()),
+        ),
+        (
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_CTRL"),
+            std::ffi::OsString::from(ctrl_slot.to_string()),
+        ),
+    ];
+    if publish_enabled {
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_PUBLISH_CTRL"),
+            std::ffi::OsString::from(publish_slot.to_string()),
+        ));
+    }
     if let Some(limit) = options.vram_limit_bytes {
-        cmd.env("SMOLVM_CUDA_VRAM_LIMIT_BYTES", limit.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_VRAM_LIMIT_BYTES"),
+            std::ffi::OsString::from(limit.to_string()),
+        ));
     }
     if let Some(pool) = options.fork_pool_size {
-        cmd.env("SMOLVM_CUDA_FORK_POOL_SIZE", pool.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_FORK_POOL_SIZE"),
+            std::ffi::OsString::from(pool.to_string()),
+        ));
     }
     // Clone live-RAM transport: hand the worker our (pid, gpa, host_va, len) so
     // it can pread/pwrite /proc/<pid>/mem for D2H/H2D instead of ring-copying.
     if let Some((pid, regions)) = &procmem {
-        cmd.env("SMOLVM_CUDA_CLONE_PROCMEM", procmem_to_env(*pid, regions));
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_PROCMEM"),
+            std::ffi::OsString::from(procmem_to_env(*pid, regions)),
+        ));
     }
     if let Some(rd) = ring_dir {
         // File-ring transport: the worker resolves RingSetupFile names
         // against the clone VM's advertised host ring dir.
-        cmd.env("SMOLVM_CUDA_CLONE_RING_DIR", rd);
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_RING_DIR"),
+            std::ffi::OsString::from(rd),
+        ));
     }
     // Per-fork density: --share-weights requests sharing, but the documented
     // daemon kill switch remains authoritative. This is needed for safe
     // all-private controls and emergency rollback; blindly replacing an
     // inherited "0" here made SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0 ineffective.
     if let Some(setting) = clone_worker_share_env(share_weights, configured_sharing.as_deref()) {
-        cmd.env("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", setting);
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_FORK_SHARE_WEIGHTS"),
+            std::ffi::OsString::from(setting),
+        ));
     }
+    #[cfg(target_os = "linux")]
+    if module_blob.is_some() {
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_MODULES_FD"),
+            std::ffi::OsString::from(module_slot.to_string()),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if has_module_images {
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_MODULE_IMAGES_FD"),
+            std::ffi::OsString::from(module_images_slot.to_string()),
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
     if let Some(mp) = &modpath {
-        cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_MODULES"),
+            mp.as_os_str().to_os_string(),
+        ));
     }
     // Parent copies of the exported-physical fds, to close once the child has
-    // forked (it inherits its own set). Every open export fd holds a DRIVER
+    // spawned (it inherits its own set). Every open export fd holds a DRIVER
     // REFERENCE on the golden's physical allocation — leaking them in the
     // daemon pins the golden's VRAM long after the golden is torn down and its
     // session reclaimed (found: two dead goldens left ~3.2 GB resident).
     let parent_fds = export_fds.clone();
-    // SAFETY: dup2 in the forked child (async-signal-safe); fds were inherited at
-    // fork. Connection → fd 3; each exported physical → fd 4+idx.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::dup2(conn_fd, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for (i, efd) in export_fds.iter().enumerate() {
-                if libc::dup2(*efd, 4 + i as i32) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            // The export fds from cuMemExportToShareableHandle are O_CLOEXEC. dup2 to
-            // a DIFFERENT fd clears CLOEXEC, but dup2(fd, fd) — when an export fd
-            // already sits at its destination (commonly the first, fd 4) — is a
-            // no-op that does NOT clear it, so that fd would be closed on exec and
-            // the worker's import fails e=999 (a region left uninitialized → a later
-            // read of a weight there faults). Clear CLOEXEC on every handed-off fd.
-            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for i in 0..export_fds.len() as i32 {
-                if libc::fcntl(4 + i, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            if libc::dup2(ctrl_child, ctrl_slot) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::fcntl(ctrl_slot, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let spawned = cmd.spawn().map(|child| child.id());
+    #[cfg(target_os = "linux")]
+    let module_action = (module_child >= 0).then_some((module_child, module_slot));
+    #[cfg(not(target_os = "linux"))]
+    let module_action = None;
+    #[cfg(target_os = "linux")]
+    let module_images_action =
+        (module_images_child >= 0).then_some((module_images_child, module_images_slot));
+    #[cfg(not(target_os = "linux"))]
+    let module_images_action = None;
+    let spawned = posix_spawn_clone_worker(
+        &exe,
+        &worker_env,
+        CloneWorkerSpawnFds {
+            connection: conn_fd,
+            exports: &export_fds,
+            control: (ctrl_child, ctrl_slot),
+            publish: publish_enabled.then_some((publish_child, publish_slot)),
+            module: module_action,
+            module_images: module_images_action,
+        },
+    );
     // The child (if any) forked with its own copies; drop ours either way so
     // the golden's physicals can actually be released at teardown.
     for efd in parent_fds {
@@ -4192,11 +5678,43 @@ fn spawn_clone_worker(
     }
     // SAFETY: the child inherited its own copy of the control child-end.
     unsafe { libc::close(ctrl_child) };
+    if publish_enabled {
+        // SAFETY: as above for the dedicated publication child-end.
+        unsafe { libc::close(publish_child) };
+    }
+    #[cfg(target_os = "linux")]
+    if module_child >= 0 {
+        // SAFETY: the child inherited its own copy at module_slot.
+        unsafe { libc::close(module_child) };
+    }
+    #[cfg(target_os = "linux")]
+    if module_images_child >= 0 {
+        // SAFETY: the child inherited its own copy at module_images_slot.
+        unsafe { libc::close(module_images_child) };
+    }
     match spawned {
-        Ok(pid) => Ok((pid, sp[0])),
+        Ok(pid) => {
+            if publish_enabled {
+                // SAFETY: the parent owns this socketpair end after spawn.
+                let stream = unsafe { UnixStream::from_raw_fd(publish_sp[0]) };
+                if let Err(error) = spawn_tensor_bundle_receiver(stream, pid) {
+                    unsafe {
+                        libc::close(sp[0]);
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
+                    return Err(error);
+                }
+            }
+            Ok((pid, sp[0]))
+        }
         Err(e) => {
             // SAFETY: no worker took ownership; close the parent control end.
-            unsafe { libc::close(sp[0]) };
+            unsafe {
+                libc::close(sp[0]);
+                if publish_enabled {
+                    libc::close(publish_sp[0]);
+                }
+            }
             Err(e)
         }
     }
@@ -4231,6 +5749,7 @@ pub fn ensure_running() -> io::Result<PathBuf> {
     };
     Command::new(exe)
         .args(["_cuda-daemon", &sock.to_string_lossy()])
+        .env("CUDA_DEVICE_ORDER", CUDA_DEVICE_ORDER)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
@@ -4279,20 +5798,90 @@ impl Drop for FileLock {
 mod mps_tests {
     use super::{
         clone_layout_reservation_envelopes, clone_worker_idle_expired,
-        clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_vm_is_alive,
-        consume_procmem_preamble, create_host_snapshot_memfd, create_private_mps_paths,
-        daemon_has_live_cuda_clients, decode_attach_procmem, disabled_worker_route,
-        encode_attach_procmem, fork_snapshot_enabled, golden_eviction_enabled, host_snapshot_fits,
-        host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count, mps_enabled,
-        ordinary_regions_are_reserved, range_is_reserved, read_host_snapshot, recv_fd,
-        seal_host_snapshot, select_golden_owner, send_fd, spawn_clone_attach_listener_with_timeout,
-        unique_live_clone_worker,
+        clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_spawn_pace,
+        clone_worker_vm_is_alive, consume_procmem_preamble, create_host_snapshot_memfd,
+        create_private_mps_paths, daemon_has_live_cuda_clients, decode_attach_procmem,
+        decode_clone_worker_status, disabled_worker_route, encode_attach_procmem,
+        encode_clone_worker_status, fork_snapshot_enabled, golden_eviction_enabled,
+        host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
+        live_host_snapshot_count, map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved,
+        posix_spawn_clone_worker, prepare_module_blob, prepare_streamed_module_blob,
+        range_is_reserved, read_host_snapshot, reconstruct_golden_modules, recv_fd,
+        redeem_tensor_bundle_from_stream, seal_host_snapshot, select_golden_owner, send_fd,
+        send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
+        spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
+        unique_live_clone_worker, validate_tensor_bundle_metadata, write_module_handoff,
+        CloneWorkerSpawnFds, CloneWorkerStatus, TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
-    use std::io;
+    use std::io::{self, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn high_fanout_clone_workers_keep_a_bounded_spawn_interval() {
+        assert_eq!(clone_worker_spawn_pace(None), Duration::ZERO);
+        assert_eq!(clone_worker_spawn_pace(Some(4)), Duration::ZERO);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(clone_worker_spawn_pace(Some(5)), Duration::from_millis(20));
+            assert_eq!(clone_worker_spawn_pace(Some(64)), Duration::from_millis(20));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(clone_worker_spawn_pace(Some(5)), Duration::ZERO);
+            assert_eq!(clone_worker_spawn_pace(Some(64)), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn clone_worker_posix_spawn_preserves_the_descriptor_contract() {
+        let mut connection = [-1; 2];
+        let mut control = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET,
+                    0,
+                    connection.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, control.as_mut_ptr())
+            },
+            0
+        );
+        let pid = posix_spawn_clone_worker(
+            std::path::Path::new("/bin/true"),
+            &[("SMOLVM_SPAWN_TEST".into(), "1".into())],
+            CloneWorkerSpawnFds {
+                connection: connection[1],
+                exports: &[],
+                control: (control[1], 4),
+                publish: None,
+                module: None,
+                module_images: None,
+            },
+        )
+        .unwrap();
+        unsafe {
+            for fd in connection.into_iter().chain(control) {
+                libc::close(fd);
+            }
+        }
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, 0) },
+            pid as i32
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
 
     #[test]
     fn worker_fd_sources_are_lifted_above_every_dup_destination() {
@@ -4314,6 +5903,276 @@ mod mps_tests {
             file.read_exact(&mut got).unwrap();
             assert_eq!(got, [value]);
         }
+    }
+
+    #[test]
+    fn module_blob_fd_mappings_are_offset_independent() {
+        use std::io::{Seek as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+
+        let expected = b"immutable cuda module handoff";
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(expected).unwrap();
+        assert_eq!(file.stream_position().unwrap(), expected.len() as u64);
+        let first = unsafe { libc::dup(file.as_raw_fd()) };
+        let second = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(first >= 0 && second >= 0);
+
+        let first = map_module_blob_fd(first).unwrap();
+        let second = map_module_blob_fd(second).unwrap();
+        assert_eq!(first.as_slice(), expected);
+        assert_eq!(second.as_slice(), expected);
+        assert_eq!(file.stream_position().unwrap(), expected.len() as u64);
+    }
+
+    #[test]
+    fn module_blob_mapping_rejects_empty_and_non_file_sources() {
+        use std::os::fd::IntoRawFd as _;
+
+        let empty = tempfile::tempfile().unwrap();
+        assert_eq!(
+            map_module_blob_fd(empty.into_raw_fd())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(directory.path()).unwrap();
+        assert_eq!(
+            map_module_blob_fd(directory.into_raw_fd())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn parsed_module_images_keep_the_mapped_blob_alive() {
+        use std::io::Write as _;
+        use std::os::fd::IntoRawFd as _;
+
+        let image = b"mapped-cubin";
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1_u32.to_le_bytes());
+        blob.extend_from_slice(&0x1234_u64.to_le_bytes());
+        blob.extend_from_slice(&(image.len() as u32).to_le_bytes());
+        blob.extend_from_slice(image);
+        blob.extend_from_slice(&0_u32.to_le_bytes()); // functions
+        blob.extend_from_slice(&0_u32.to_le_bytes()); // streams
+        blob.extend_from_slice(&0_u32.to_le_bytes()); // events
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&blob).unwrap();
+        let source = map_module_blob_fd(file.into_raw_fd()).unwrap();
+        let mut backend = smolvm_cuda::host::CpuBackend::default();
+        let (images, functions, streams, events, graphs, handles) =
+            reconstruct_golden_modules(&mut backend, &source, None).unwrap();
+        drop(source);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, 0x1234);
+        assert_eq!(images[0].1.as_slice(), image);
+        assert!(functions.is_empty());
+        assert!(streams.is_empty());
+        assert!(events.is_empty());
+        assert!(graphs.is_empty());
+        assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn external_module_image_store_keeps_handoff_metadata_small() {
+        use std::io::Write as _;
+        use std::os::fd::IntoRawFd as _;
+
+        let image: Arc<[u8]> = b"external-module-image".as_slice().into();
+        let snapshot = (
+            vec![(0x1234, image.clone())],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut image_file = tempfile::tempfile().unwrap();
+        image_file.write_all(&image).unwrap();
+        let image_store = smolvm_cuda::host::ModuleImageStoreSnapshot {
+            file: image_file.try_clone().unwrap(),
+            ranges: std::collections::HashMap::from([(0x1234, (0, image.len() as u64))]),
+            bytes: image.len() as u64,
+        };
+        let mut metadata = Vec::new();
+        write_module_handoff(&mut metadata, &snapshot, &Vec::new(), Some(&image_store)).unwrap();
+        assert!(metadata.starts_with(&super::EXTERNAL_MODULE_IMAGES_MAGIC));
+        assert!(!metadata
+            .windows(image.len())
+            .any(|window| window == image.as_ref()));
+
+        let mut metadata_file = tempfile::tempfile().unwrap();
+        metadata_file.write_all(&metadata).unwrap();
+        let metadata_source = map_module_blob_fd(metadata_file.into_raw_fd()).unwrap();
+        let image_source = map_module_blob_fd(image_file.into_raw_fd()).unwrap();
+        let mut backend = smolvm_cuda::host::CpuBackend::default();
+        assert_eq!(
+            reconstruct_golden_modules(&mut backend, &metadata_source, None)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut invalid_range = metadata.clone();
+        invalid_range[16..24].copy_from_slice(&1_u64.to_le_bytes());
+        let invalid_range = smolvm_cuda::host::ModuleHandoffBytes::from_owned(invalid_range);
+        assert_eq!(
+            reconstruct_golden_modules(&mut backend, &invalid_range, Some(&image_source))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let (images, functions, streams, events, graphs, handles) =
+            reconstruct_golden_modules(&mut backend, &metadata_source, Some(&image_source))
+                .unwrap();
+        drop(metadata_source);
+        drop(image_source);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, 0x1234);
+        assert_eq!(images[0].1.as_slice(), image.as_ref());
+        assert!(functions.is_empty());
+        assert!(streams.is_empty());
+        assert!(events.is_empty());
+        assert!(graphs.is_empty());
+        assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn truncated_module_handoff_fails_closed() {
+        let source = smolvm_cuda::host::ModuleHandoffBytes::from_owned(vec![1, 0, 0]);
+        let mut backend = smolvm_cuda::host::CpuBackend::default();
+        assert_eq!(
+            reconstruct_golden_modules(&mut backend, &source, None)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn dead_lineages_do_not_retain_module_blobs() {
+        let token = u64::MAX - 91;
+        let blob = prepare_module_blob(token, 0, b"short-lived module state").unwrap();
+        assert_eq!(blob.bytes, 24);
+        assert!(super::cached_module_blob(token).is_none());
+    }
+
+    #[test]
+    fn streamed_module_handoff_preserves_the_wire_format() {
+        use smolvm_cuda::host::{GraphKernelNode, GraphSer};
+
+        let snapshot = (
+            vec![(0x10, Arc::<[u8]>::from(&b"module-image"[..]))],
+            vec![(0x20, 0x10, "kernel".to_owned(), vec![(8, 49_152), (-1, -2)])],
+            vec![(0x30, 1)],
+            vec![(0x40, 2)],
+            vec![(
+                0x50,
+                0x51,
+                GraphSer {
+                    nodes: vec![GraphKernelNode {
+                        func: 0x20,
+                        grid: [2, 3, 4],
+                        block: [5, 6, 7],
+                        shared_mem: 8,
+                        params: vec![vec![1, 2], vec![3, 4, 5]],
+                    }],
+                    edges: vec![(0, 0)],
+                },
+            )],
+            vec![(3, 0x1234, 0x60, vec![9, 8])],
+        );
+        let oplogs = vec![(0x50, 0x51, vec![vec![7, 6, 5]])];
+
+        let mut actual = Vec::new();
+        let written = write_module_handoff(&mut actual, &snapshot, &oplogs, None).unwrap();
+
+        fn u16_field(output: &mut Vec<u8>, value: u16) {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        fn u32_field(output: &mut Vec<u8>, value: u32) {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        fn i32_field(output: &mut Vec<u8>, value: i32) {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        fn u64_field(output: &mut Vec<u8>, value: u64) {
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        fn bytes_field(output: &mut Vec<u8>, value: &[u8]) {
+            u32_field(output, value.len() as u32);
+            output.extend_from_slice(value);
+        }
+
+        let mut expected = Vec::new();
+        u32_field(&mut expected, 1); // modules
+        u64_field(&mut expected, 0x10);
+        bytes_field(&mut expected, b"module-image");
+        u32_field(&mut expected, 1); // functions
+        u64_field(&mut expected, 0x20);
+        u64_field(&mut expected, 0x10);
+        bytes_field(&mut expected, b"kernel");
+        u32_field(&mut expected, 2); // attributes
+        i32_field(&mut expected, 8);
+        i32_field(&mut expected, 49_152);
+        i32_field(&mut expected, -1);
+        i32_field(&mut expected, -2);
+        u32_field(&mut expected, 1); // streams
+        u64_field(&mut expected, 0x30);
+        u32_field(&mut expected, 1);
+        u32_field(&mut expected, 1); // events
+        u64_field(&mut expected, 0x40);
+        u32_field(&mut expected, 2);
+        u32_field(&mut expected, 1); // graphs
+        u64_field(&mut expected, 0x50);
+        u64_field(&mut expected, 0x51);
+        u32_field(&mut expected, 1); // nodes
+        u64_field(&mut expected, 0x20);
+        for value in [2, 3, 4, 5, 6, 7, 8] {
+            u32_field(&mut expected, value);
+        }
+        u32_field(&mut expected, 2); // parameters
+        bytes_field(&mut expected, &[1, 2]);
+        bytes_field(&mut expected, &[3, 4, 5]);
+        u32_field(&mut expected, 1); // edges
+        u32_field(&mut expected, 0);
+        u32_field(&mut expected, 0);
+        u32_field(&mut expected, 1); // library handles
+        expected.push(3);
+        u16_field(&mut expected, 0x1234);
+        u64_field(&mut expected, 0x60);
+        bytes_field(&mut expected, &[9, 8]);
+        u32_field(&mut expected, 1); // op-log graphs
+        u64_field(&mut expected, 0x50);
+        u64_field(&mut expected, 0x51);
+        u32_field(&mut expected, 1);
+        bytes_field(&mut expected, &[7, 6, 5]);
+
+        assert_eq!(written, expected.len() as u64);
+        assert_eq!(actual, expected);
+
+        let token = u64::MAX - 92;
+        let blob = prepare_streamed_module_blob(token, 0, &snapshot, &oplogs, None).unwrap();
+        assert_eq!(blob.bytes, expected.len() as u64);
+        assert_eq!(blob.file.metadata().unwrap().len(), expected.len() as u64);
+        let mapped = unsafe {
+            smolvm_cuda::host::ModuleHandoffBytes::map_read_only(&blob.file, expected.len())
+        }
+        .unwrap();
+        assert_eq!(mapped.as_slice(), expected);
+        assert!(super::cached_module_blob(token).is_none());
     }
 
     #[test]
@@ -4508,7 +6367,7 @@ mod mps_tests {
         let listener = spawn_clone_attach_listener_with_timeout(
             sockets[1],
             0,
-            Arc::new((None, None, Vec::new())),
+            Arc::new((None, Vec::new())),
             active.clone(),
             None,
             Duration::ZERO,
@@ -4570,6 +6429,98 @@ mod mps_tests {
     }
 
     #[test]
+    fn tensor_bundle_metadata_rejects_ranges_outside_the_export() {
+        let mut metadata = Vec::new();
+        metadata.extend_from_slice(&2u32.to_le_bytes());
+        metadata.extend_from_slice(&2u32.to_le_bytes());
+        metadata.extend_from_slice(b"{}");
+        metadata.extend_from_slice(&0u64.to_le_bytes());
+        metadata.extend_from_slice(&64u64.to_le_bytes());
+        metadata.extend_from_slice(&64u64.to_le_bytes());
+        metadata.extend_from_slice(&32u64.to_le_bytes());
+        validate_tensor_bundle_metadata(&metadata, 128).unwrap();
+
+        metadata[26..34].copy_from_slice(&96u64.to_le_bytes());
+        assert!(validate_tensor_bundle_metadata(&metadata, 128).is_err());
+    }
+
+    #[test]
+    fn tensor_bundle_token_transfers_one_fd_once() {
+        use smolvm_cuda::host::{DeviceTensorBundle, PublishedTensorRange};
+        use std::os::fd::OwnedFd;
+
+        let (mut worker, parent) = std::os::unix::net::UnixStream::pair().unwrap();
+        spawn_tensor_bundle_receiver(parent, std::process::id()).unwrap();
+        let allocation: OwnedFd = tempfile::tempfile().unwrap().into();
+        let token = send_tensor_bundle_to_parent(
+            &mut worker,
+            DeviceTensorBundle {
+                allocation,
+                allocation_size: 4096,
+                manifest: br#"{"name":"adapter"}"#.to_vec(),
+                tensors: vec![
+                    PublishedTensorRange {
+                        offset: 0,
+                        size: 64,
+                    },
+                    PublishedTensorRange {
+                        offset: 64,
+                        size: 32,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(token.len(), 32);
+
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let served = std::thread::spawn(move || serve_tensor_bundle_consumer(server));
+        let redeemed = redeem_tensor_bundle_from_stream(client, &token).unwrap();
+        assert_eq!(redeemed.allocation_size, 4096);
+        validate_tensor_bundle_metadata(&redeemed.metadata, redeemed.allocation_size).unwrap();
+        drop(redeemed);
+        served.join().unwrap().unwrap();
+
+        let (mut retry, retry_server) = std::os::unix::net::UnixStream::pair().unwrap();
+        retry.write_all(&TENSOR_CONSUME_MAGIC).unwrap();
+        retry
+            .write_all(&(token.len() as u16).to_le_bytes())
+            .unwrap();
+        retry.write_all(&token).unwrap();
+        assert!(serve_tensor_bundle_consumer(retry_server).is_err());
+    }
+
+    #[test]
+    fn published_tensor_bundle_outlives_its_clone_worker_channel() {
+        use smolvm_cuda::host::{DeviceTensorBundle, PublishedTensorRange};
+        use std::os::fd::OwnedFd;
+
+        let (mut worker, parent) = std::os::unix::net::UnixStream::pair().unwrap();
+        spawn_tensor_bundle_receiver(parent, u32::MAX).unwrap();
+        let allocation: OwnedFd = tempfile::tempfile().unwrap().into();
+        let token = send_tensor_bundle_to_parent(
+            &mut worker,
+            DeviceTensorBundle {
+                allocation,
+                allocation_size: 4096,
+                manifest: br#"{"name":"adapter"}"#.to_vec(),
+                tensors: vec![PublishedTensorRange {
+                    offset: 0,
+                    size: 64,
+                }],
+            },
+        )
+        .unwrap();
+        drop(worker);
+
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let served = std::thread::spawn(move || serve_tensor_bundle_consumer(server));
+        let redeemed = redeem_tensor_bundle_from_stream(client, &token).unwrap();
+        assert_eq!(redeemed.allocation_size, 4096);
+        served.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn tokenless_clone_worker_selection_fails_closed_when_ambiguous() {
         let mut workers = HashMap::new();
         workers.insert((10, 7), (101, 201));
@@ -4596,6 +6547,17 @@ mod mps_tests {
         assert_eq!(clone_worker_share_env(true, Some("false")), Some("0"));
         assert_eq!(clone_worker_share_env(true, Some("off")), Some("0"));
         assert_eq!(clone_worker_share_env(false, None), None);
+    }
+
+    #[test]
+    fn clone_worker_status_round_trips_and_rejects_ambiguous_records() {
+        for status in [CloneWorkerStatus::Ready, CloneWorkerStatus::Failed] {
+            let encoded = encode_clone_worker_status(42, status);
+            assert_eq!(decode_clone_worker_status(&encoded), Some((42, status)));
+        }
+        assert_eq!(decode_clone_worker_status("42 ready trailing"), None);
+        assert_eq!(decode_clone_worker_status("42 unknown"), None);
+        assert_eq!(decode_clone_worker_status("ready"), None);
     }
 
     #[test]

@@ -16,6 +16,10 @@ use crate::proto::{
 };
 use std::collections::{hash_map::Entry, HashMap};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::sync::{Arc, Mutex};
 
 /// `Ok(value)` or `Err(CUresult)` — a non-zero CUDA error code.
 pub type CuResult<T> = Result<T, i32>;
@@ -27,6 +31,51 @@ const VHANDLE_TAG: u64 = 1 << 63;
 /// `CUDA_ERROR_NOT_FOUND`.
 pub const CUDA_ERROR_NOT_FOUND: i32 = 500;
 pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
+
+#[cfg(unix)]
+const MAX_PUBLISHED_TENSORS: usize = 65_536;
+#[cfg(unix)]
+const MAX_PUBLISHED_MANIFEST: usize = 1 << 20;
+#[cfg(unix)]
+const MAX_PUBLISHED_BYTES: u64 = 16 << 30;
+
+/// One range inside a packed device-resident tensor bundle. Offsets are chosen
+/// by the host from the explicit source ranges; the caller's manifest cannot
+/// redirect a consumer to memory outside this allocation.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedTensorRange {
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// An immutable allocation staged for a local managed consumer. `allocation`
+/// owns the CUDA-export fd; dropping an unconsumed bundle releases that driver
+/// reference automatically.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct DeviceTensorBundle {
+    pub allocation: OwnedFd,
+    pub allocation_size: u64,
+    pub manifest: Vec<u8>,
+    pub tensors: Vec<PublishedTensorRange>,
+}
+
+#[cfg(unix)]
+pub type TensorBundlePublisher =
+    dyn Fn(DeviceTensorBundle) -> CuResult<Vec<u8>> + Send + Sync + 'static;
+
+/// Process-local publication hook installed only by an isolated clone worker.
+/// The shared daemon intentionally leaves this unset: a request can therefore
+/// never use a shared CUDA context to name another session's allocation.
+#[cfg(unix)]
+static TENSOR_BUNDLE_PUBLISHER: Mutex<Option<Arc<TensorBundlePublisher>>> = Mutex::new(None);
+
+/// Install or clear the clone worker's tensor-bundle sink.
+#[cfg(unix)]
+pub fn set_tensor_bundle_publisher(publisher: Option<Arc<TensorBundlePublisher>>) {
+    *TENSOR_BUNDLE_PUBLISHER.lock().unwrap() = publisher;
+}
 
 /// M3b: one KERNEL node of a captured CUDA graph, in a portable form. `func` is
 /// the golden's `CUfunction` (re-resolved in the worker); `params` are the raw
@@ -356,6 +405,101 @@ pub trait Backend: Send {
     fn mem_import_handle(&mut self, _fd: i32) -> CuResult<u64> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
+}
+
+#[cfg(unix)]
+fn tensor_publish_stage<T>(stage: &str, result: CuResult<T>) -> CuResult<T> {
+    if let Err(error) = &result {
+        eprintln!("[cuda-tensor-publish] {stage} failed code={error}");
+    }
+    result
+}
+
+#[cfg(unix)]
+fn publish_tensor_bundle(
+    b: &mut dyn Backend,
+    device: i32,
+    manifest: Vec<u8>,
+    tensors: Vec<(u64, u64)>,
+) -> CuResult<Vec<u8>> {
+    use std::os::fd::FromRawFd;
+
+    if manifest.len() > MAX_PUBLISHED_MANIFEST
+        || tensors.is_empty()
+        || tensors.len() > MAX_PUBLISHED_TENSORS
+        || tensors.iter().any(|&(dptr, size)| dptr == 0 || size == 0)
+    {
+        return Err(CUDA_ERROR_INVALID_HANDLE);
+    }
+    let publisher = TENSOR_BUNDLE_PUBLISHER
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+    let payload_size = tensors.iter().try_fold(0u64, |total, &(_, size)| {
+        total.checked_add(size).ok_or(CUDA_ERROR_INVALID_HANDLE)
+    })?;
+    if payload_size > MAX_PUBLISHED_BYTES {
+        return Err(CUDA_ERROR_INVALID_HANDLE);
+    }
+    let granularity = tensor_publish_stage(
+        "allocation granularity",
+        b.mem_get_allocation_granularity(device, 0),
+    )?
+    .max(1 << 16);
+    let allocation_size = payload_size
+        .checked_add(granularity - 1)
+        .ok_or(CUDA_ERROR_INVALID_HANDLE)?
+        / granularity
+        * granularity;
+    let handle = tensor_publish_stage(
+        "exportable allocation",
+        b.mem_create_exportable(allocation_size, device),
+    )?;
+    let va = match b.mem_address_reserve(allocation_size, 0) {
+        Ok(va) => va,
+        Err(error) => {
+            eprintln!("[cuda-tensor-publish] address reservation failed code={error}");
+            let _ = b.mem_release(handle);
+            return Err(error);
+        }
+    };
+    let mut mapped = false;
+    let staged: CuResult<DeviceTensorBundle> = (|| {
+        tensor_publish_stage("allocation map", b.mem_map(va, allocation_size, 0, handle))?;
+        mapped = true;
+        tensor_publish_stage(
+            "allocation access",
+            b.mem_set_access(va, allocation_size, device),
+        )?;
+        let mut offset = 0u64;
+        let mut ranges = Vec::with_capacity(tensors.len());
+        for (dptr, size) in tensors {
+            tensor_publish_stage("device copy", b.memcpy_dtod(va + offset, dptr, size))?;
+            ranges.push(PublishedTensorRange { offset, size });
+            offset += size;
+        }
+        // The export must not become visible before work on framework-owned
+        // streams has settled and every D2D copy into the immutable allocation
+        // is complete.
+        tensor_publish_stage("copy synchronization", b.ctx_synchronize())?;
+        let fd = tensor_publish_stage("allocation export", b.mem_export_handle(handle))?;
+        // SAFETY: a successful backend export transfers one newly owned POSIX
+        // descriptor; OwnedFd closes it on every callback/error path.
+        let allocation = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(DeviceTensorBundle {
+            allocation,
+            allocation_size,
+            manifest,
+            tensors: ranges,
+        })
+    })();
+    if mapped {
+        let _ = b.mem_unmap(va, allocation_size);
+    }
+    let _ = b.mem_address_free(va, allocation_size);
+    let _ = b.mem_release(handle);
+    tensor_publish_stage("parent publication channel", publisher(staged?))
 }
 
 /// Per-connection opaque→raw handle translation. Ids are dense and monotonic so
@@ -740,6 +884,8 @@ impl ChunkCover {
 
 #[derive(Default)]
 struct GoldenLayout {
+    /// Monotonic version of state serialized into a clone worker handoff.
+    handoff_revision: u64,
     reservations: HashMap<u64, u64>,
     /// va → per-chunk H2D coverage + share verdict. A chunk is a share
     /// CANDIDATE only if its recorded upload segments tile it exactly; it is
@@ -752,8 +898,20 @@ struct GoldenLayout {
     /// LayerNorm activations packed into partial chunks). A kernel write
     /// changes content → CRC mismatch → the chunk degrades to private.
     maps: HashMap<u64, ChunkCover>,
-    /// M3a: golden module handle → module image bytes (to reload in the worker).
-    modules: HashMap<u64, Vec<u8>>,
+    /// M3a: golden module handle → immutable module image (to reload in the
+    /// worker). Shared with the process-wide content cache and handoff snapshots
+    /// so preparing a clone never deep-copies multi-gigabyte module state.
+    modules: HashMap<u64, std::sync::Arc<[u8]>>,
+    /// Linux keeps a second, append-only representation of module images in an
+    /// unlinked regular file while the golden loads. Clone handoffs can then
+    /// serialize only handle metadata and map these already-materialized bytes
+    /// instead of rewriting every image at first fork.
+    #[cfg(target_os = "linux")]
+    module_image_store: Option<ModuleImageStore>,
+    /// A store write failure permanently selects the existing owned-image
+    /// fallback for this layout; repeatedly retrying could mix partial stores.
+    #[cfg(target_os = "linux")]
+    module_image_store_failed: bool,
     /// M3a: golden function handle → (module handle, name) — the worker re-resolves
     /// it in its reloaded module and remaps the inherited raw CUfunction handle.
     functions: HashMap<u64, (u64, String)>,
@@ -793,6 +951,13 @@ struct GoldenLayout {
     lib_handles: Vec<(u8, u16, u64, Vec<u8>)>,
     /// Host GPU the golden is pinned to — clones must reconstruct on it.
     device_base: i32,
+}
+
+#[cfg(target_os = "linux")]
+struct ModuleImageStore {
+    writable: std::fs::File,
+    bytes: u64,
+    ranges: HashMap<u64, (u64, u64)>,
 }
 type LayoutCell = std::sync::Mutex<GoldenLayout>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
@@ -906,6 +1071,11 @@ fn layout_handoff_lookup(token: u64) -> Option<std::sync::Arc<LayoutCell>> {
         .as_ref()?
         .get(&token)
         .cloned()
+}
+
+/// Return whether reconstruction metadata for `token` is still live or retained.
+pub fn layout_handoff_present(token: u64) -> bool {
+    layout_handoff_lookup(token).is_some()
 }
 
 /// Retain a frozen layout only when it has no device-memory dependency.
@@ -1085,7 +1255,7 @@ pub fn layout_set_share_verdict(token: u64, va: u64, ok: bool) {
 pub fn module_handoff_snapshot(
     token: u64,
 ) -> Option<(
-    Vec<(u64, Vec<u8>)>,
+    Vec<(u64, std::sync::Arc<[u8]>)>,
     Vec<FuncMeta>,
     Vec<(u64, u32)>,
     Vec<(u64, u32)>,
@@ -1112,6 +1282,70 @@ pub fn module_handoff_snapshot(
     let graphs = g.graphs.clone();
     let lib_handles = g.lib_handles.clone();
     Some((modules, funcs, streams, events, graphs, lib_handles))
+}
+
+/// Read-only snapshot of the append-only Linux module-image store.
+///
+/// The returned ranges cover every module in the same process layout or the
+/// function returns `None`, allowing the daemon to retain its existing
+/// self-contained handoff fallback after any store failure.
+#[cfg(target_os = "linux")]
+pub struct ModuleImageStoreSnapshot {
+    pub file: std::fs::File,
+    pub ranges: HashMap<u64, (u64, u64)>,
+    pub bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub fn module_image_store_snapshot(
+    token: u64,
+) -> std::io::Result<Option<ModuleImageStoreSnapshot>> {
+    use std::os::fd::AsRawFd;
+
+    let Some(layout) = layout_handoff_lookup(token) else {
+        return Ok(None);
+    };
+    let golden = layout.lock().unwrap();
+    let Some(store) = golden.module_image_store.as_ref() else {
+        return Ok(None);
+    };
+    if golden.modules.len() != store.ranges.len()
+        || golden
+            .modules
+            .keys()
+            .any(|handle| !store.ranges.contains_key(handle))
+        || store.ranges.values().any(|(offset, length)| {
+            offset
+                .checked_add(*length)
+                .is_none_or(|end| end > store.bytes)
+        })
+    {
+        return Ok(None);
+    }
+    let path = format!("/proc/self/fd/{}", store.writable.as_raw_fd());
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() < store.bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CUDA module image store is truncated or not a regular file",
+        ));
+    }
+    Ok(Some(ModuleImageStoreSnapshot {
+        file,
+        ranges: store.ranges.clone(),
+        bytes: store.bytes,
+    }))
+}
+
+/// Current version of the module/handle state serialized for clone workers.
+pub fn module_handoff_revision(token: u64) -> Option<u64> {
+    Some(
+        layout_handoff_lookup(token)?
+            .lock()
+            .unwrap()
+            .handoff_revision,
+    )
 }
 
 /// P3b: capture-replay op-logs, `(graph_vh, exec_vh, ordered op payloads)`.
@@ -1235,7 +1469,7 @@ pub fn prewarm_clone_worker(b: &mut dyn Backend) {
         return;
     }
     let t0 = std::time::Instant::now();
-    let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+    let mods = staged_module_handles();
     let nmods = mods.len();
     for g in mods {
         let _ = xlat_mod(b, g);
@@ -1307,8 +1541,157 @@ pub fn replay_lib_handles(b: &mut dyn Backend, handles: &[(u8, u16, u64, Vec<u8>
 // each function) on FIRST USE at the raw_module/raw_fn_h choke points. Empty
 // (identity) unless a Path-3 clone worker installed it via `set_handle_trans`.
 type HandleMap = std::cell::RefCell<HashMap<u64, u64>>;
-type ImageMap = std::cell::RefCell<HashMap<u64, Vec<u8>>>;
+type ImageMap = std::cell::RefCell<HashMap<u64, ModuleHandoffBytes>>;
 type MetaMap = std::cell::RefCell<HashMap<u64, (u64, String, Vec<(i32, i32)>)>>;
+
+/// Immutable bytes backing a clone worker's CUDA module handoff.
+///
+/// Owned inputs use one reference-counted allocation. Linux clone workers map
+/// the daemon's read-only handoff descriptor instead, and each module is a
+/// cheap range into that mapping. Keeping the mapping alive here is required:
+/// modules are deliberately loaded lazily, after worker startup.
+#[derive(Clone)]
+pub struct ModuleHandoffBytes {
+    storage: std::sync::Arc<ModuleHandoffStorage>,
+    start: usize,
+    len: usize,
+}
+
+enum ModuleHandoffStorage {
+    Owned(Box<[u8]>),
+    #[cfg(target_os = "linux")]
+    Mapped(ReadOnlyModuleMapping),
+}
+
+#[cfg(target_os = "linux")]
+struct ReadOnlyModuleMapping {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the mapping is immutable (`PROT_READ`) and remains valid until the
+// last Arc-backed ModuleHandoffBytes is dropped. Sharing read-only slices across
+// worker serving threads cannot introduce aliasing writes.
+#[cfg(target_os = "linux")]
+unsafe impl Send for ReadOnlyModuleMapping {}
+// SAFETY: see the Send justification above; no API exposes a mutable pointer.
+#[cfg(target_os = "linux")]
+unsafe impl Sync for ReadOnlyModuleMapping {}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReadOnlyModuleMapping {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` and `len` are exactly the successful mmap result and
+        // are unmapped once, when the final Arc owner is released.
+        unsafe {
+            libc::munmap(self.ptr.as_ptr().cast(), self.len);
+        }
+    }
+}
+
+impl ModuleHandoffBytes {
+    pub fn from_owned(bytes: Vec<u8>) -> Self {
+        let bytes = bytes.into_boxed_slice();
+        let len = bytes.len();
+        Self {
+            storage: std::sync::Arc::new(ModuleHandoffStorage::Owned(bytes)),
+            start: 0,
+            len,
+        }
+    }
+
+    /// Map an immutable regular file read-only. The file descriptor may be
+    /// closed after this returns; the mapping owns the kernel reference.
+    ///
+    /// # Safety
+    ///
+    /// The file must not be truncated or modified for the lifetime of this
+    /// value or any slices cloned from it.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn map_read_only(file: &std::fs::File, len: usize) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file()
+            || len == 0
+            || len > isize::MAX as usize
+            || metadata.len() < len as u64
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CUDA module handoff mapping has invalid size",
+            ));
+        }
+        // SAFETY: the descriptor is a validated regular file at least `len`
+        // bytes long. The mapping is read-only/private and checked for failure.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let Some(ptr) = std::ptr::NonNull::new(ptr.cast::<u8>()) else {
+            // SAFETY: mmap reported success, so release its exact result before
+            // rejecting an address that cannot back a NonNull slice.
+            unsafe { libc::munmap(ptr, len) };
+            return Err(std::io::Error::other(
+                "CUDA module handoff mmap returned null",
+            ));
+        };
+        Ok(Self {
+            storage: std::sync::Arc::new(ModuleHandoffStorage::Mapped(ReadOnlyModuleMapping {
+                ptr,
+                len,
+            })),
+            start: 0,
+            len,
+        })
+    }
+
+    /// Return a cheap, bounds-checked view into the same immutable storage.
+    pub fn slice(&self, start: usize, len: usize) -> Option<Self> {
+        let end = start.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        Some(Self {
+            storage: self.storage.clone(),
+            start: self.start.checked_add(start)?,
+            len,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        #[cfg(target_os = "linux")]
+        let all: &[u8] = match self.storage.as_ref() {
+            ModuleHandoffStorage::Owned(bytes) => bytes,
+            ModuleHandoffStorage::Mapped(mapping) => {
+                // SAFETY: the mapping remains live through `self.storage`, is
+                // immutable, and its length was validated before construction.
+                unsafe { std::slice::from_raw_parts(mapping.ptr.as_ptr(), mapping.len) }
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let all: &[u8] = {
+            let ModuleHandoffStorage::Owned(bytes) = self.storage.as_ref();
+            bytes
+        };
+        &all[self.start..self.start + self.len]
+    }
+}
+
+impl AsRef<[u8]> for ModuleHandoffBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
 thread_local! {
     static FUNC_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
     static MOD_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
@@ -1506,6 +1889,25 @@ pub fn set_handle_trans(
     streams: Vec<(u64, u64)>,
     events: Vec<(u64, u64)>,
 ) {
+    set_shared_handle_trans(
+        mod_images
+            .into_iter()
+            .map(|(handle, image)| (handle, ModuleHandoffBytes::from_owned(image)))
+            .collect(),
+        func_meta,
+        streams,
+        events,
+    );
+}
+
+/// Install handle reconstruction without copying module images. Each image may
+/// be a range of one shared read-only handoff mapping.
+pub fn set_shared_handle_trans(
+    mod_images: Vec<(u64, ModuleHandoffBytes)>,
+    func_meta: Vec<FuncMeta>,
+    streams: Vec<(u64, u64)>,
+    events: Vec<(u64, u64)>,
+) {
     fn put_h(cell: &'static std::thread::LocalKey<HandleMap>, v: Vec<(u64, u64)>) {
         cell.with(|m| {
             let mut m = m.borrow_mut();
@@ -1515,23 +1917,12 @@ pub fn set_handle_trans(
     }
     MOD_TRANS.with(|m| m.borrow_mut().clear());
     FUNC_TRANS.with(|m| m.borrow_mut().clear());
-    MOD_IMAGES.with(|m| {
-        let mut m = m.borrow_mut();
-        m.clear();
-        m.extend(mod_images.iter().cloned());
-    });
-    FUNC_META.with(|m| {
-        let mut m = m.borrow_mut();
-        m.clear();
-        m.extend(
-            func_meta
-                .iter()
-                .cloned()
-                .map(|(f, gm, n, a)| (f, (gm, n, a))),
-        );
-    });
-    // Process-global copies too, so a channel served on a thread that was
-    // never seeded still lazy-resolves instead of leaking golden handles.
+    // Lazy source state is immutable for the worker lifetime and can be tens
+    // of megabytes. Keep one process-global copy instead of duplicating every
+    // module image and function record into this thread as well; all serving
+    // threads already fall back to these maps before resolving a handle.
+    MOD_IMAGES.with(|m| m.borrow_mut().clear());
+    FUNC_META.with(|m| m.borrow_mut().clear());
     *MOD_IMAGES_GLOBAL.lock().unwrap() = Some(mod_images.into_iter().collect());
     *FUNC_META_GLOBAL.lock().unwrap() = Some(
         func_meta
@@ -1543,6 +1934,19 @@ pub fn set_handle_trans(
     *EVENT_TRANS_GLOBAL.lock().unwrap() = Some(events.iter().copied().collect());
     put_h(&STREAM_TRANS, streams);
     put_h(&EVENT_TRANS, events);
+}
+
+fn staged_module_handles() -> Vec<u64> {
+    let local: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+    if !local.is_empty() {
+        return local;
+    }
+    MOD_IMAGES_GLOBAL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|images| images.keys().copied().collect())
+        .unwrap_or_default()
 }
 
 /// Lazily reload the golden module `golden` in THIS worker's context (once),
@@ -1578,20 +1982,30 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
                 .as_ref()
                 .and_then(|m| m.get(&golden).cloned())
         });
-    let Some(mut image) = image else {
+    let Some(image) = image else {
         return golden;
     };
     // Binary images (ELF cubin / fatbin) must reload BYTE-IDENTICAL to what the
     // golden loaded — appending anything diverges from the proven-loadable bytes
     // (sm90 fatbins failed 209 with a spurious trailing byte). Only PTX, which
     // cuModuleLoadData reads as a C string, needs a trailing NUL.
-    let is_elf = image.starts_with(&[0x7f, b'E', b'L', b'F']);
-    let is_fatbin = image.len() >= 4
-        && u32::from_le_bytes([image[0], image[1], image[2], image[3]]) == 0xba55ed50;
-    if !is_elf && !is_fatbin && image.last() != Some(&0) {
-        image.push(0);
-    }
-    match b.module_load_data(&image) {
+    let bytes = image.as_slice();
+    let is_elf = bytes.starts_with(&[0x7f, b'E', b'L', b'F']);
+    let is_fatbin = bytes.len() >= 4
+        && u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == 0xba55ed50;
+    let nul_terminated;
+    let load_bytes = if !is_elf && !is_fatbin && bytes.last() != Some(&0) {
+        nul_terminated = {
+            let mut copy = Vec::with_capacity(bytes.len() + 1);
+            copy.extend_from_slice(bytes);
+            copy.push(0);
+            copy
+        };
+        nul_terminated.as_slice()
+    } else {
+        bytes
+    };
+    match b.module_load_data(load_bytes) {
         Ok(w) => {
             MOD_TRANS.with(|m| {
                 m.borrow_mut().insert(golden, w);
@@ -1609,15 +2023,19 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
                 std::sync::atomic::AtomicU64::new(0);
             let n = RELOAD_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 8 {
-                let head: Vec<String> = image.iter().take(12).map(|b| format!("{b:02x}")).collect();
+                let head: Vec<String> = load_bytes
+                    .iter()
+                    .take(12)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
                 eprintln!(
                     "[M3a-lazy] module reload failed: e={e} len={} elf={is_elf} fatbin={is_fatbin} head={}",
-                    image.len(),
+                    load_bytes.len(),
                     head.join("")
                 );
                 if std::env::var_os("SMOLVM_CUDA_DUMP_FAILMOD").is_some() {
                     let p = format!("/tmp/smolvm/failmod-{golden:x}.bin");
-                    let _ = std::fs::write(&p, &image);
+                    let _ = std::fs::write(&p, load_bytes);
                     // Context health right after the failed load: a poisoned
                     // (sticky-fault) context errors on sync/alloc too; a healthy
                     // one pins the failure on cuModuleLoadData itself.
@@ -1813,10 +2231,9 @@ struct ModuleCacheKey {
     tail: [u8; 8],
 }
 
-fn module_cache() -> &'static std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>> {
-    static C: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>>,
-    > = std::sync::OnceLock::new();
+fn module_cache() -> &'static std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<[u8]>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<[u8]>>>> =
+        std::sync::OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -1832,7 +2249,7 @@ fn module_cache_budget() -> u64 {
     })
 }
 
-fn module_cache_put(image: &[u8]) {
+fn module_cache_put(image: std::sync::Arc<[u8]>) {
     if image.len() < 64 {
         return;
     }
@@ -1842,17 +2259,86 @@ fn module_cache_put(image: &[u8]) {
         return; // over budget: first-come wins; the big early fatbins matter most
     }
     let key = ModuleCacheKey {
-        fnv: fnv64(image),
+        fnv: fnv64(&image),
         len: image.len() as u64,
         head: image[..8].try_into().unwrap(),
         tail: image[image.len() - 8..].try_into().unwrap(),
     };
-    c.entry(key)
-        .or_insert_with(|| std::sync::Arc::new(image.to_vec()));
+    c.entry(key).or_insert(image);
 }
 
-fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
+fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<[u8]>> {
     module_cache().lock().unwrap().get(key).cloned()
+}
+
+#[cfg(target_os = "linux")]
+fn create_module_image_store() -> std::io::Result<ModuleImageStore> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    static NEXT_STORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let directory = std::env::temp_dir().join("smolvm");
+    std::fs::create_dir_all(&directory)?;
+    for _ in 0..16 {
+        let sequence = NEXT_STORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = directory.join(format!(
+            "cuda-module-images-{}-{sequence:016x}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                if let Err(error) = std::fs::remove_file(&path) {
+                    drop(file);
+                    let _ = std::fs::remove_file(path);
+                    return Err(error);
+                }
+                return Ok(ModuleImageStore {
+                    writable: file,
+                    bytes: 0,
+                    ranges: HashMap::new(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique CUDA module image store",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn retain_module_image(layout: &mut GoldenLayout, handle: u64, image: &[u8]) {
+    if layout.module_image_store_failed {
+        return;
+    }
+    if layout.module_image_store.is_none() {
+        match create_module_image_store() {
+            Ok(store) => layout.module_image_store = Some(store),
+            Err(error) => {
+                layout.module_image_store_failed = true;
+                eprintln!("[cuda-module-store] disabled after create failure: {error}");
+                return;
+            }
+        }
+    }
+    let store = layout.module_image_store.as_mut().unwrap();
+    let offset = store.bytes;
+    let length = image.len() as u64;
+    if let Err(error) = store.writable.write_all(image) {
+        layout.module_image_store = None;
+        layout.module_image_store_failed = true;
+        eprintln!("[cuda-module-store] disabled after append failure: {error}");
+        return;
+    }
+    store.ranges.insert(handle, (offset, length));
+    store.bytes = store.bytes.saturating_add(length);
 }
 
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
@@ -2187,6 +2673,15 @@ fn translate_dptrs(trans: &[(u64, u64, u64)], req: Request) -> Request {
             c: xlat(trans, c),
             ldc,
         },
+        Request::PublishTensorBundle {
+            manifest,
+            mut tensors,
+        } => {
+            for (dptr, _) in &mut tensors {
+                *dptr = xlat(trans, *dptr);
+            }
+            Request::PublishTensorBundle { manifest, tensors }
+        }
         // LibCall (cuBLAS/cuDNN) device-pointer args are translated TYPED in the
         // generated dispatch via `gpu::dptr_resolve` (a byte-scan of the packed,
         // mixed-width arg buffer would mis-align and corrupt scalars), driven by
@@ -3093,7 +3588,7 @@ fn worker_module_take(raw: u64) -> bool {
 /// passed RAW GOLDEN HANDLES to the driver — launch-time "invalid argument"
 /// at best, a SIGSEGV inside `cuModuleGetFunction` (foreign-handle deref) at
 /// worst: the intermittent per-clone worker crash loop.
-static MOD_IMAGES_GLOBAL: std::sync::Mutex<Option<HashMap<u64, Vec<u8>>>> =
+static MOD_IMAGES_GLOBAL: std::sync::Mutex<Option<HashMap<u64, ModuleHandoffBytes>>> =
     std::sync::Mutex::new(None);
 #[allow(clippy::type_complexity)]
 static FUNC_META_GLOBAL: std::sync::Mutex<Option<HashMap<u64, (u64, String, Vec<(i32, i32)>)>>> =
@@ -3594,7 +4089,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // the lazy paths to retry; later sessions adopt from the
                 // registry.
                 if prereplay_enabled() {
-                    let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+                    let mods = staged_module_handles();
                     if !mods.is_empty() {
                         let t0 = std::time::Instant::now();
                         let mut loaded = 0u32;
@@ -3693,17 +4188,18 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let raw = b.module_load_data(&image)?;
             worker_module_register(raw);
             sess.owned_modules.insert(raw);
+            let image: std::sync::Arc<[u8]> = image.into();
             // Feed the process-wide image cache so later replicas can load by
             // hash without re-shipping the bytes (LibCall 6/1).
-            module_cache_put(&image);
+            module_cache_put(image.clone());
             // M3a: keep the image so a Path-3 clone worker can reload the module in
             // its own context and remap this inherited handle.
             if path3_enabled() {
-                sess.golden_layout
-                    .lock()
-                    .unwrap()
-                    .modules
-                    .insert(raw, image.clone());
+                let mut layout = sess.golden_layout.lock().unwrap();
+                #[cfg(target_os = "linux")]
+                retain_module_image(&mut layout, raw, &image);
+                layout.modules.insert(raw, image);
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Ok(Response::Handle(raw))
         }
@@ -3713,11 +4209,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // primary context, so a forked clone keeps its parent's functions.
             let raw_fn = b.module_get_function(raw_mod, &name)?;
             if path3_enabled() {
-                sess.golden_layout
-                    .lock()
-                    .unwrap()
-                    .functions
-                    .insert(raw_fn, (raw_mod, name.clone()));
+                let mut layout = sess.golden_layout.lock().unwrap();
+                layout.functions.insert(raw_fn, (raw_mod, name.clone()));
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Ok(Response::Handle(raw_fn))
         }
@@ -3751,13 +4245,13 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         } => {
             let raw_fn = raw_fn_h(sess, b, function);
             if path3_enabled() {
-                sess.golden_layout
-                    .lock()
-                    .unwrap()
+                let mut layout = sess.golden_layout.lock().unwrap();
+                layout
                     .func_attrs
                     .entry(raw_fn)
                     .or_default()
                     .push((attrib, value));
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
@@ -3847,7 +4341,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             sess.owned_streams.insert(st);
             worker_handle_register(&WORKER_STREAMS, st);
             if path3_enabled() {
-                sess.golden_layout.lock().unwrap().streams.insert(st, flags);
+                let mut layout = sess.golden_layout.lock().unwrap();
+                layout.streams.insert(st, flags);
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Response::Handle(st)
         }),
@@ -3879,11 +4375,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         "[p3b] golden recorded {} ops for graph {graph_vh:#x}",
                         log.len()
                     );
-                    sess.golden_layout
-                        .lock()
-                        .unwrap()
-                        .pending_oplogs
-                        .insert(graph_vh, log);
+                    let mut layout = sess.golden_layout.lock().unwrap();
+                    layout.pending_oplogs.insert(graph_vh, log);
+                    layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                 }
             }
             Ok(Response::Handle(g))
@@ -3907,6 +4401,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // on launch rather than mis-executing an unsupported graph).
             if path3_enabled() {
                 let mut layout = sess.golden_layout.lock().unwrap();
+                let mut changed = false;
                 // P3b preferred: promote the parked capture-replay log (keyed by
                 // graph_vh) to a `(graph_vh, exec_vh, log)` entry.
                 if let Some(log) = layout.pending_oplogs.remove(&graph) {
@@ -3915,11 +4410,16 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         log.len()
                     );
                     layout.graph_oplogs.push((graph, exec_vh, log));
+                    changed = true;
                 }
                 // Node-rebuild fallback (kernel-only graphs): kept for clones
                 // whose exec has no oplog.
                 if let Ok(Some(ser)) = b.graph_introspect(real_graph) {
                     layout.graphs.push((graph, exec_vh, ser));
+                    changed = true;
+                }
+                if changed {
+                    layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                 }
             }
             if exec_vh & VHANDLE_TAG != 0 {
@@ -4147,7 +4647,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             sess.owned_events.insert(e);
             worker_handle_register(&WORKER_EVENTS, e);
             if path3_enabled() {
-                sess.golden_layout.lock().unwrap().events.insert(e, flags);
+                let mut layout = sess.golden_layout.lock().unwrap();
+                layout.events.insert(e, flags);
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Response::Handle(e)
         }),
@@ -4289,11 +4791,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     worker_module_register(raw);
                     sess.owned_modules.insert(raw);
                     if path3_enabled() {
-                        sess.golden_layout
-                            .lock()
-                            .unwrap()
-                            .modules
-                            .insert(raw, image.to_vec());
+                        let mut layout = sess.golden_layout.lock().unwrap();
+                        #[cfg(target_os = "linux")]
+                        retain_module_image(&mut layout, raw, &image);
+                        layout.modules.insert(raw, image.clone());
+                        layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                     }
                     return Ok(Response::LibResult(0, raw.to_le_bytes().to_vec()));
                 }
@@ -4357,12 +4859,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         if std::env::var_os("SMOLVM_CUDA_LIB_SEED_DEBUG").is_some() {
                             eprintln!("[lib-rec] lib={lib} func={func} h={h:#x}");
                         }
-                        sess.golden_layout.lock().unwrap().lib_handles.push((
-                            lib,
-                            func,
-                            h,
-                            args.clone(),
-                        ));
+                        let mut layout = sess.golden_layout.lock().unwrap();
+                        layout.lib_handles.push((lib, func, h, args.clone()));
+                        layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                     }
                 }
             }
@@ -4584,6 +5083,17 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::MemGetAllocationGranularity { device, flags } => b
             .mem_get_allocation_granularity(dev(sess, device), flags)
             .map(Response::Bytes),
+        Request::PublishTensorBundle { manifest, tensors } => {
+            #[cfg(unix)]
+            {
+                publish_tensor_bundle(b, sess.device_base, manifest, tensors).map(Response::Data)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (manifest, tensors);
+                Err(CUDA_ERROR_NOT_SUPPORTED)
+            }
+        }
     })();
     let (status, resp) = match r {
         Ok(resp) => (0, resp),
@@ -4947,6 +5457,68 @@ mod tests {
     use super::*;
     use crate::client::Client;
     use std::io::{Read, Write};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_module_ranges_keep_the_read_only_mapping_alive() {
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd as _;
+
+        let name = std::ffi::CString::new("smolvm-module-mapping-test").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(b"0123456789").unwrap();
+        let range = {
+            // SAFETY: the test never changes the memfd after mapping it.
+            let mapping = unsafe { ModuleHandoffBytes::map_read_only(&file, 10) }.unwrap();
+            assert!(matches!(
+                mapping.storage.as_ref(),
+                ModuleHandoffStorage::Mapped(_)
+            ));
+            mapping.slice(3, 4).unwrap()
+        };
+        drop(file);
+        assert_eq!(range.as_slice(), b"3456");
+        assert!(range.slice(4, 1).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn module_image_store_snapshot_covers_every_retained_module() {
+        use std::os::unix::fs::FileExt as _;
+
+        let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        let first: Arc<[u8]> = b"first-module-image".as_slice().into();
+        let second: Arc<[u8]> = b"second-module-image".as_slice().into();
+        {
+            let mut golden = layout.lock().unwrap();
+            retain_module_image(&mut golden, 0x10, &first);
+            retain_module_image(&mut golden, 0x20, &second);
+            golden.modules.insert(0x10, first.clone());
+            golden.modules.insert(0x20, second.clone());
+        }
+        let token = 0xA6A6_0000_0000_0001;
+        layout_handoff_register(&layout, token);
+
+        let snapshot = module_image_store_snapshot(token).unwrap().unwrap();
+        assert_eq!(snapshot.bytes, (first.len() + second.len()) as u64);
+        let mut actual = vec![0; snapshot.bytes as usize];
+        snapshot.file.read_exact_at(&mut actual, 0).unwrap();
+        assert_eq!(actual, [first.as_ref(), second.as_ref()].concat());
+        assert_eq!(snapshot.ranges.get(&0x10), Some(&(0, first.len() as u64)));
+        assert_eq!(
+            snapshot.ranges.get(&0x20),
+            Some(&(first.len() as u64, second.len() as u64))
+        );
+
+        layout
+            .lock()
+            .unwrap()
+            .modules
+            .insert(0x30, b"not-in-store".as_slice().into());
+        assert!(module_image_store_snapshot(token).unwrap().is_none());
+    }
 
     #[test]
     fn replayed_vmm_access_preserves_only_shared_intersections() {
@@ -5640,6 +6212,37 @@ mod tests {
     }
 
     #[test]
+    fn clone_handle_sources_are_available_to_unseeded_threads() {
+        let golden_module = 0x6f00_0000_0000_0001;
+        let golden_function = 0x6f00_0000_0000_0002;
+        let golden_stream = 0x6f00_0000_0000_0003;
+        let worker_stream = 0x6f00_0000_0000_0004;
+        let golden_event = 0x6f00_0000_0000_0005;
+        let worker_event = 0x6f00_0000_0000_0006;
+        set_handle_trans(
+            vec![(golden_module, vec![1, 2, 3, 4])],
+            vec![(golden_function, golden_module, "vecadd".into(), Vec::new())],
+            vec![(golden_stream, worker_stream)],
+            vec![(golden_event, worker_event)],
+        );
+
+        std::thread::spawn(move || {
+            assert!(MOD_IMAGES.with(|images| images.borrow().is_empty()));
+            assert!(FUNC_META.with(|functions| functions.borrow().is_empty()));
+            assert!(staged_module_handles().contains(&golden_module));
+            assert_eq!(xlat_stream(golden_stream), worker_stream);
+            assert_eq!(xlat_event(golden_event), worker_event);
+
+            let mut backend = CpuBackend::default();
+            let worker_function = xlat_func(&mut backend, golden_function);
+            assert_ne!(worker_function, 0);
+            assert_ne!(worker_function, golden_function);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
     fn graph_handoff_copies_parent_captures_to_clone() {
         use std::sync::{Arc, Mutex};
         // High, distinctive tokens so this test can't collide with any token
@@ -5696,26 +6299,37 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
-        layout
-            .lock()
-            .unwrap()
-            .modules
-            .insert(0xCAFE, vec![1, 2, 3, 4]);
+        let image: Arc<[u8]> = vec![1, 2, 3, 4].into();
+        {
+            let mut state = layout.lock().unwrap();
+            state.modules.insert(0xCAFE, image.clone());
+            state.handoff_revision = 7;
+        }
         let primary = 0xA3A3_0000_0000_0001;
         let alias = 0xA3A3_0000_0000_0002;
         layout_handoff_register(&layout, primary);
         layout_handoff_register(&layout, alias);
 
+        assert!(layout_handoff_present(primary));
+        assert!(layout_handoff_present(alias));
+        assert_eq!(module_handoff_revision(primary), Some(7));
+        assert_eq!(module_handoff_revision(alias), Some(7));
         assert!(cache_metadata_only_layout(primary));
         drop(layout);
 
         for token in [primary, alias] {
             let (modules, ..) = module_handoff_snapshot(token).unwrap();
-            assert_eq!(modules, vec![(0xCAFE, vec![1, 2, 3, 4])]);
+            assert_eq!(modules.len(), 1);
+            assert_eq!(modules[0].0, 0xCAFE);
+            assert_eq!(modules[0].1.as_ref(), &[1, 2, 3, 4]);
+            assert!(Arc::ptr_eq(&modules[0].1, &image));
             assert!(layout_handoff_snapshot(token).unwrap().1.is_empty());
         }
         assert!(layout_handoff_same_process(primary, alias));
         assert!(release_metadata_only_layout(alias));
+        assert!(!layout_handoff_present(primary));
+        assert!(!layout_handoff_present(alias));
+        assert_eq!(module_handoff_revision(primary), None);
         assert!(layout_handoff_snapshot(primary).is_none());
         assert!(layout_handoff_snapshot(alias).is_none());
     }
@@ -5744,7 +6358,7 @@ mod tests {
             .lock()
             .unwrap()
             .modules
-            .insert(0xBEEF, vec![4, 3, 2, 1]);
+            .insert(0xBEEF, vec![4, 3, 2, 1].into());
         let token = 0xA5A5_0000_0000_0001;
         layout_handoff_register(&layout, token);
 
@@ -5756,7 +6370,9 @@ mod tests {
             vec![(0x4000, 0x2000)]
         );
         let (modules, ..) = module_handoff_snapshot(token).unwrap();
-        assert_eq!(modules, vec![(0xBEEF, vec![4, 3, 2, 1])]);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].0, 0xBEEF);
+        assert_eq!(modules[0].1.as_ref(), &[4, 3, 2, 1]);
         assert!(release_metadata_only_layout(token));
         assert!(layout_handoff_snapshot(token).is_none());
     }
