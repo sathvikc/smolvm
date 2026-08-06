@@ -1798,6 +1798,9 @@ impl AgentManager {
                 // golden's loaded weights instead of copying them.
                 v.push(("SMOLVM_CUDA_CLONE_SHARE", "1".to_string()));
             }
+            if features.cuda_preload_modules {
+                v.push(("SMOLVM_CUDA_CLONE_PRELOAD_MODULES", "1".to_string()));
+            }
             if let Some(pool_size) = features.cuda_fork_pool_size {
                 v.push((
                     smolvm_protocol::guest_env::CUDA_FORK_POOL_SIZE,
@@ -2061,6 +2064,14 @@ impl AgentManager {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
         let mut cmd = std::process::Command::new(&boot_exe);
+        if let Some(service) = crate::network::launch::guest_host_service()
+            .map_err(|reason| Error::config("configure guest rollout ingress", reason))?
+        {
+            cmd.env(
+                crate::api::guest_rollout::GUEST_HOST_SERVICE_ENV,
+                format!("{}:{}", service.guest_port, service.host_port),
+            );
+        }
         // libkrun dlopen()s libkrunfw by bare soname at krun_start_enter time and
         // carries no rpath, so the dynamic linker must be told where to look
         // BEFORE the child launches — the loader caches its search path at
