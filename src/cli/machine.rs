@@ -85,6 +85,24 @@ fn resolve_egress_flags(
     Ok((allow_cidr, net, dns_filter_hosts))
 }
 
+fn smolmachine_egress_fields(
+    manifest_network: bool,
+    allow_cidrs: Vec<String>,
+    cli_network: bool,
+    dns_filter_hosts: Option<Vec<String>>,
+) -> (bool, Option<Vec<String>>, Option<Vec<String>>) {
+    let allowed_cidrs = if allow_cidrs.is_empty() {
+        None
+    } else {
+        Some(allow_cidrs)
+    };
+    (
+        manifest_network || cli_network,
+        allowed_cidrs,
+        dns_filter_hosts,
+    )
+}
+
 /// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
 /// into validated [`SecretRef`]s keyed by the guest-side env var name.
 ///
@@ -161,6 +179,31 @@ fn parse_published_sockets(
                     "guest path '{}' contains an unsupported character (';' or '|')",
                     s.guest_path
                 ),
+            ));
+        }
+        // The guest resolves this path in its own namespace (and bind-mounts a
+        // mounted socket there), so a relative path would silently land next to
+        // whatever the resolving process happens to be rooted at.
+        if !s.guest_path.starts_with('/') {
+            return Err(smolvm::Error::config(
+                "publish-socket",
+                format!("guest path '{}' must be absolute", s.guest_path),
+            ));
+        }
+    }
+    // Two mount bridges at the same guest path silently shadow each other in
+    // the guest, the later bind mount wins, leaving the first bridge's host
+    // socket unreachable. Reject the config instead of paying out a dead
+    // bridge. (Expose entries only *dial* their guest path, so duplicates
+    // there are harmless.)
+    let mut mounted_paths = std::collections::HashSet::new();
+    for s in &out {
+        if s.direction == smolvm::config::SocketDirection::Mount
+            && !mounted_paths.insert(&s.guest_path)
+        {
+            return Err(smolvm::Error::config(
+                "mount-socket",
+                format!("guest path '{}' is mounted more than once", s.guest_path),
             ));
         }
     }
@@ -361,6 +404,31 @@ impl MachineCmd {
 // ============================================================================
 // Run Command (Ephemeral)
 // ============================================================================
+
+/// Parse repeated `--label key=value` pairs.
+///
+/// Split on the FIRST `=` only, so values may contain `=` (base64, query
+/// strings). An empty key is rejected: it would be unaddressable, and silently
+/// keeping it would corrupt `machine ls --json` for the caller reading it back.
+fn parse_labels(raw: &[String]) -> smolvm::Result<std::collections::BTreeMap<String, String>> {
+    let mut labels = std::collections::BTreeMap::new();
+    for entry in raw {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(smolvm::Error::config(
+                "--label",
+                format!("expected KEY=VALUE, got '{entry}'"),
+            ));
+        };
+        if key.is_empty() {
+            return Err(smolvm::Error::config(
+                "--label",
+                format!("label key cannot be empty (in '{entry}')"),
+            ));
+        }
+        labels.insert(key.to_string(), value.to_string());
+    }
+    Ok(labels)
+}
 
 /// Run a container image in an ephemeral machine.
 ///
@@ -1027,6 +1095,9 @@ impl RunCmd {
             self.storage,
             self.overlay,
             cli_allow_cidrs,
+            // Ephemeral runs are not addressable later, so they carry no labels;
+            // `machine create` is the path an orchestrator labels.
+            Default::default(),
         )?;
 
         let mut params = params;
@@ -1358,6 +1429,18 @@ impl RunCmd {
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
+            // A foreground ephemeral VM exists only to serve this command, so bind
+            // its lifetime to this process. Without the watchdog the VM survives a
+            // SIGKILL of the CLI — which is how orchestrators (and CI) enforce
+            // timeouts — and then holds its full RAM until some later `machine run`
+            // happens to sweep it (see the bounded reclaim in `MachineCmd::run`).
+            // That sweep stays as the backstop for cases the watchdog can't cover,
+            // such as a host that sleeps mid-run.
+            //
+            // `--detach` deliberately leaves the VM up for later `machine exec`, so
+            // it must opt out: arming this there would kill the VM the moment the
+            // launching CLI returned.
+            watch_parent: Some(!self.detach),
             packed_layers_dir,
             extra_disks: std::env::var("SMOLVM_EXTRA_DISK")
                 .ok()
@@ -1889,6 +1972,38 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_labels;
+
+    #[test]
+    fn parses_labels_and_keeps_values_containing_equals() {
+        let labels = parse_labels(&[
+            "owner=exo".to_string(),
+            // Values are opaque to smolvm, so `=` inside one must survive.
+            "token=abc=def==".to_string(),
+            "empty=".to_string(),
+        ])
+        .expect("valid labels");
+        assert_eq!(labels.get("owner").map(String::as_str), Some("exo"));
+        assert_eq!(labels.get("token").map(String::as_str), Some("abc=def=="));
+        assert_eq!(labels.get("empty").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn rejects_labels_that_could_not_be_read_back() {
+        // No separator: silently treating this as a valueless key would hand the
+        // caller back something they never wrote.
+        assert!(parse_labels(&["notakeyvalue".to_string()]).is_err());
+        // Empty key is unaddressable.
+        assert!(parse_labels(&["=value".to_string()]).is_err());
+    }
+
+    #[test]
+    fn later_label_wins_for_a_repeated_key() {
+        let labels =
+            parse_labels(&["k=first".to_string(), "k=second".to_string()]).expect("valid labels");
+        assert_eq!(labels.get("k").map(String::as_str), Some("second"));
+    }
+
     use super::*;
     use clap::Parser;
 
@@ -1974,10 +2089,42 @@ mod tests {
     }
 
     #[test]
+    fn smolmachine_egress_fields_preserve_resolved_cli_policy() {
+        let cidrs = vec!["192.0.2.10/32".to_string()];
+        let hosts = Some(vec!["provider.test".to_string()]);
+        assert_eq!(
+            smolmachine_egress_fields(false, cidrs.clone(), true, hosts.clone()),
+            (true, Some(cidrs), hosts)
+        );
+    }
+
+    #[test]
+    fn smolmachine_egress_fields_preserve_manifest_network_default() {
+        assert_eq!(
+            smolmachine_egress_fields(true, Vec::new(), false, None),
+            (true, None, None)
+        );
+    }
+
+    #[test]
     fn parse_published_sockets_rejects_bad_specs() {
         assert!(parse_published_sockets(&[], &["/only-host".to_string()]).is_err());
         assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[]).is_err());
         assert!(parse_published_sockets(&["/run/a;b.sock".to_string()], &[]).is_err());
+        // Relative guest paths resolve against whatever the guest process is
+        // rooted at, so they can never name the socket the user meant.
+        assert!(parse_published_sockets(&["app.sock".to_string()], &[]).is_err());
+        assert!(parse_published_sockets(&[], &["/run/h.sock:app.sock".to_string()]).is_err());
+        // Two mount bridges at one guest path shadow each other in the guest,
+        // leaving the first host socket unreachable.
+        assert!(parse_published_sockets(
+            &[],
+            &[
+                "/run/h1.sock:/run/control/engine.sock".to_string(),
+                "/run/h2.sock:/run/control/engine.sock".to_string(),
+            ]
+        )
+        .is_err());
     }
 
     #[test]
@@ -2623,6 +2770,16 @@ pub struct CreateCmd {
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
+    /// Attach metadata to the machine (repeatable), e.g.
+    /// `--label owner=exo --label sandbox=agent-7`.
+    ///
+    /// smolvm never interprets these. They exist so a process managing many
+    /// machines can identify its own later — which sandbox a machine serves, who
+    /// created it, whether it may be reclaimed — instead of encoding that into
+    /// the name. Read them back with `machine ls --json`.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
+
     /// Container image: a registry reference (alpine, python:3.12-alpine), a
     /// `docker save` archive (./myapp.tar, or `-` to read one from stdin), or an
     /// unpacked rootfs directory (./rootfs/). A bare name is always a registry
@@ -2845,6 +3002,7 @@ impl CreateCmd {
             self.storage,
             self.overlay,
             cli_allow_cidrs,
+            parse_labels(&self.labels)?,
         )?;
         let mut params = params;
         if self.auto_graph {
@@ -2990,6 +3148,19 @@ impl CreateCmd {
             manifest.mem
         };
 
+        let (cli_allow_cidrs, cli_network, cli_dns_filter_hosts) = resolve_egress_flags(
+            self.allow_cidr.clone(),
+            self.allow_host.clone(),
+            self.outbound_localhost_only,
+            self.net,
+        )?;
+        let (network, allowed_cidrs, dns_filter_hosts) = smolmachine_egress_fields(
+            manifest.network,
+            cli_allow_cidrs,
+            cli_network,
+            cli_dns_filter_hosts,
+        );
+
         // A .smolmachine is an untrusted, portable artifact: validate its secret
         // refs under the Untrusted scope, which rejects every source kind. A
         // packed `from_env`/`from_file` ref would otherwise read THIS host's
@@ -3035,7 +3206,7 @@ impl CreateCmd {
             mem,
             volume: self.volume.clone(),
             port: self.port.clone(),
-            net: self.net || manifest.network,
+            net: network,
             network_backend: self.net_backend,
             dns: self.dns,
             init: self.init.clone(),
@@ -3050,10 +3221,11 @@ impl CreateCmd {
             workdir: manifest.workdir,
             storage_gb: self.storage,
             overlay_gb: self.overlay,
-            allowed_cidrs: None,
+            allowed_cidrs,
             restart_policy: None,
             restart_max_retries: None,
             restart_max_backoff_secs: None,
+            labels: parse_labels(&self.labels)?,
             health_cmd: None,
             health_interval_secs: None,
             health_timeout_secs: None,
@@ -3062,13 +3234,34 @@ impl CreateCmd {
             ssh_agent: self.ssh_agent,
             cuda: self.cuda || self.auto_graph,
             docker_socket: self.docker_socket,
-            dns_filter_hosts: None,
+            dns_filter_hosts,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             rosetta: false,
             source_smolmachine: Some(canonical_path),
         };
+
+        let resources = VmResources {
+            cpus: params.cpus,
+            memory_mib: params.mem,
+            network: params.net,
+            network_backend: params.network_backend,
+            dns: params.dns,
+            gpu: params.gpu,
+            gpu_vram_mib: params.gpu_vram_mib,
+            cuda: params.cuda,
+            rosetta: params.rosetta,
+            storage_gib: params.storage_gb,
+            overlay_gib: params.overlay_gb,
+            allowed_cidrs: params.allowed_cidrs.clone(),
+        };
+        resources.validate()?;
+        validate_requested_network_backend(
+            &resources,
+            params.dns_filter_hosts.as_deref(),
+            params.port.len(),
+        )?;
 
         let record = vm_common::build_vm_record(&params)?;
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
