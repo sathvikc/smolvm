@@ -89,7 +89,7 @@ like — by hand, or from a Smolfile — then pack the stopped machine into a
 ```bash
 smolvm machine shell --name myvm          # install and configure interactively
 smolvm machine stop  --name myvm
-smolvm pack create --from-vm myvm -o myvm.smolmachine
+smolvm pack create --from-vm myvm -o myvm
 smolvm pack push --file myvm.smolmachine ghcr.io/you/myvm:v1
 ```
 
