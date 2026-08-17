@@ -285,6 +285,7 @@ impl ExportVm {
                 storage_gib: None,
                 overlay_gib: None,
                 allowed_cidrs: None,
+                network_name: None,
             },
             features,
         ) {
@@ -513,7 +514,12 @@ fn flatten_and_export(
         .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
         .with_file_name("flat-export.tmp");
     let total = client
-        .read_file_to_path("/storage/flat-export.tar", &tmp_file, |_| {})
+        .read_file_to_path_capped(
+            "/storage/flat-export.tar",
+            &tmp_file,
+            crate::agent::pack_export_max_total(),
+            |_| {},
+        )
         .map_err(|e| Error::agent("export flattened layer", e.to_string()))?;
     if total == 0 {
         let _ = std::fs::remove_file(&tmp_file);
@@ -603,6 +609,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
+            network_name: None,
         },
         features,
     )?;
