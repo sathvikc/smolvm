@@ -1029,6 +1029,9 @@ impl RunCmd {
                 debug: false,
                 cuda: self.cuda,
                 auto_graph: self.auto_graph,
+                // `--from` rejects the egress flags at parse time
+                // (`conflicts_with_all`), so there is no policy to carry.
+                egress: None,
             }
             .run();
         }
@@ -1153,6 +1156,14 @@ impl RunCmd {
                     debug: false,
                     cuda: self.cuda || params.cuda,
                     auto_graph: self.auto_graph,
+                    // A user-supplied artifact's manifest keeps deciding the
+                    // network default (no override), but any allow-list / DNS
+                    // filter from the flags or Smolfile must still be enforced.
+                    egress: Some(crate::cli::pack_run::ResolvedEgressPolicy {
+                        network_override: None,
+                        allowed_cidrs: params.allowed_cidrs.clone(),
+                        dns_filter_hosts: params.dns_filter_hosts.clone(),
+                    }),
                 }
                 .run();
             }
@@ -1254,6 +1265,16 @@ impl RunCmd {
                 debug: false,
                 cuda: self.cuda || params.cuda,
                 auto_graph: self.auto_graph,
+                // The workload's network policy, resolved above from the flags
+                // and Smolfile. The override is absolute: the baked artifact's
+                // manifest records the BAKE VM's networking (enabled, for the
+                // pull), so without it a cache hit would run the workload with
+                // unrestricted egress no matter what the caller asked for.
+                egress: Some(crate::cli::pack_run::ResolvedEgressPolicy {
+                    network_override: Some(params.net),
+                    allowed_cidrs: params.allowed_cidrs.clone(),
+                    dns_filter_hosts: params.dns_filter_hosts.clone(),
+                }),
             }
             .run();
         }
@@ -3838,22 +3859,36 @@ impl EgressEventsCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = self.name.as_deref().unwrap_or("default");
         let events = smolvm::agent::read_egress_denials(name, self.limit);
-        if self.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&events).unwrap_or_default()
-            );
-            return Ok(());
+        // Write through the io API instead of println!: piping into a pager
+        // that exits early (`| head`) closes stdout, and println! turns that
+        // EPIPE into a panic. A closed pipe just means the reader is done.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            if self.json {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&events).unwrap_or_default()
+                )?;
+                return Ok(());
+            }
+            if events.is_empty() {
+                writeln!(out, "No egress denials recorded for '{name}'.")?;
+                return Ok(());
+            }
+            writeln!(out, "{:<30} {:<9} DESTINATION", "TIMESTAMP", "OP")?;
+            for e in &events {
+                writeln!(out, "{:<30} {:<9} {}", e.timestamp, e.operation, e.dest)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(smolvm::Error::config("egress-events", e.to_string())),
+            Ok(()) => Ok(()),
         }
-        if events.is_empty() {
-            println!("No egress denials recorded for '{name}'.");
-            return Ok(());
-        }
-        println!("{:<30} {:<9} DESTINATION", "TIMESTAMP", "OP");
-        for e in &events {
-            println!("{:<30} {:<9} {}", e.timestamp, e.operation, e.dest);
-        }
-        Ok(())
     }
 }
 

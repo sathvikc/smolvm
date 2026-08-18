@@ -1610,13 +1610,27 @@ impl From<std::io::Error> for StorageError {
 
 type Result<T> = std::result::Result<T, StorageError>;
 
-/// Check if a layer directory is properly cached (exists and has content).
+/// Marker recording that a layer finished extracting AND its data reached the
+/// disk (written only after the writeback barrier in the pull). It sits NEXT TO
+/// the layer directory, never inside it — layer dirs are overlay lowerdirs, so
+/// a file inside would surface in every container's root.
+fn layer_ok_marker(layer_dir: &Path) -> PathBuf {
+    let mut name = layer_dir.file_name().unwrap_or_default().to_os_string();
+    name.push(".ok");
+    layer_dir.with_file_name(name)
+}
+
+/// Check if a layer directory is properly cached: its completion marker exists
+/// and the directory has content.
 ///
-/// An empty layer directory indicates failed/incomplete extraction and should
-/// be re-extracted. This prevents issues where layer_dir.exists() returns true
-/// but the directory is empty due to interrupted extraction.
+/// The marker is written only after extraction succeeded and the filesystem
+/// reported the data flushed, so its absence covers every bad state the old
+/// "directory is non-empty" check trusted: interrupted extraction, and
+/// extraction whose writeback later failed (a host out of disk surfaces as
+/// guest I/O errors AFTER tar exits, leaving non-empty corrupt layers that were
+/// then reused on every restart).
 fn is_layer_cached(layer_dir: &Path) -> bool {
-    if !layer_dir.exists() {
+    if !layer_ok_marker(layer_dir).exists() {
         return false;
     }
     // Check if the directory has any entries
@@ -1624,6 +1638,30 @@ fn is_layer_cached(layer_dir: &Path) -> bool {
         Ok(mut entries) => entries.next().is_some(),
         Err(_) => false,
     }
+}
+
+/// Force writeback of everything extracted onto the storage filesystem and
+/// surface any I/O error doing so. `sync(2)` reports nothing — during a
+/// host-out-of-disk incident it happily returned while every dirtied page
+/// failed to land — so this uses `syncfs(2)`, which returns writeback errors.
+#[cfg(target_os = "linux")]
+fn sync_layer_writeback(root: &Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let dir = std::fs::File::open(root)
+        .map_err(|e| StorageError::new(format!("open {} for syncfs: {}", root.display(), e)))?;
+    // SAFETY: syncfs on a valid, owned fd.
+    if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
+        return Err(StorageError::new(format!(
+            "flushing extracted layers to disk failed (out of space?): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_layer_writeback(_root: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Initialize storage directories.
@@ -1792,8 +1830,9 @@ pub fn status() -> Result<StorageStatus> {
     // Get disk usage (simplified)
     let (total_bytes, used_bytes) = get_disk_usage(root)?;
 
-    // Count layers and images
-    let layer_count = count_entries(&root.join(LAYERS_DIR))?;
+    // Count layers and images. Layers count directories only — their `.ok`
+    // completion markers are sibling files and would double the number.
+    let layer_count = count_dir_entries(&root.join(LAYERS_DIR))?;
     let image_count = count_entries(&root.join(MANIFESTS_DIR))?;
 
     Ok(StorageStatus {
@@ -1966,6 +2005,9 @@ where
 
     // Extract layers with progress updates
     let mut total_size = 0u64;
+    // Layers extracted by THIS pull; their completion markers are written only
+    // after the writeback barrier below confirms the data reached the disk.
+    let mut newly_extracted: Vec<PathBuf> = Vec::new();
     for (i, layer_digest) in layers.iter().enumerate() {
         let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
         let layer_dir = root.join(LAYERS_DIR).join(layer_id);
@@ -1977,13 +2019,15 @@ where
             continue;
         }
 
-        // Clean up empty/incomplete layer directory if it exists
+        // Clean up an incomplete or unverified layer directory: empty, or left
+        // by an interrupted/unflushed earlier extraction (no completion marker).
         if layer_dir.exists() {
-            warn!(layer = %layer_id, "removing empty/incomplete layer directory");
+            warn!(layer = %layer_id, "removing incomplete or unverified layer directory");
             if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
                 warn!(layer = %layer_id, error = %e, "failed to remove incomplete layer directory");
             }
         }
+        let _ = std::fs::remove_file(layer_ok_marker(&layer_dir));
 
         info!(
             layer = %layer_id,
@@ -2085,6 +2129,8 @@ where
             total_size += size;
         }
 
+        newly_extracted.push(layer_dir);
+
         // Report progress after successful extraction
         progress(i + 1, total_layers, layer_id);
     }
@@ -2093,16 +2139,26 @@ where
     // for large images (gigabytes flushed through virtio-blk).
     progress(total_layers, total_layers, "syncing");
 
-    // Sync filesystem to ensure all layer data is persisted to the ext4 journal.
+    // Writeback barrier before anything marks these layers trustworthy.
     // Defense in depth: even though shutdown waits for acknowledgment (which also
     // syncs), we sync here because:
     // 1. Commands may complete and VM may exit before shutdown is called
     // 2. Protects against ungraceful termination (SIGKILL, host crash)
-    // 3. Empty layer directories cause "executable not found" errors that are
-    //    hard to diagnose - better to be safe than sorry
-    // SAFETY: sync() is always safe to call
-    unsafe {
-        libc::sync();
+    // 3. tar can exit cleanly while every page it dirtied later fails writeback
+    //    (a host out of disk surfaces exactly this way) — only an error-reporting
+    //    sync catches it, and a pull must FAIL then, not report done.
+    if let Err(sync_error) = sync_layer_writeback(root) {
+        for dir in &newly_extracted {
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_file(layer_ok_marker(dir));
+        }
+        return Err(sync_error);
+    }
+
+    // Markers last: a layer without one is re-pulled, never trusted.
+    for dir in &newly_extracted {
+        std::fs::write(layer_ok_marker(dir), "ok")
+            .map_err(|e| StorageError::new(format!("write layer completion marker: {}", e)))?;
     }
 
     // Build ImageInfo
@@ -2205,15 +2261,18 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let os = config_json["os"].as_str().unwrap_or("linux").to_string();
     let created = config_json["created"].as_str().map(String::from);
 
-    // Verify all layers exist and calculate total size
+    // Verify all layers are present AND verified (completion marker written
+    // after the pull's writeback barrier) and calculate total size. A layer dir
+    // that exists without its marker is an interrupted or unflushed extraction —
+    // trusting it is how a corrupted store kept "booting" after an out-of-disk
+    // pull — so the image re-pulls instead.
     let mut total_size = 0u64;
     for layer_digest in &layers {
         let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
         let layer_dir = root.join(LAYERS_DIR).join(layer_id);
-        if !layer_dir.exists() {
-            // Layer missing - image is incomplete, needs re-pull
+        if !is_layer_cached(&layer_dir) {
             // Clean up corrupt manifest to avoid repeated failures
-            warn!(layer = %layer_id, image = %image, "cached image has missing layer, cleaning up and will re-pull");
+            warn!(layer = %layer_id, image = %image, "cached image has a missing or unverified layer, cleaning up and will re-pull");
             let _ = std::fs::remove_file(&manifest_path);
             return Ok(None);
         }
@@ -2487,11 +2546,14 @@ impl OverlaySetup {
         // sandbox hosts generation, for one) hard-fails on the missing file.
         // Provide a default only when neither the image nor a previous session
         // supplies one: unlike resolv.conf this file is never overwritten, so
-        // image-provided copies and in-container edits stay untouched.
+        // image-provided copies and in-container edits stay untouched. "Supplies
+        // one" means actual name mappings — Ubuntu-derived images often ship an
+        // empty or comments-only /etc/hosts, and counting those left `localhost`
+        // unresolvable inside the container.
         let hosts_path = upper_etc.join("hosts");
         let image_has_hosts = lowerdirs
             .iter()
-            .any(|l| Path::new(l).join("etc/hosts").exists());
+            .any(|l| hosts_file_has_entries(&Path::new(l).join("etc/hosts")));
         if !image_has_hosts && !hosts_path.exists() {
             let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
             if let Err(e) = std::fs::write(&hosts_path, overlay_hosts_contents(hostname.trim())) {
@@ -2719,6 +2781,20 @@ fn overlay_hosts_contents(hostname: &str) -> String {
         hosts.push_str(&format!("127.0.1.1\t{}\n", hostname));
     }
     hosts
+}
+
+/// True when this /etc/hosts actually provides name mappings — at least one
+/// non-comment, non-blank line. An empty or comments-only file must not count
+/// as image-provided, or `localhost` never resolves in the container.
+fn hosts_file_has_entries(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|contents| {
+            contents
+                .lines()
+                .map(str::trim)
+                .any(|line| !line.is_empty() && !line.starts_with('#'))
+        })
+        .unwrap_or(false)
 }
 
 /// Prepare an overlay filesystem for a workload.
@@ -4296,6 +4372,18 @@ fn count_entries(path: &Path) -> Result<usize> {
     Ok(std::fs::read_dir(path)?.count())
 }
 
+/// Count only the directory entries in a directory.
+fn count_dir_entries(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    Ok(std::fs::read_dir(path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .count())
+}
+
 /// Convert an OCI platform string to its architecture component.
 ///
 /// # Examples
@@ -4987,6 +5075,54 @@ mod tests {
         b.setup_upper_layer(&[full_layer.display().to_string()])
             .unwrap();
         assert!(!b.upper_path.join("etc/hosts").exists());
+
+        // An EMPTY image /etc/hosts provides no mappings, so the default must
+        // still be written — otherwise `localhost` never resolves in-container.
+        let empty_layer = tmp.path().join("layer-empty");
+        std::fs::create_dir_all(empty_layer.join("etc")).unwrap();
+        std::fs::write(empty_layer.join("etc/hosts"), "").unwrap();
+        let b = builder("empty");
+        b.prepare_directories().unwrap();
+        b.setup_upper_layer(&[empty_layer.display().to_string()])
+            .unwrap();
+        let written = std::fs::read_to_string(b.upper_path.join("etc/hosts")).unwrap();
+        assert!(written.contains("127.0.0.1\tlocalhost"));
+
+        // Same for a comments-only file (Debian tooling ships these).
+        let comment_layer = tmp.path().join("layer-comments");
+        std::fs::create_dir_all(comment_layer.join("etc")).unwrap();
+        std::fs::write(comment_layer.join("etc/hosts"), "# static hosts\n\n").unwrap();
+        let b = builder("comments");
+        b.prepare_directories().unwrap();
+        b.setup_upper_layer(&[comment_layer.display().to_string()])
+            .unwrap();
+        let written = std::fs::read_to_string(b.upper_path.join("etc/hosts")).unwrap();
+        assert!(written.contains("127.0.0.1\tlocalhost"));
+    }
+
+    #[test]
+    fn layer_cache_trusts_only_marked_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("aabbccdd");
+
+        // Missing entirely: not cached.
+        assert!(!is_layer_cached(&layer));
+
+        // Non-empty but unverified — the exact state an interrupted or
+        // writeback-failed extraction leaves behind. Must NOT be trusted.
+        std::fs::create_dir_all(layer.join("bin")).unwrap();
+        assert!(!is_layer_cached(&layer));
+
+        // Marker present: cached.
+        std::fs::write(layer_ok_marker(&layer), "ok").unwrap();
+        assert!(is_layer_cached(&layer));
+        // The marker is a sibling of the layer dir, never inside it (layer
+        // dirs are overlay lowerdirs).
+        assert!(layer_ok_marker(&layer).parent() == layer.parent());
+
+        // Marker present but dir emptied: not cached.
+        std::fs::remove_dir_all(layer.join("bin")).unwrap();
+        assert!(!is_layer_cached(&layer));
     }
 
     #[test]
