@@ -795,6 +795,27 @@ fn image_bakeable(image: Option<&str>) -> bool {
     )
 }
 
+/// Build the bake's `machine start` argv, forwarding the run's `--proxy` /
+/// `--no-proxy` so the one-time init pull reaches the registry through the same
+/// proxy the outer run uses. Without this, a Smolfile with `init` steps pulls
+/// direct in the bake and times out on a proxy-only network.
+fn bake_start_args<'a>(
+    tmp: &'a str,
+    proxy: Option<&'a str>,
+    no_proxy: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut start = vec!["machine", "start", "--name", tmp];
+    if let Some(p) = proxy {
+        start.push("--proxy");
+        start.push(p);
+    }
+    if let Some(n) = no_proxy {
+        start.push("--no-proxy");
+        start.push(n);
+    }
+    start
+}
+
 /// Bake `image + init` into a cached `.smolmachine` (or reuse an existing one) and
 /// return its path. Runs the well-tested `machine create/start/stop` + `pack create
 /// --from-vm` flow as subprocesses of this same binary: create a temp machine from
@@ -806,6 +827,8 @@ fn ensure_init_layer(
     smolfile: Option<&Path>,
     rebuild: bool,
     digest: Option<&str>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> smolvm::Result<PathBuf> {
     // The bake here only ever receives a registry image: `ensure_init_layer` is
     // gated on `image_bakeable()` (local archives/dirs take the direct path),
@@ -920,7 +943,12 @@ fn ensure_init_layer(
 
         println!("  · pulling image and running init...");
         run_smolvm(&exe, &create)?;
-        run_smolvm(&exe, &["machine", "start", "--name", &tmp])?;
+        // The image pull happens at `start`; forward the run's proxy so the
+        // bake reaches the registry through a corporate/loopback proxy too —
+        // otherwise a Smolfile with `init` steps pulls direct and times out
+        // even when the outer run was given --proxy.
+        let start = bake_start_args(&tmp, proxy, no_proxy);
+        run_smolvm(&exe, &start)?;
         run_smolvm(&exe, &["machine", "stop", "--name", &tmp])?;
         println!("  · snapshotting...");
         run_smolvm(
@@ -1234,6 +1262,8 @@ impl RunCmd {
                 self.smolfile.as_deref(),
                 self.rebuild_init_cache,
                 resolved_digest.as_deref(),
+                self.proxy_opts.proxy().as_deref(),
+                self.proxy_opts.no_proxy().as_deref(),
             )?;
             // The real workload: CLI trailing args win, else the Smolfile's
             // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
@@ -1542,8 +1572,8 @@ impl RunCmd {
                 &mut client,
                 img,
                 effective_platform.as_deref(),
-                self.proxy_opts.proxy(),
-                self.proxy_opts.no_proxy(),
+                self.proxy_opts.proxy().as_deref(),
+                self.proxy_opts.no_proxy().as_deref(),
             ) {
                 Ok(info) => Some(info),
                 Err(e) if !params.net => {
@@ -1981,6 +2011,41 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bake_start_forwards_proxy_when_set() {
+        // No proxy: plain start.
+        assert_eq!(
+            super::bake_start_args("t", None, None),
+            ["machine", "start", "--name", "t"]
+        );
+        // Proxy only.
+        assert_eq!(
+            super::bake_start_args("t", Some("http://host.smolvm.internal:8118"), None),
+            [
+                "machine",
+                "start",
+                "--name",
+                "t",
+                "--proxy",
+                "http://host.smolvm.internal:8118"
+            ]
+        );
+        // Proxy + no_proxy.
+        assert_eq!(
+            super::bake_start_args("t", Some("http://p:3128"), Some("localhost,.internal")),
+            [
+                "machine",
+                "start",
+                "--name",
+                "t",
+                "--proxy",
+                "http://p:3128",
+                "--no-proxy",
+                "localhost,.internal"
+            ]
+        );
+    }
+
     #[test]
     fn cp_mode_parses_common_octal_forms_and_rejects_garbage() {
         assert_eq!(super::parse_octal_mode("644").unwrap(), 0o644);
@@ -3130,24 +3195,30 @@ impl CreateCmd {
         // `manifest` is moved into `params`; the disks are seeded from them after
         // extraction below, or the machine boots the bare agent-rootfs with no
         // /bin/sh (mirrors pack_run + the serve API create path).
-        let vm_seed: Option<(Option<String>, Option<String>, Option<u64>)> =
-            if manifest.mode == smolvm_pack::format::PackMode::Vm {
-                Some((
-                    manifest
-                        .assets
-                        .overlay_template
-                        .as_ref()
-                        .map(|t| t.path.clone()),
-                    manifest
-                        .assets
-                        .storage_template
-                        .as_ref()
-                        .map(|t| t.path.clone()),
-                    manifest.assets.overlay_logical_size,
-                ))
-            } else {
-                None
-            };
+        struct VmModeSeed {
+            overlay_template: Option<String>,
+            storage_template: Option<String>,
+            overlay_logical_size: Option<u64>,
+            storage_logical_size: Option<u64>,
+        }
+        let vm_seed = if manifest.mode == smolvm_pack::format::PackMode::Vm {
+            Some(VmModeSeed {
+                overlay_template: manifest
+                    .assets
+                    .overlay_template
+                    .as_ref()
+                    .map(|t| t.path.clone()),
+                storage_template: manifest
+                    .assets
+                    .storage_template
+                    .as_ref()
+                    .map(|t| t.path.clone()),
+                overlay_logical_size: manifest.assets.overlay_logical_size,
+                storage_logical_size: manifest.assets.storage_logical_size,
+            })
+        } else {
+            None
+        };
 
         // Resolve the canonical path for storage in VmRecord.
         let canonical_path = sidecar_path
@@ -3323,19 +3394,36 @@ impl CreateCmd {
             }
 
             println!("Extracting .smolmachine assets...");
-            let result = smolvm_pack::extract::extract_sidecar(
-                sidecar_path,
-                &cache_dir,
-                &footer,
-                false,
-                false,
-            )
-            .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()));
+            let result = if smolvm_pack::extract::shared_extract_enabled() {
+                #[cfg(target_os = "linux")]
+                {
+                    let lease = smolvm::artifact_cache::materialize_shared_pack_lease(
+                        sidecar_path,
+                        &footer,
+                        &cache_dir,
+                        false,
+                    )
+                    .map_err(|e| smolvm::Error::agent("extract sidecar (shared)", e.to_string()))?;
+                    Ok((lease.shared_dir, Some(lease.artifact_sha256)))
+                }
+                #[cfg(not(target_os = "linux"))]
+                unreachable!("shared pack extraction is Linux-only")
+            } else {
+                smolvm_pack::extract::extract_sidecar(
+                    sidecar_path,
+                    &cache_dir,
+                    &footer,
+                    false,
+                    false,
+                )
+                .map(|()| (cache_dir.clone(), None::<String>))
+                .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))
+            };
             // Detach unconditionally: extraction mounts the case-sensitive volume on
             // macOS even when it later fails, so the detach must run on both success
             // and failure paths to honor the "mounted iff running" invariant.
             smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-            result?;
+            let (pack_content_dir, artifact_sha256) = result?;
 
             // VM-mode pack: seed this machine's overlay+storage disks from the
             // packed templates so a start boots the source VM's rootfs rather than
@@ -3345,7 +3433,7 @@ impl CreateCmd {
             // (Writing the resized copy onto `manager.overlay_path()` — the default
             // `.qcow2` — handed the guest raw bytes named `.qcow2`, the /bin/sh-missing
             // bug's disk counterpart.)
-            if let Some((overlay_template, storage_template, overlay_logical_size)) = &vm_seed {
+            if let Some(seed) = &vm_seed {
                 let disk_dir = manager
                     .storage_path()
                     .parent()
@@ -3353,12 +3441,16 @@ impl CreateCmd {
                     .unwrap_or_else(|| smolvm::agent::vm_data_dir(&name_for_layers));
                 smolvm::storage::seed_vm_mode_disks(
                     &disk_dir,
-                    &cache_dir,
-                    overlay_template.as_deref(),
-                    storage_template.as_deref(),
-                    *overlay_logical_size,
-                    params.overlay_gb,
-                    params.storage_gb,
+                    &pack_content_dir,
+                    smolvm::storage::VmModeDiskSeedSpec {
+                        artifact_sha256: artifact_sha256.as_deref(),
+                        overlay_template: seed.overlay_template.as_deref(),
+                        storage_template: seed.storage_template.as_deref(),
+                        overlay_logical_size: seed.overlay_logical_size,
+                        storage_logical_size: seed.storage_logical_size,
+                        overlay_gb: params.overlay_gb,
+                        storage_gb: params.storage_gb,
+                    },
                 )
                 .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
             }
@@ -3441,13 +3533,17 @@ impl StartCmd {
             vm_common::ForkLaunch::default()
         };
         match vm_common::start_vm_named(
-            &name, proxy, no_proxy, /* from_snapshot */ false, fork,
+            &name,
+            proxy.as_deref(),
+            no_proxy.as_deref(),
+            /* from_snapshot */ false,
+            fork,
         ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
                 // With an explicit --name, VmNotFound is a real error.
-                vm_common::start_vm_default(proxy, no_proxy)
+                vm_common::start_vm_default(proxy.as_deref(), no_proxy.as_deref())
             }
             Err(e) => Err(e),
         }
