@@ -125,6 +125,24 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// likely already torn down — safe to proceed with SIGTERM.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
 
+/// Default read window for a guest-side flatten (overlay merge + tar of tens
+/// of GiB to the guest disk). The guest stays quiet while tar runs, so the
+/// window must cover the whole tar, not just the mount. Pack size is
+/// unbounded, so a fixed window cannot cover every pack — raise it for very
+/// large packs with `SMOLVM_FLATTEN_TIMEOUT_SECS`.
+const FLATTEN_TIMEOUT_DEFAULT_SECS: u64 = 900;
+
+/// Resolve the flatten read window, honoring `SMOLVM_FLATTEN_TIMEOUT_SECS`
+/// (seconds, must be > 0). Falls back to [`FLATTEN_TIMEOUT_DEFAULT_SECS`].
+fn flatten_timeout() -> Duration {
+    let secs = std::env::var("SMOLVM_FLATTEN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(FLATTEN_TIMEOUT_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
 // ============================================================================
 // I/O Constants
 // ============================================================================
@@ -434,6 +452,10 @@ pub struct RunConfig {
     /// Run as an unprivileged container (restricted caps, ro cgroup, no extra
     /// tmpfs). Default false = "VM-grade" (the microVM is the boundary).
     pub unprivileged: bool,
+    /// Remote-volume mount script to run inside the workload container before
+    /// its (image-resolved) command. Set by the workload launcher; the agent
+    /// wraps the resolved command so the image's real entrypoint still runs.
+    pub remote_volume_mount: Option<String>,
 }
 
 impl RunConfig {
@@ -455,7 +477,14 @@ impl RunConfig {
             persistent_overlay_id: None,
             stdin: None,
             unprivileged: false,
+            remote_volume_mount: None,
         }
+    }
+
+    /// Set the remote-volume mount script run inside the workload container.
+    pub fn with_remote_volume_mount(mut self, script: Option<String>) -> Self {
+        self.remote_volume_mount = script;
+        self
     }
 
     /// Set environment variables.
@@ -1182,6 +1211,12 @@ impl AgentClient {
     /// Missing or empty entries are dropped guest-side, so callers can append a
     /// container overlay's upper dir without probing it first.
     pub fn flatten_layers(&mut self, lowerdirs: &[String], output: &str) -> Result<()> {
+        // Merging the lower dirs and tarring the result runs for minutes on a
+        // large base, and the agent sends nothing in between — far past the
+        // default read timeout, which surfaces as a spurious EAGAIN. Widen the
+        // window for the whole flatten, as the file-read paths do for large
+        // transfers. Configurable because pack size is unbounded.
+        let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
         let resp = self.request(&AgentRequest::FlattenLayers {
             lowerdirs: lowerdirs.to_vec(),
             output: output.to_string(),
@@ -1553,6 +1588,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: config.stdin,
             background: false,
+            remote_volume_mount: None,
         })?;
 
         expect_completed(resp, "run command")
@@ -1579,6 +1615,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: true,
+            remote_volume_mount: None,
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -1622,6 +1659,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
+            remote_volume_mount: None,
         })?;
 
         collect_exec_events(self, "run streaming", on_event)
@@ -1659,6 +1697,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
+                remote_volume_mount: None,
             },
             tty,
             "run interactive",
@@ -1697,6 +1736,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
+            remote_volume_mount: config.remote_volume_mount,
         })?;
         let resp = loop {
             match self.receive()? {
@@ -1932,6 +1972,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
+                remote_volume_mount: None,
             },
             input,
             on_output,
@@ -3472,5 +3513,54 @@ mod term_default_tests {
         let env = with_term_default(vec![("A".to_string(), "b".to_string())], false);
         assert_eq!(term_of(&env), None);
         assert_eq!(env.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod flatten_timeout_tests {
+    use super::*;
+
+    // `set_var`/`remove_var` are process-global and the tests run in parallel
+    // threads; serialize them so one test's override can't bleed into another.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env(value: Option<&str>, f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        match value {
+            Some(v) => std::env::set_var("SMOLVM_FLATTEN_TIMEOUT_SECS", v),
+            None => std::env::remove_var("SMOLVM_FLATTEN_TIMEOUT_SECS"),
+        }
+        f();
+        std::env::remove_var("SMOLVM_FLATTEN_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn defaults_to_900_seconds_without_env() {
+        with_env(None, || {
+            assert_eq!(
+                flatten_timeout(),
+                Duration::from_secs(FLATTEN_TIMEOUT_DEFAULT_SECS)
+            );
+        });
+    }
+
+    #[test]
+    fn honors_a_valid_override() {
+        with_env(Some("3600"), || {
+            assert_eq!(flatten_timeout(), Duration::from_secs(3600));
+        });
+    }
+
+    #[test]
+    fn rejects_zero_unparsable_and_empty_values() {
+        for bad in ["0", "-5", "abc", "", "  "] {
+            with_env(Some(bad), || {
+                assert_eq!(
+                    flatten_timeout(),
+                    Duration::from_secs(FLATTEN_TIMEOUT_DEFAULT_SECS),
+                    "value {bad:?} must fall back to the default"
+                );
+            });
+        }
     }
 }

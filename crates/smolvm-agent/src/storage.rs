@@ -506,23 +506,43 @@ pub fn repair_boot_volume_mounts() -> Result<()> {
     Ok(())
 }
 
+/// True when a user mount target claims /workspace itself or anything beneath it.
+///
+/// Compares path *components*, not string prefixes: `/workspaces/project` begins
+/// with the characters of `/workspace` but is a sibling rather than a child, and
+/// must not suppress the fallback. Slash-normalized so a trailing `/` on the
+/// user's target still matches.
+fn claims_workspace(target: &str) -> bool {
+    Path::new(target.trim_end_matches('/')).starts_with(paths::WORKSPACE_GUEST_PATH)
+}
+
 /// Add the /storage/workspace → /workspace fallback bind mount to an OCI spec,
-/// unless a user-provided volume already claims /workspace.
+/// unless a user-provided volume already claims /workspace or a path under it.
 ///
 /// The fallback exposes the storage disk's workspace directory inside containers
 /// so that persistent files written to /workspace survive across VM restarts.
-/// It must be skipped when the user provides `-v host:/workspace` to avoid
-/// silently overwriting their virtiofs mount (which comes earlier in the spec).
-///
-/// Mount target comparison is slash-normalized to handle trailing slashes.
+/// It must be skipped whenever the user has mounted at or below /workspace, to
+/// avoid silently overwriting their virtiofs mount (which comes earlier in the
+/// spec). Binding /workspace on top of a user mount at, say, /workspace/project
+/// replaces the parent directory the nested mount hangs from: the mount stays in
+/// the namespace and is listed in /proc/self/mountinfo, but no longer resolves by
+/// path, so the user sees an empty directory instead of their files.
 pub fn add_workspace_fallback(spec: &mut OciSpec, mounts: &[(String, String, bool)]) {
     let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
     if !workspace_src.exists() {
         return;
     }
-    let user_owns_workspace = mounts
-        .iter()
-        .any(|(_, path, _)| path.trim_end_matches('/') == paths::WORKSPACE_GUEST_PATH);
+    add_workspace_fallback_from(spec, mounts, &workspace_src);
+}
+
+/// Core of [`add_workspace_fallback`], with the fallback source injected so the
+/// rule can be exercised without a real /storage/workspace on the test host.
+fn add_workspace_fallback_from(
+    spec: &mut OciSpec,
+    mounts: &[(String, String, bool)],
+    workspace_src: &Path,
+) {
+    let user_owns_workspace = mounts.iter().any(|(_, path, _)| claims_workspace(path));
     if !user_owns_workspace {
         spec.add_bind_mount(
             &workspace_src.to_string_lossy(),
@@ -851,6 +871,38 @@ const ARCHIVE_CONFIG_FILE: &str = "config.json";
 /// Marker written once a flatten completes, so restarts reuse it.
 const ARCHIVE_EXTRACTED_MARKER: &str = ".extracted";
 
+/// Env var to override where archive staging spills its scratch. Point it at a
+/// mounted volume with more room than the storage disk, or elsewhere entirely.
+const ARCHIVE_SCRATCH_DIR_ENV: &str = "SMOLVM_ARCHIVE_SCRATCH_DIR";
+
+/// Scratch space for archive staging. Defaults to the storage disk because the
+/// guest's `/tmp` is a tmpfs sized from VM RAM, so multi-GiB scratch — crane's
+/// stdin spool, the decompressed copy of a compressed archive — must land on
+/// the machine's disk instead: a 10 GB `docker save` archive would otherwise
+/// fill `/tmp` while `/storage` sits idle (#955). Precedence:
+///   1. `SMOLVM_ARCHIVE_SCRATCH_DIR`, when set to a dir that can be created;
+///   2. `/storage/tmp`, the storage disk;
+///   3. the default temp dir, when the storage disk is absent (host-side unit
+///      tests).
+fn archive_scratch_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var(ARCHIVE_SCRATCH_DIR_ENV) {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            let p = PathBuf::from(dir);
+            if std::fs::create_dir_all(&p).is_ok() {
+                return p;
+            }
+            warn!(dir = %p.display(), "{ARCHIVE_SCRATCH_DIR_ENV} unusable, falling back to the storage disk");
+        }
+    }
+    let dir = Path::new(STORAGE_ROOT).join("tmp");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        dir
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 /// If `packed_dir` is a staged local image archive (it contains `archive.tar`),
 /// flatten it once into a rootfs on the storage disk and return that directory
 /// (holding `0000_rootfs/` + `config.json`). Returns `None` for an ordinary
@@ -951,7 +1003,7 @@ where
     // streaming decompressor into a subprocess's stdin. The guest ships no zstd
     // tool, so decompression is done in-process.
     let mut reader = decompress_layer_reader(file)?;
-    let mut tmp = tempfile::NamedTempFile::new()
+    let mut tmp = tempfile::NamedTempFile::new_in(archive_scratch_dir())
         .map_err(|e| StorageError::new(format!("failed to create temp file: {e}")))?;
     copy_with_progress(
         &mut reader,
@@ -1137,6 +1189,10 @@ where
     let mut crane = Command::new("crane");
     crane
         .args(["export", "-", "-"])
+        // crane spools the stdin tarball to a temp file before flattening it;
+        // point that at the storage disk so an archive bigger than the RAM-sized
+        // /tmp tmpfs doesn't fail with a full filesystem (#955).
+        .env("TMPDIR", archive_scratch_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Capture (don't discard) crane's stderr so a failure reports the REAL
@@ -3086,31 +3142,31 @@ pub fn run_command(
         let workdir_str = workdir.unwrap_or("/");
         let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
             .map_err(StorageError::new)?;
-        let mut spec = OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
-        spec.add_gpu_devices_if_available();
 
-        // Add virtiofs bind mounts to OCI spec
-        for (tag, container_path, read_only) in mounts {
-            let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
-            spec.add_bind_mount(
-                &virtiofs_mount.to_string_lossy(),
-                container_path,
-                *read_only,
-            );
-        }
-
-        add_workspace_fallback(&mut spec, mounts);
-        add_storage_fallback(&mut spec, mounts, unprivileged);
-
-        // Forward SSH agent into the container if enabled at boot.
-        crate::ssh_agent::inject_into_container(&mut spec);
-        crate::publish_socket::inject_into_container(&mut spec);
-        crate::forkpoint::inject_into_container(&mut spec);
-        crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
-
-        // Write config.json to bundle
-        spec.write_to(&bundle_path)
-            .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
+        // Build an OCI spec for `cmd` sharing this overlay's rootfs, virtiofs
+        // mounts, workspace/storage fallbacks, and the same injections. Used for
+        // both the one-shot exec spec and the keep-alive spec so a container the
+        // execs join has the identical mount view as the exec itself.
+        let build_spec = |cmd: &[String], spec_env: &[(String, String)]| {
+            let mut spec = OciSpec::new(cmd, spec_env, workdir_str, false, &identity, unprivileged);
+            spec.add_gpu_devices_if_available();
+            for (tag, container_path, read_only) in mounts {
+                let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+                spec.add_bind_mount(
+                    &virtiofs_mount.to_string_lossy(),
+                    container_path,
+                    *read_only,
+                );
+            }
+            add_workspace_fallback(&mut spec, mounts);
+            add_storage_fallback(&mut spec, mounts, unprivileged);
+            // Forward SSH agent + published sockets + forkpoint if enabled at boot.
+            crate::ssh_agent::inject_into_container(&mut spec);
+            crate::publish_socket::inject_into_container(&mut spec);
+            crate::forkpoint::inject_into_container(&mut spec);
+            crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
+            spec
+        };
 
         // If a main workload container is running for this overlay, join it
         // via crun exec instead of creating a fresh isolated container.
@@ -3120,10 +3176,41 @@ pub fn run_command(
             return result;
         }
 
-        // Generate unique container ID for this execution
-        let container_id = generate_container_id();
+        // Persistent overlay with no keep-alive container. This is the fork-clone
+        // path: the clone's restored keep-alive was reaped as stale during the
+        // remount above, and without re-establishing one every exec would pay a
+        // fresh container (~seconds) instead of a `crun exec` join (~ms).
+        // Establish a keep-alive (PID 1 = `tail -f /dev/null`) sharing this
+        // overlay's mounts, persist its id so subsequent execs join it, then
+        // exec the command INTO it.
+        if let Some(overlay_id) = persistent_overlay_id {
+            let keepalive = [
+                "tail".to_string(),
+                "-f".to_string(),
+                "/dev/null".to_string(),
+            ];
+            match establish_keepalive_container(
+                &build_spec(&keepalive, env),
+                &bundle_path,
+                overlay_id,
+            ) {
+                Ok(cid) => {
+                    let result =
+                        run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+                    let _ = mounted_paths;
+                    return result;
+                }
+                Err(e) => {
+                    warn!(error = %e, "keep-alive main container setup failed; running in a fresh container")
+                }
+            }
+        }
 
-        // Run with crun
+        // Ephemeral overlay (or keep-alive setup failed): one-shot fresh container.
+        let spec = build_spec(command, env);
+        spec.write_to(&bundle_path)
+            .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
+        let container_id = generate_container_id();
         let result = run_with_crun(
             &bundle_path,
             &container_id,
@@ -3508,6 +3595,65 @@ fn detach_mount(path: &Path) {
 ///
 /// This uses `crun run` which creates, starts, waits, and deletes the container
 /// in a single operation. Stdout and stderr are captured.
+/// Establish a long-lived keep-alive main container for a persistent overlay so
+/// that this and every subsequent exec joins it via `crun exec` (~ms) instead of
+/// launching a fresh container (~seconds). `spec` is the keep-alive OCI spec
+/// (PID 1 = `tail -f /dev/null`) already carrying this overlay's rootfs, mounts,
+/// and injections; it is written into `bundle_dir`. Returns the new container id,
+/// persisted under `persistent-<overlay_id>` so `resolve_main_container` finds it.
+///
+/// This mirrors `crate::ensure_main_container` (the machine-start / interactive
+/// path) for the fork-clone case: a clone's restored keep-alive is reaped as
+/// stale on the first exec's remount, and without re-establishing one here every
+/// clone exec would one-shot a fresh container.
+fn establish_keepalive_container(
+    spec: &OciSpec,
+    bundle_dir: &Path,
+    overlay_id: &str,
+) -> Result<String> {
+    spec.write_to(bundle_dir)
+        .map_err(|e| StorageError::new(format!("failed to write keep-alive OCI spec: {}", e)))?;
+
+    let container_id = generate_container_id();
+
+    let create = CrunCommand::create(bundle_dir, &container_id)
+        .output()
+        .map_err(|e| StorageError::new(format!("keep-alive crun create failed: {}", e)))?;
+    if !create.status.success() {
+        return Err(StorageError::new(format!(
+            "keep-alive crun create failed: {}",
+            String::from_utf8_lossy(&create.stderr).trim()
+        )));
+    }
+
+    let start = CrunCommand::start(&container_id)
+        .output()
+        .map_err(|e| StorageError::new(format!("keep-alive crun start failed: {}", e)))?;
+    if !start.status.success() {
+        let _ = CrunCommand::delete(&container_id, true).output();
+        return Err(StorageError::new(format!(
+            "keep-alive crun start failed: {}",
+            String::from_utf8_lossy(&start.stderr).trim()
+        )));
+    }
+
+    let workload_id = format!("persistent-{}", overlay_id);
+    if let Err(e) = std::fs::write(
+        paths::main_container_id_path(&workload_id),
+        container_id.as_bytes(),
+    ) {
+        let _ = CrunCommand::kill(&container_id, "SIGKILL").status();
+        let _ = CrunCommand::delete(&container_id, true).output();
+        return Err(StorageError::new(format!(
+            "failed to persist keep-alive container id: {}",
+            e
+        )));
+    }
+
+    info!(container_id = %container_id, overlay_id = %overlay_id, "established keep-alive main container for clone exec");
+    Ok(container_id)
+}
+
 /// Join a running container via `crun exec` (non-interactive).
 fn run_exec_in_container(
     container_id: &str,
@@ -4432,6 +4578,83 @@ mod tests {
     use smolvm_oci_layer::{classify_layer_entry, jailed_join, LayerEntry};
     use std::sync::{Mutex, OnceLock};
 
+    /// The /workspace fallback is bound on top of the user's mounts, so it must
+    /// stand down for anything at or below /workspace — not only an exact
+    /// `-v host:/workspace`. A user mount at /workspace/project that keeps the
+    /// fallback ends up shadowed by its own parent: still listed in
+    /// /proc/self/mountinfo, but unreachable by path.
+    ///
+    /// The sibling /workspaces/project is the trap: it shares the string prefix
+    /// but is not under /workspace, and must still get the fallback.
+    #[test]
+    fn a_user_mount_below_workspace_suppresses_the_fallback() {
+        let fallback_src = std::path::Path::new("/storage/workspace");
+        let user_source = "/host/source".to_string();
+
+        // (user mount target, mount destinations expected in the spec afterwards)
+        let cases: &[(&str, &[&str])] = &[
+            // At /workspace: fallback suppressed, only the user's mount.
+            ("/workspace", &["/workspace"]),
+            // Below /workspace: fallback suppressed — the bug this guards.
+            ("/workspace/project", &["/workspace/project"]),
+            // Trailing slash is the same claim.
+            ("/workspace/project/", &["/workspace/project/"]),
+            // Sibling that merely shares the prefix: fallback still applies.
+            (
+                "/workspaces/project",
+                &["/workspaces/project", "/workspace"],
+            ),
+            // Unrelated targets: fallback still applies.
+            ("/mnt/project", &["/mnt/project", "/workspace"]),
+            (
+                "/opt/workspace/project",
+                &["/opt/workspace/project", "/workspace"],
+            ),
+        ];
+
+        for (target, expected) in cases {
+            let mut spec = OciSpec::new(
+                &[],
+                &[],
+                "/",
+                false,
+                &crate::oci::ProcessIdentity::root(),
+                false,
+            );
+            spec.mounts.clear();
+            let mounts = vec![(user_source.clone(), (*target).to_string(), false)];
+            for (source, destination, read_only) in &mounts {
+                spec.add_bind_mount(source, destination, *read_only);
+            }
+
+            add_workspace_fallback_from(&mut spec, &mounts, fallback_src);
+
+            let got: Vec<&str> = spec.mounts.iter().map(|m| m.destination.as_str()).collect();
+            assert_eq!(
+                got, *expected,
+                "user mount at {target} produced the wrong mount set"
+            );
+        }
+    }
+
+    /// With no user mount in play the fallback must still be added, otherwise
+    /// /workspace stops surviving VM restarts.
+    #[test]
+    fn no_user_mount_still_gets_the_workspace_fallback() {
+        let mut spec = OciSpec::new(
+            &[],
+            &[],
+            "/",
+            false,
+            &crate::oci::ProcessIdentity::root(),
+            false,
+        );
+        spec.mounts.clear();
+        add_workspace_fallback_from(&mut spec, &[], std::path::Path::new("/storage/workspace"));
+        let got: Vec<&str> = spec.mounts.iter().map(|m| m.destination.as_str()).collect();
+        assert_eq!(got, vec!["/workspace"]);
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -5015,6 +5238,35 @@ mod tests {
         );
 
         std::env::remove_var(guest_env::DNS);
+    }
+
+    #[test]
+    fn archive_scratch_dir_honors_env_override() {
+        let _guard = env_lock().lock().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        // A dir that doesn't exist yet, to prove it's created on demand.
+        let target = base.path().join("scratch");
+        std::env::set_var(ARCHIVE_SCRATCH_DIR_ENV, &target);
+
+        assert_eq!(archive_scratch_dir(), target);
+        assert!(target.is_dir(), "override dir should be created");
+
+        std::env::remove_var(ARCHIVE_SCRATCH_DIR_ENV);
+    }
+
+    #[test]
+    fn archive_scratch_dir_ignores_blank_override() {
+        // A blank/whitespace override is treated as unset, not as "use CWD".
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var(ARCHIVE_SCRATCH_DIR_ENV, "   ");
+
+        // Without a storage disk on the host, this falls through to the OS temp
+        // dir — never the override, never an empty path.
+        let dir = archive_scratch_dir();
+        assert!(dir.is_absolute() && dir.is_dir());
+        assert_ne!(dir.as_os_str(), "   ");
+
+        std::env::remove_var(ARCHIVE_SCRATCH_DIR_ENV);
     }
 
     #[test]
