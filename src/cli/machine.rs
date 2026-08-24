@@ -1337,7 +1337,18 @@ impl RunCmd {
             .run();
         }
 
-        let mut mounts = HostMount::parse(&params.volume)?;
+        // Remote volumes are mounted inside the guest by the agent, so peel them
+        // off before the host-directory parse, which would reject an `s3://`
+        // source as a missing directory.
+        let (host_volume_specs, remote_volumes) =
+            smolvm::remote_volume::split_specs(&params.volume)?;
+        let mut mounts = HostMount::parse(&host_volume_specs)?;
+        if !remote_volumes.is_empty() && !params.net {
+            return Err(Error::config(
+                "machine run",
+                "remote volumes need network access to reach the bucket: add --net",
+            ));
+        }
         let ports = params.port.clone();
         PortMapping::check_duplicates(&ports)
             .map_err(|e| smolvm::Error::config("validate ports", e))?;
@@ -1717,6 +1728,10 @@ impl RunCmd {
                 &env,
                 params.workdir.as_deref(),
             );
+            // Credentials and endpoint come from the workload's own env, the
+            // same place every AWS SDK reads them, so a remote volume needs no
+            // configuration beyond the `-v` spec and the usual variables.
+            let s3_volumes = smolvm::remote_volume::to_s3_volumes(&remote_volumes, &defaults.env);
             if self.detach {
                 // Start the main workload container first. If this fails, the
                 // VM is stopped and no DB record is written — a retry won't
@@ -1728,7 +1743,8 @@ impl RunCmd {
                         .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings.clone())
                         .with_persistent_overlay(Some(vm_name.clone()))
-                        .with_unprivileged(self.unprivileged);
+                        .with_unprivileged(self.unprivileged)
+                        .with_s3_volumes(s3_volumes.clone());
                     client.run_container_detached(run_config)?;
                 }
 
@@ -1843,7 +1859,8 @@ impl RunCmd {
                         .with_timeout(self.timeout)
                         .with_tty(tty)
                         .with_persistent_overlay(Some(vm_name.clone()))
-                        .with_unprivileged(self.unprivileged);
+                        .with_unprivileged(self.unprivileged)
+                        .with_s3_volumes(s3_volumes.clone());
                     client.run_interactive(config)?
                 } else {
                     let config = RunConfig::new(img, command)
@@ -1853,7 +1870,8 @@ impl RunCmd {
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
                         .with_persistent_overlay(Some(vm_name.clone()))
-                        .with_unprivileged(self.unprivileged);
+                        .with_unprivileged(self.unprivileged)
+                        .with_s3_volumes(s3_volumes.clone());
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
@@ -2747,12 +2765,24 @@ impl ExecCmd {
             // Fork clones address the golden's inherited overlay; ordinary
             // machines use their own name.
             let overlay_owner = persistent_overlay_owner_for_record(&name, record.as_ref());
+            // An exec may be what establishes the workload container — the
+            // machine's command exited, or the image's own default was
+            // short-lived — and that container is where the mount lives. Carry
+            // the machine's volumes so the bucket is in whichever container
+            // serves this session, not only when a long-running workload
+            // happened to survive.
+            let exec_s3_volumes = record
+                .as_ref()
+                .map(|r| smolvm::remote_volume::to_s3_volumes(&r.remote_volumes, &r.env))
+                .unwrap_or_default();
             if self.detach {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env)
                     .with_workdir(defaults.workdir)
                     .with_user(defaults.user)
                     .with_mounts(mount_bindings)
+                    .with_s3_volumes(exec_s3_volumes.clone())
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner));
                 let pid = client.run_background(config)?;
                 println!("{pid}");
@@ -2766,6 +2796,7 @@ impl ExecCmd {
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner.clone()));
                 let exit_code = client.run_interactive(config)?;
                 std::process::exit(exit_code);
@@ -2778,6 +2809,7 @@ impl ExecCmd {
                     .with_user(defaults.user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner.clone()));
                 let mut printer = ExecEventPrinter::default();
                 client.run_streaming_with(config, |event| printer.handle(event))?;
@@ -2790,6 +2822,7 @@ impl ExecCmd {
                 .with_user(defaults.user)
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
+                .with_s3_volumes(exec_s3_volumes.clone())
                 .with_persistent_overlay(Some(overlay_owner));
             let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
@@ -2966,12 +2999,11 @@ pub struct CreateCmd {
     pub overlay: Option<u64>,
 
     /// Mount host directory (can be used multiple times). Also accepts
-    /// remote sources mounted inside the guest via rclone on every start:
+    /// S3-compatible object storage, mounted inside the guest on every start:
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
     /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
-    /// for R2/MinIO; anonymous without them) or any raw rclone remote,
-    /// e.g. `:sftp,host=example.com,user=me:/srv:/data`. The image must
-    /// provide `rclone` and `fusermount3`.
+    /// for R2/MinIO; anonymous without them). Nothing is required of the
+    /// image: the agent performs the mount itself.
     #[arg(short = 'v', long = "volume", value_name = "HOST|REMOTE:GUEST[:ro]")]
     pub volume: Vec<String>,
 

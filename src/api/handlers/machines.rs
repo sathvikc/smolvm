@@ -407,7 +407,7 @@ pub async fn create_machine(
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
-    // Split remote volumes (s3:// or rclone-remote sources) from host mounts,
+    // Split remote volumes (`s3://` sources) from host mounts,
     // mirroring the CLI's -v handling, then validate the host mount paths.
     let mut remote_volumes = Vec::new();
     let mut host_mount_specs: Vec<crate::api::types::MountSpec> = Vec::new();
@@ -1238,14 +1238,7 @@ pub async fn start_machine(
         // Remote volumes mount inside the workload container; build the mount
         // script here and let the agent run it ahead of the image-resolved
         // command, so a service image's own entrypoint is preserved.
-        let remote_volume_mount = if record.remote_volumes.is_empty() {
-            None
-        } else {
-            Some(
-                crate::remote_volume::mount_script(&record.remote_volumes, &env)
-                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
-            )
-        };
+        let s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, &env);
         let workdir = record.workdir.clone();
         let user = record.user.clone();
         let mounts_config = {
@@ -1315,7 +1308,7 @@ pub async fn start_machine(
                 .with_user(user)
                 .with_mounts(mounts_config)
                 .with_persistent_overlay(Some(overlay_id))
-                .with_remote_volume_mount(remote_volume_mount);
+                .with_s3_volumes(s3_volumes);
             c.run_container_detached(config).map(|_| ())
         })
         .await;
