@@ -592,8 +592,9 @@ pub struct CreateMachineRequest {
     /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,
-    /// Path to a .smolmachine sidecar file. Creates the machine from pre-packed
-    /// layers instead of pulling from a registry. Mutually exclusive with `image`.
+    /// Path to a `.smolmachine` or `.smolcheckpoint` artifact. Creates from
+    /// pre-packed layers or restores the artifact's captured live state.
+    /// Mutually exclusive with `image`.
     #[serde(default)]
     pub from: Option<String>,
     /// Registry reference to a .smolmachine artifact (e.g., "myapp:v1").
@@ -897,6 +898,11 @@ pub struct ForkRequest {
     /// Name for the new clone machine.
     #[schema(example = "clone-1")]
     pub name: String,
+    /// Materialize the restored clone as a new checkpoint source so it can be
+    /// forked again. This pays one eager guest-memory copy at clone boot;
+    /// descendants remain copy-on-write.
+    #[serde(default)]
+    pub forkable: bool,
     /// Pin the clone's inbound port forwards. Without this, the golden's
     /// forwards are remapped to freshly-allocated host ports so the clone does
     /// not collide with the still-running golden or sibling clones.

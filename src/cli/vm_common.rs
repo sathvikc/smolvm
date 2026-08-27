@@ -796,6 +796,7 @@ pub struct ForkVmOptions<'a> {
 
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
+    let _source_lock = smolvm::agent::fork::lock_fork_source(golden)?;
 
     // A live FUSE mount does not survive the freeze/restore: the restored
     // clone's mount wedges its container namespace and every exec hangs.
@@ -852,7 +853,6 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     }
 
     let snapshot_dir = prep.snapshot_dir.clone();
-    let resume_golden = prep.resume_golden_on_rollback;
     if let Err(error) = boot_prepared_fork(
         &db,
         clone,
@@ -861,14 +861,14 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         options.fork_env,
         None,
     ) {
-        return rollback_failed_fork(golden, &snapshot_dir, resume_golden, error);
+        return retain_failed_fork(golden, &snapshot_dir, error);
     }
     if options.wait_ready.is_some() && !options.hold {
         if let Err(error) = smolvm::agent::fork::fail_closed_on_rejuvenation(
             smolvm::agent::fork::release_forkpoint(clone),
             || teardown_fork_clone(&db, clone),
         ) {
-            return rollback_failed_fork(golden, &snapshot_dir, resume_golden, error);
+            return retain_failed_fork(golden, &snapshot_dir, error);
         }
     }
     if options.hold {
@@ -898,6 +898,7 @@ pub fn fork_vm_batch(
     hold: bool,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
+    let _source_lock = smolvm::agent::fork::lock_fork_source(golden)?;
 
     // A live FUSE mount does not survive the freeze/restore: the restored
     // clone's mount wedges its container namespace and every exec hangs.
@@ -936,7 +937,6 @@ pub fn fork_vm_batch(
     );
     let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs)?;
     let snapshot_dir = prepared[0].snapshot_dir.clone();
-    let resume_golden = prepared[0].resume_golden_on_rollback;
     let all_names: Vec<String> = clones.iter().map(|(name, _)| name.clone()).collect();
     let jobs: Vec<_> = prepared
         .into_iter()
@@ -1040,7 +1040,7 @@ pub fn fork_vm_batch(
         for name in &all_names {
             teardown_fork_clone(&db, name);
         }
-        return rollback_failed_fork(golden, &snapshot_dir, resume_golden, error);
+        return retain_failed_fork(golden, &snapshot_dir, error);
     }
 
     if hold {
@@ -1121,6 +1121,7 @@ fn boot_prepared_fork(
     retry_gate: Option<&std::sync::Mutex<()>>,
 ) -> smolvm::Result<()> {
     let preload_modules = prep.clone_record.cuda_preload_modules;
+    let clone_forkable = prep.clone_record.forkable;
     eprintln!("Booting clone '{clone}' from snapshot...");
     let mut start = || {
         start_vm_named_with_db(
@@ -1130,6 +1131,7 @@ fn boot_prepared_fork(
             None,
             true,
             ForkLaunch {
+                forkable: clone_forkable,
                 snapshot_dir: Some(prep.snapshot_dir.clone()),
                 share_weights,
                 preload_modules,
@@ -1190,31 +1192,18 @@ fn teardown_fork_clone(db: &SmolvmDb, clone: &str) {
     let _ = std::fs::remove_dir_all(vm_data_dir(clone));
 }
 
-fn rollback_failed_fork(
+fn retain_failed_fork(
     golden: &str,
     snapshot_dir: &std::path::Path,
-    resume_golden: bool,
     error: smolvm::Error,
 ) -> smolvm::Result<()> {
-    if resume_golden {
-        if let Err(resume_error) = smolvm::agent::fork::resume_golden(golden, snapshot_dir) {
-            return Err(smolvm::Error::agent(
-                "fork rollback",
-                format!(
-                    "{error}; golden rollback failed: {resume_error}; preserved checkpoint {} for recovery",
-                    snapshot_dir.display()
-                ),
-            ));
-        }
-    }
-    let cleanup_error = std::fs::remove_dir_all(snapshot_dir).err();
-    match cleanup_error {
-        None => Err(error),
-        Some(cleanup) => Err(smolvm::Error::agent(
-            "fork rollback",
-            format!("{error}; golden rollback succeeded but snapshot cleanup failed: {cleanup}"),
-        )),
-    }
+    Err(smolvm::Error::agent(
+        "fork clone boot",
+        format!(
+            "{error}; source '{golden}' remains frozen at retained checkpoint {} so the fork can be retried safely",
+            snapshot_dir.display()
+        ),
+    ))
 }
 
 fn persist_batch_clone_running(db: &SmolvmDb, clone: &str) -> smolvm::Result<()> {
@@ -1283,6 +1272,11 @@ fn start_vm_named_with_db(
 
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    // A durable checkpoint restores the already-running guest and workload just
+    // like an in-memory fork snapshot. Capture this before AgentManager consumes
+    // the one-shot payload at readiness, so the workload is not launched twice.
+    let from_snapshot = from_snapshot
+        || smolvm::portable_checkpoint::pending_dir(&smolvm::agent::vm_data_dir(name)).is_some();
     // A Smolfile-declared fork base starts forkable without requiring the user
     // to repeat `--forkable`. Older records that persisted a CUDA pool before
     // the explicit field existed get the same behavior, but clones remain
@@ -2210,8 +2204,28 @@ fn remove_vm_data_and_record(
     Ok(())
 }
 
+fn ensure_fork_base_delete_is_safe(
+    name: &str,
+    dependent_clones: &[String],
+    cascade: bool,
+) -> smolvm::Result<()> {
+    if dependent_clones.is_empty() || cascade {
+        return Ok(());
+    }
+    Err(smolvm::Error::agent(
+        "delete",
+        format!(
+            "machine '{name}' is the fork base for {} clone(s) ({}); \
+             delete the clones first or use --cascade to remove them too",
+            dependent_clones.len(),
+            dependent_clones.join(", ")
+        ),
+    ))
+}
+
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
+    let _fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
     let config = SmolvmConfig::load()?;
 
     // Check if exists
@@ -2221,43 +2235,25 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         .clone();
 
     // A golden's disks are the copy-on-write backing for its clones' overlays,
-    // so it must outlive them. Refuse to delete a golden while clones depend on
-    // it (unless forced, in which case the clones' overlays are left dangling).
-    let dependent_clones = SmolvmDb::open()?.dependent_clones(name)?;
-    if !dependent_clones.is_empty() {
-        if options.cascade {
-            // Children before the fork base: delete each dependent clone first,
-            // then fall through to remove the golden. A clone is never itself a
-            // fork base (clones launch non-forkable), so one level of recursion
-            // is exhaustive — no name-guessing, no stale overlays left dangling.
-            for clone in &dependent_clones {
-                println!("Deleting dependent clone '{clone}' (cascade)...");
-                delete_vm(
-                    clone,
-                    true, // no per-clone confirmation during a cascade
-                    DeleteVmOptions {
-                        stop_if_running: true,
-                        cascade: false,
-                    },
-                )?;
-            }
-        } else if !force {
-            return Err(smolvm::Error::agent(
-                "delete",
-                format!(
-                    "machine '{name}' is the fork base for {} clone(s) ({}); \
-                     delete the clones first, use --cascade to remove them too, \
-                     or --force to break them",
-                    dependent_clones.len(),
-                    dependent_clones.join(", ")
-                ),
-            ));
-        } else {
-            tracing::warn!(
-                golden = name,
-                clones = %dependent_clones.join(", "),
-                "force-deleting a golden; dependent clones' disk overlays will dangle"
-            );
+    // so it must outlive them. `--force` only suppresses confirmation; it must
+    // never bypass this storage-integrity boundary. `--cascade` is the explicit
+    // operation that removes descendants deepest-first.
+    let db = SmolvmDb::open()?;
+    let dependent_clones = db.dependent_clones(name)?;
+    ensure_fork_base_delete_is_safe(name, &dependent_clones, options.cascade)?;
+    if !dependent_clones.is_empty() && options.cascade {
+        // Delete the full lineage deepest-first. Every qcow2 overlay must
+        // disappear before the parent image that backs it.
+        for clone in db.dependent_descendants_postorder(name)? {
+            println!("Deleting dependent clone '{clone}' (cascade)...");
+            delete_vm(
+                &clone,
+                true, // no per-clone confirmation during a cascade
+                DeleteVmOptions {
+                    stop_if_running: true,
+                    cascade: false,
+                },
+            )?;
         }
     }
 
@@ -2280,18 +2276,14 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
             }
             RecordState::Unreachable => {
                 // Reap unconditionally: we're past the dependent-clones
-                // guard above, so either this isn't a fork base or --force
-                // was given. The guarded `cli_recover_if_unreachable` would
-                // skip a frozen fork base, orphaning its VMM after we remove
-                // the record below.
+                // guard above, so this machine has no live child dependency.
+                // The guarded `cli_recover_if_unreachable` would skip a frozen
+                // fork base, orphaning its VMM after we remove the record below.
                 smolvm::agent::state_probe::recover_unreachable_machine(&record)?;
             }
             RecordState::Frozen => {
-                // A frozen fork base only reaches here under --force (the
-                // dependent-clones guard above blocks the non-force path).
-                // Reap its paused VMM so it isn't orphaned once the record
-                // is removed; the clones' overlays are left dangling, as
-                // the force-delete warning already states.
+                // All descendants are gone (or a cascade removed them above),
+                // so reap the paused VMM before removing its record.
                 smolvm::agent::state_probe::recover_unreachable_machine(&record)?;
             }
             _ => {}
@@ -3314,6 +3306,47 @@ mod init_runner_tests {
                 ("BAZ".to_string(), "from-cli".to_string()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_lineage_tests {
+    use super::{ensure_fork_base_delete_is_safe, retain_failed_fork};
+
+    #[test]
+    fn force_cannot_bypass_a_live_fork_dependency() {
+        // `force` deliberately is not an input to the safety gate: it controls
+        // confirmation only and cannot make a dangling qcow2 chain acceptable.
+        let children = vec!["child-a".to_string(), "child-b".to_string()];
+        let error = ensure_fork_base_delete_is_safe("root", &children, false)
+            .expect_err("a live child must protect its parent");
+        let message = error.to_string();
+        assert!(message.contains("child-a, child-b"));
+        assert!(message.contains("--cascade"));
+    }
+
+    #[test]
+    fn cascade_and_childless_deletes_pass_the_lineage_gate() {
+        let children = vec!["child".to_string()];
+        ensure_fork_base_delete_is_safe("root", &children, true).unwrap();
+        ensure_fork_base_delete_is_safe("leaf", &[], false).unwrap();
+    }
+
+    #[test]
+    fn failed_clone_boot_preserves_the_retry_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkpoint = temp.path().join("checkpoint.bin");
+        std::fs::write(&checkpoint, b"checkpoint").unwrap();
+        let error = retain_failed_fork(
+            "root",
+            temp.path(),
+            smolvm::Error::agent("clone boot", "injected failure"),
+        )
+        .expect_err("the original boot failure must be returned");
+
+        assert!(checkpoint.exists(), "the retry checkpoint must survive");
+        assert!(error.to_string().contains("remains frozen"));
+        assert!(error.to_string().contains("retried safely"));
     }
 }
 

@@ -190,6 +190,23 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Fork a machine and make the restored clone a new checkpoint source.
+    /// This pays one eager guest-memory copy during clone boot; later forks of
+    /// `clone` use the normal copy-on-write path.
+    pub fn fork_checkpointable_machine(
+        &self,
+        source: &str,
+        clone: &str,
+        ports: &[(u16, u16)],
+    ) -> Result<()> {
+        self.with_name_locks(&[source, clone], || {
+            let handle =
+                control::fork_vm_with_options(&self.db, source, clone, ports, true, false, None)?;
+            self.insert_handle(clone, handle)?;
+            Ok(())
+        })
+    }
+
     /// Fork several clones from one retained snapshot and boot them with
     /// bounded parallelism. All names are locked together so overlapping SDK
     /// calls cannot race the golden freeze or claim the same clone name.
@@ -242,7 +259,31 @@ impl EmbeddedRuntime {
                 golden,
                 clone,
                 ports,
+                false,
                 share_weights,
+                Some(false),
+            )?;
+            handle.detach();
+            Ok(())
+        })
+    }
+
+    /// Fork a checkpointable child for a detached CLI operation. The child
+    /// outlives this process and can become the source of another fork.
+    pub fn fork_checkpointable_machine_detached(
+        &self,
+        source: &str,
+        clone: &str,
+        ports: &[(u16, u16)],
+    ) -> Result<()> {
+        self.with_name_locks(&[source, clone], || {
+            let handle = control::fork_vm_with_options(
+                &self.db,
+                source,
+                clone,
+                ports,
+                true,
+                false,
                 Some(false),
             )?;
             handle.detach();
@@ -269,6 +310,17 @@ impl EmbeddedRuntime {
     /// Stop a machine and persist stopped state.
     pub fn stop_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
+            let _source_lock = crate::agent::fork::lock_fork_source(name)?;
+            let dependents = self.db.dependent_clones(name)?;
+            if !dependents.is_empty() {
+                return Err(Error::agent(
+                    "stop machine",
+                    format!(
+                        "machine '{name}' has dependent fork(s) ({}); delete descendants first",
+                        dependents.join(", ")
+                    ),
+                ));
+            }
             if let Some(handle) = self.remove_cached_handle(name)? {
                 lock_handle(&handle)?.stop()?;
                 control::mark_stopped(&self.db, name)?;
@@ -282,7 +334,37 @@ impl EmbeddedRuntime {
     /// Stop best-effort, remove from the registry and DB, and delete storage.
     pub fn delete_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
-            if let Some(handle) = self.remove_cached_handle(name)? {
+            let _source_lock = crate::agent::fork::lock_fork_source(name)?;
+            let Some(record) = self.db.get_vm(name)? else {
+                self.remove_name_lock(name)?;
+                return Ok(());
+            };
+
+            // A parent's RAM and disks back every direct child. Check before
+            // stopping it: discovering the dependency after teardown would
+            // leave live descendants dangling.
+            let dependents = self.db.dependent_clones(name)?;
+            if !dependents.is_empty() {
+                return Err(Error::agent(
+                    "delete machine",
+                    format!(
+                        "machine '{name}' has dependent fork(s) ({}); delete descendants first",
+                        dependents.join(", ")
+                    ),
+                ));
+            }
+
+            let state = crate::agent::state_probe::resolve_state(name, &record);
+            if matches!(
+                state,
+                crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
+            ) {
+                // Paused vCPUs cannot acknowledge the normal guest shutdown.
+                // Reap the verified VMM directly instead of waiting for a
+                // response that cannot arrive.
+                self.remove_cached_handle(name)?;
+                crate::agent::state_probe::recover_unreachable_machine_in_db(&record, &self.db)?;
+            } else if let Some(handle) = self.remove_cached_handle(name)? {
                 let _ = lock_handle(&handle)?.stop();
             } else {
                 let _ = control::stop_vm(&self.db, name);
@@ -291,7 +373,7 @@ impl EmbeddedRuntime {
             // Idempotent: deleting an already-deleted machine is a no-op success
             // (the desired end state — gone — already holds). Lets SDK callers
             // call delete() more than once without an error.
-            match control::delete_vm(&self.db, name) {
+            match control::delete_vm_locked(&self.db, name) {
                 Ok(()) | Err(crate::Error::VmNotFound { .. }) => {}
                 Err(e) => return Err(e),
             }
@@ -458,8 +540,11 @@ impl EmbeddedRuntime {
     /// overlay so their writes survive — matching non-streaming exec.
     fn image_and_overlay_owner(&self, name: &str) -> Result<(Option<String>, String)> {
         let record = control::get_record(&self.db, name)?;
-        let overlay_owner =
-            crate::workload::persistent_overlay_owner(name, record.golden.as_deref());
+        let overlay_owner = crate::workload::persistent_overlay_owner_with_lineage(
+            name,
+            record.golden.as_deref(),
+            record.fork_overlay_owner.as_deref(),
+        );
         Ok((record.image, overlay_owner))
     }
 
@@ -855,5 +940,51 @@ mod tests {
             .read()
             .expect("name locks should not be poisoned")
             .contains_key("runtime-delete-lock"));
+    }
+
+    #[test]
+    fn delete_machine_refuses_a_live_fork_parent_before_teardown() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        runtime
+            .create_machine(test_spec("delete-parent", true))
+            .unwrap();
+        let mut child = test_spec("delete-child", true).to_record();
+        child.golden = Some("delete-parent".to_string());
+        db.insert_vm("delete-child", &child).unwrap();
+
+        let error = runtime.delete_machine("delete-parent").unwrap_err();
+        assert!(error.to_string().contains("dependent fork"));
+        assert!(db.get_vm("delete-parent").unwrap().is_some());
+        assert!(db.get_vm("delete-child").unwrap().is_some());
+    }
+
+    #[test]
+    fn stop_machine_refuses_a_live_fork_parent_before_teardown() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        runtime
+            .create_machine(test_spec("stop-parent", true))
+            .unwrap();
+        let mut child = test_spec("stop-child", true).to_record();
+        child.golden = Some("stop-parent".to_string());
+        db.insert_vm("stop-child", &child).unwrap();
+
+        let error = runtime.stop_machine("stop-parent").unwrap_err();
+        assert!(error.to_string().contains("dependent fork"));
+        assert!(db.get_vm("stop-parent").unwrap().is_some());
+        assert!(db.get_vm("stop-child").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_machine_reaps_a_frozen_checkpoint_without_guest_shutdown() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        let mut record = test_spec("delete-frozen", true).to_record();
+        record.state = crate::config::RecordState::Frozen;
+        db.insert_vm("delete-frozen", &record).unwrap();
+
+        runtime.delete_machine("delete-frozen").unwrap();
+        assert!(db.get_vm("delete-frozen").unwrap().is_none());
     }
 }

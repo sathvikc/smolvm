@@ -32,7 +32,18 @@ pub fn record_mounts_to_bindings(mounts: &[(String, String, bool)]) -> Vec<(Stri
 /// renaming the directory on disk, keeps that live mount valid while making
 /// the clone's execs land in the inherited state.
 pub fn persistent_overlay_owner(name: &str, golden: Option<&str>) -> String {
-    golden.unwrap_or(name).to_string()
+    persistent_overlay_owner_with_lineage(name, golden, None)
+}
+
+/// Resolve the persistent overlay owner for a machine whose immediate parent
+/// may itself be a fork. `fork_overlay_owner` keeps every generation pointed
+/// at the root overlay inherited by the live restored workload.
+pub fn persistent_overlay_owner_with_lineage(
+    name: &str,
+    golden: Option<&str>,
+    fork_overlay_owner: Option<&str>,
+) -> String {
+    fork_overlay_owner.or(golden).unwrap_or(name).to_string()
 }
 
 /// Launch an image machine's workload container in the background.
@@ -41,8 +52,8 @@ pub fn persistent_overlay_owner(name: &str, golden: Option<&str>) -> String {
 /// a host-side concern the caller owns. An empty entrypoint+cmd makes the
 /// agent resolve the image's own ENTRYPOINT+CMD, so service-style images
 /// start as their authors intended. The persistent overlay is keyed by
-/// [`persistent_overlay_owner`] (the machine name, or the golden's for a fork
-/// clone) so filesystem state survives restarts and forks.
+/// [`persistent_overlay_owner_with_lineage`] (the machine name, or the root
+/// golden's for a fork clone) so filesystem state survives restarts and forks.
 ///
 /// Returns `Ok(false)` (no launch) for machines without an image, and for
 /// image machines where neither the record nor the image supplies a command —
@@ -190,6 +201,10 @@ mod tests {
         assert_eq!(
             persistent_overlay_owner("clone-a", Some("golden-a")),
             "golden-a"
+        );
+        assert_eq!(
+            persistent_overlay_owner_with_lineage("grandchild", Some("child"), Some("root")),
+            "root"
         );
     }
 
