@@ -31,7 +31,17 @@ const SECURITY_NONE: u8 = 1;
 /// How long a client's incremental update request waits for a new frame
 /// before we answer with the current one. Without a bound, a client would
 /// hang for as long as the desktop is idle and look disconnected.
-const UPDATE_WAIT: Duration = Duration::from_secs(2);
+///
+/// This also bounds INPUT latency, which is why it is short. A session is one
+/// loop: read a message, act on it, repeat. While it is parked in
+/// `wait_for_frame` nothing is reading the socket, so a keystroke that arrives
+/// mid-wait is not seen until the wait ends. With a two-second bound — the
+/// value this started at — typing into a still screen stalled for up to two
+/// seconds per keypress, because a still screen is exactly the case that runs
+/// the wait to its full length. A frame arriving still wakes the wait
+/// immediately via the condvar, so shortening it costs only an empty
+/// four-byte reply per tick on an idle desktop.
+const UPDATE_WAIT: Duration = Duration::from_millis(15);
 
 /// Pseudo-encoding letting us tell the client the desktop changed size, which
 /// happens when the compositor sets a mode different from the initial one.
@@ -275,6 +285,18 @@ fn serve_http(
     };
 
     if let Some(key) = request.websocket_key.as_deref() {
+        let route = request.path.as_str();
+        if route != "/websockify" && route != "/video" {
+            return respond(&mut s, "404 Not Found", "text/plain", b"not found");
+        }
+        if route == "/video" && !super::video::is_available() {
+            return respond(
+                &mut s,
+                "503 Service Unavailable",
+                "text/plain",
+                b"encoded video unavailable",
+            );
+        }
         let mut reply = format!(
             "HTTP/1.1 101 Switching Protocols\r\n\
              Upgrade: websocket\r\n\
@@ -289,6 +311,10 @@ fn serve_http(
         }
         reply.push_str("\r\n");
         s.write_all(reply.as_bytes())?;
+        if route == "/video" {
+            tracing::info!("encoded video browser client connected");
+            return super::video::serve_browser(super::websocket::WsStream::new(s), fb);
+        }
         tracing::info!("vnc browser client connected");
         return handle_client(super::websocket::WsStream::new(s), fb, input);
     }
@@ -895,6 +921,8 @@ mod tests {
         // in a browser, long after the build went green.
         assert!(CLIENT_HTML.starts_with("<!doctype html>"));
         assert!(CLIENT_HTML.contains("/websockify"));
+        assert!(CLIENT_HTML.contains("/video"));
+        assert!(CLIENT_HTML.contains("VideoDecoder"));
         assert!(CLIENT_HTML.trim_end().ends_with("</html>"));
     }
 
@@ -990,6 +1018,38 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_incremental_request_returns_promptly_so_input_is_not_starved() {
+        // A session is one loop: read a message, act on it, repeat. While it
+        // is parked in `wait_for_frame` nothing is reading the socket, so a
+        // keystroke arriving mid-wait is not seen until the wait ends — and a
+        // still screen is exactly what runs the wait to its full length.
+        // Bounding the wait is therefore what keeps typing responsive, so
+        // assert the bound rather than the constant.
+        let mut s = connect(serve_a_test_desktop());
+        drive_rfb_session(&mut s); // consume the first, full-frame update
+
+        // Nothing has changed since, so this request exercises the wait path.
+        let mut req = vec![3u8, 1]; // incremental
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&(TEST_W as u16).to_be_bytes());
+        req.extend_from_slice(&(TEST_H as u16).to_be_bytes());
+
+        let started = std::time::Instant::now();
+        s.write_all(&req).unwrap();
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head).unwrap();
+        let waited = started.elapsed();
+
+        assert_eq!(head[0], 0, "expected a FramebufferUpdate");
+        assert!(
+            waited < Duration::from_millis(500),
+            "an idle incremental request took {waited:?}; input would stall for \
+             that long behind it"
+        );
+    }
+
+    #[test]
     fn a_browser_is_served_the_embedded_client() {
         let mut s = connect(serve_a_test_desktop());
         s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
@@ -1008,6 +1068,22 @@ mod tests {
         let mut reply = Vec::new();
         s.read_to_end(&mut reply).unwrap();
         assert!(String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn video_upgrade_without_a_prestarted_helper_is_503() {
+        // Encoded video is optional. A page receiving this response starts
+        // Raw RFB on its already-established input/display connection.
+        assert!(std::env::var_os("SMOLVM_VIDEO_SOCKET").is_none());
+        let mut s = connect(serve_a_test_desktop());
+        s.write_all(
+            b"GET /video HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .unwrap();
+        let mut reply = Vec::new();
+        s.read_to_end(&mut reply).unwrap();
+        assert!(String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 503"));
     }
 
     /// The client half of a WebSocket: masks what it writes, unmasks what it
