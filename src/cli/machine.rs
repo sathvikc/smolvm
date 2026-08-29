@@ -3754,11 +3754,9 @@ impl CreateCmd {
             }
 
             if let Some(ref checkpoint) = checkpoint {
-                smolvm::portable_checkpoint::install(
-                    &pack_content_dir,
-                    &smolvm::agent::vm_data_dir(&name_for_layers),
-                    checkpoint,
-                )?;
+                let vm_data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
+                smolvm::portable_checkpoint::install(&pack_content_dir, &vm_data_dir, checkpoint)?;
+                smolvm::portable_checkpoint::discard_transport_pack(&vm_data_dir)?;
             }
 
             reservation.commit(&record)?;
@@ -3862,10 +3860,10 @@ impl StartCmd {
 
 /// Fork a running forkable machine into a new clone.
 ///
-/// Freezes the source (the "golden") via its control socket, copy-on-write
-/// clones its disks, and boots the new machine from the golden's in-memory
-/// snapshot instead of cold-booting — so the clone comes up already warm
-/// (same processes, same filesystem state), in well under a second.
+/// Captures the source (the "golden") through its control socket, copy-on-write
+/// clones its disks, and boots the new machine from the source's in-memory
+/// snapshot instead of cold-booting. Linux/x86_64 resumes the source after the
+/// boundary; other hosts retain it as the frozen copy-on-write base.
 ///
 /// The golden must have been started with `--forkable`.
 #[derive(Args, Debug)]
