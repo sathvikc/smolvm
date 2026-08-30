@@ -3,8 +3,8 @@
 //!
 //! A fork snapshots a running, forkable machine's RAM, device state, and disks,
 //! gives the clone private copy-on-write layers, and lets the caller boot the
-//! clone from that exact boundary. Linux/x86_64 resumes the source immediately
-//! on new private layers; other hosts retain the source as the frozen CoW base.
+//! clone from that exact boundary. Linux/x86_64 and macOS resume the source
+//! immediately on new private layers; other hosts retain a frozen CoW base.
 //! The boot itself differs between callers (the CLI uses `start_vm_named`; the
 //! API uses `AgentManager`), so it stays out of here; everything up to and
 //! including the snapshot + disk clone is shared so the two entry points can
@@ -17,7 +17,7 @@ use crate::db::SmolvmDb;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,7 +28,7 @@ const MAX_FORK_LINEAGE_DEPTH: usize = 32;
 
 type ForkDisk = (&'static str, PathBuf, crate::data::disk::DiskFormat);
 
-/// Cross-process guard for one source machine's complete fork transaction.
+/// Cross-process guard for one source machine's fork or checkpoint transaction.
 ///
 /// The in-process API/SDK lifecycle locks cannot serialize a separate CLI
 /// process. Without this guard, two first forks can both wait in the guest;
@@ -56,9 +56,11 @@ impl ForkSourceLock {
     }
 }
 
-/// Serialize a complete fork operation for `source` across CLI, SDK, and serve
-/// processes. The sibling lock file intentionally lives outside the machine's
-/// removable data directory, so a concurrent delete cannot replace its inode.
+/// Serialize source-state capture for `source` across CLI, SDK, and serve
+/// processes. A fork retains the guard for its complete transaction; a portable
+/// checkpoint releases it once the source resumes. The sibling lock file lives
+/// outside the removable machine data directory, so concurrent deletion cannot
+/// replace its inode.
 pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::acquire_at(&fork_source_lock_path(source))
@@ -189,7 +191,7 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
     // new agent exec inside that paused VM: its vCPUs cannot answer, even
     // though the already-proven forkpoint remains the exact snapshot source.
     // The VMM control plane remains live, so recognize it before touching the
-    // guest. A continuing Linux source reports `OK running` and takes the
+    // guest. A continuing source reports `OK running` and takes the
     // ordinary agent readiness path below.
     let control = control_socket_path(golden);
     if control.exists() {
@@ -242,11 +244,14 @@ fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
 
-/// Linux/KVM can atomically checkpoint a fork generation and resume the source
-/// on private RAM and disk layers. Other hosts retain the established frozen
-/// fork-base behavior.
+/// Linux/KVM and macOS/HVF can atomically checkpoint a fork generation and
+/// resume the source on private RAM and disk layers. Other hosts retain the
+/// established frozen fork-base behavior.
 pub fn fork_continue_enabled() -> bool {
-    cfg!(all(target_os = "linux", target_arch = "x86_64"))
+    cfg!(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        target_os = "macos"
+    ))
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -304,17 +309,17 @@ pub fn restart_blocking_dependent_clones(db: &SmolvmDb, golden: &str) -> Result<
     restart_blocking_dependent_clones_in(db, golden, &vm_data_dir(golden).join("s"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fork_continue_snapshot(snapshot_dir: &Path) -> bool {
     snapshot_dir.join("generation-disks.tsv").is_file()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn fork_continue_snapshot(_snapshot_dir: &Path) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn atomic_write_snapshot_file(path: &Path, contents: &[u8]) -> Result<()> {
     let partial = path.with_extension(format!(
         "{}.partial",
@@ -480,7 +485,7 @@ fn stop_snapshot_guardians(snapshot_root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prepare_running_disk_generation(
     gdir: &Path,
     snapshot_dir: &Path,
@@ -516,6 +521,10 @@ fn prepare_running_disk_generation(
         let active = gdir.join(Path::new(raw).with_extension("qcow2"));
         let base = if format == DiskFormat::Qcow2 {
             let generation_base = generation_disk_dir.join(format!("{id}.base.qcow2"));
+            if let Err(error) = stage_relocated_qcow2_backings(&base, &generation_base) {
+                rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
+                return Err(error);
+            }
             if let Err(error) = std::fs::rename(&base, &generation_base) {
                 rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
                 return Err(Error::agent(
@@ -604,13 +613,11 @@ fn prepare_running_disk_generation(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FORK_DISK_CHAIN_DEPTH: usize = 32;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn qcow2_backing_depth(path: &Path) -> Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-
     let mut current = path.canonicalize().map_err(|error| {
         Error::agent(
             "inspect fork disk chain",
@@ -626,61 +633,9 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
                 format!("cycle at {}", current.display()),
             ));
         }
-        let mut file = File::open(&current).map_err(|error| {
-            Error::agent(
-                "inspect fork disk chain",
-                format!("{}: {error}", current.display()),
-            )
-        })?;
-        let mut header = [0_u8; 20];
-        file.read_exact(&mut header).map_err(|error| {
-            Error::agent(
-                "inspect fork disk chain",
-                format!("{}: {error}", current.display()),
-            )
-        })?;
-        if header[..4] != *b"QFI\xfb" {
+        let Some(backing) = qcow2_backing_name(&current)? else {
             return Ok(depth);
-        }
-        let offset = u64::from_be_bytes(header[8..16].try_into().unwrap());
-        let length = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
-        if offset == 0 && length == 0 {
-            return Ok(depth);
-        }
-        if offset == 0 || length == 0 || length > 4096 {
-            return Err(Error::agent(
-                "inspect fork disk chain",
-                format!("{} has invalid qcow2 backing metadata", current.display()),
-            ));
-        }
-        let end = offset
-            .checked_add(length as u64)
-            .ok_or_else(|| Error::agent("inspect fork disk chain", "backing offset overflow"))?;
-        if end
-            > file
-                .metadata()
-                .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?
-                .len()
-        {
-            return Err(Error::agent(
-                "inspect fork disk chain",
-                format!("{} has a truncated qcow2 backing name", current.display()),
-            ));
-        }
-        let mut name = vec![0_u8; length];
-        file.seek(SeekFrom::Start(offset))
-            .and_then(|_| file.read_exact(&mut name))
-            .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?;
-        let backing = std::str::from_utf8(&name).map_err(|error| {
-            Error::agent(
-                "inspect fork disk chain",
-                format!(
-                    "{} has a non-UTF-8 backing name: {error}",
-                    current.display()
-                ),
-            )
-        })?;
-        let backing = PathBuf::from(backing);
+        };
         let next = if backing.is_absolute() {
             backing
         } else {
@@ -704,7 +659,173 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn qcow2_backing_name(path: &Path) -> Result<Option<PathBuf>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = File::open(path).map_err(|error| {
+        Error::agent(
+            "inspect fork disk chain",
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    let mut header = [0_u8; 20];
+    file.read_exact(&mut header).map_err(|error| {
+        Error::agent(
+            "inspect fork disk chain",
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    if header[..4] != *b"QFI\xfb" {
+        return Ok(None);
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    let length = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
+    if offset == 0 && length == 0 {
+        return Ok(None);
+    }
+    if offset == 0 || length == 0 || length > 4096 {
+        return Err(Error::agent(
+            "inspect fork disk chain",
+            format!("{} has invalid qcow2 backing metadata", path.display()),
+        ));
+    }
+    let end = offset
+        .checked_add(length as u64)
+        .ok_or_else(|| Error::agent("inspect fork disk chain", "backing offset overflow"))?;
+    if end
+        > file
+            .metadata()
+            .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?
+            .len()
+    {
+        return Err(Error::agent(
+            "inspect fork disk chain",
+            format!("{} has a truncated qcow2 backing name", path.display()),
+        ));
+    }
+    let mut name = vec![0_u8; length];
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(&mut name))
+        .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?;
+    let backing = std::str::from_utf8(&name).map_err(|error| {
+        Error::agent(
+            "inspect fork disk chain",
+            format!("{} has a non-UTF-8 backing name: {error}", path.display()),
+        )
+    })?;
+    Ok(Some(PathBuf::from(backing)))
+}
+
+/// Preserve relative backing names when an active qcow2 image is moved into a
+/// fork-generation directory. Portable checkpoint disks deliberately use
+/// compact relative names (`0`, `1`, ...); moving only the top image would make
+/// those names resolve inside the new directory and break the first fork of a
+/// restored machine. Hard-linking the immutable backing chain keeps the move
+/// O(metadata) and does not duplicate disk contents.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let mut source = source_top.canonicalize().map_err(|error| {
+        Error::agent(
+            "stage fork disk backing",
+            format!("{}: {error}", source_top.display()),
+        )
+    })?;
+    let mut relocated = relocated_top.to_path_buf();
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_FORK_DISK_CHAIN_DEPTH {
+        if !seen.insert(source.clone()) {
+            return Err(Error::agent(
+                "stage fork disk backing",
+                format!("cycle at {}", source.display()),
+            ));
+        }
+        let Some(backing) = qcow2_backing_name(&source)? else {
+            return Ok(());
+        };
+        if backing.is_absolute() {
+            return Ok(());
+        }
+        if !backing
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(Error::agent(
+                "stage fork disk backing",
+                format!(
+                    "{} has unsafe relative backing name {}",
+                    source.display(),
+                    backing.display()
+                ),
+            ));
+        }
+        let source_next = source
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&backing)
+            .canonicalize()
+            .map_err(|error| {
+                Error::agent(
+                    "stage fork disk backing",
+                    format!("backing of {}: {error}", source.display()),
+                )
+            })?;
+        let relocated_next = relocated
+            .parent()
+            .ok_or_else(|| Error::agent("stage fork disk backing", "missing parent directory"))?
+            .join(&backing);
+        if let Some(parent) = relocated_next.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| Error::agent("stage fork disk backing", error.to_string()))?;
+        }
+        match std::fs::hard_link(&source_next, &relocated_next) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let source_meta = std::fs::metadata(&source_next).map_err(|inspect| {
+                    Error::agent("stage fork disk backing", inspect.to_string())
+                })?;
+                let relocated_meta = std::fs::metadata(&relocated_next).map_err(|inspect| {
+                    Error::agent("stage fork disk backing", inspect.to_string())
+                })?;
+                if source_meta.dev() != relocated_meta.dev()
+                    || source_meta.ino() != relocated_meta.ino()
+                {
+                    return Err(Error::agent(
+                        "stage fork disk backing",
+                        format!(
+                            "{} already exists for a different backing file",
+                            relocated_next.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(Error::agent(
+                    "stage fork disk backing",
+                    format!(
+                        "{} -> {}: {error}",
+                        source_next.display(),
+                        relocated_next.display()
+                    ),
+                ));
+            }
+        }
+        source = source_next;
+        relocated = relocated_next;
+    }
+    Err(Error::agent(
+        "stage fork disk backing",
+        format!(
+            "{} exceeds the safe backing depth of {MAX_FORK_DISK_CHAIN_DEPTH}",
+            source_top.display()
+        ),
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_fork_disk_chain_is_bounded(gdir: &Path) -> Result<()> {
     for raw in [
         crate::data::storage::STORAGE_DISK_FILENAME,
@@ -736,7 +857,7 @@ fn ensure_fork_disk_chain_is_bounded(gdir: &Path) -> Result<()> {
 /// cannot resume after switching to the new active overlays until the marker
 /// is durable, so a running source without the marker still owns the rotated
 /// base files and this operation is safe and idempotent.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rollback_uncommitted_disk_generation(gdir: &Path, snapshot_dir: &Path) -> Result<()> {
     use crate::data::disk::DiskFormat;
 
@@ -834,7 +955,7 @@ fn rollback_uncommitted_disk_generation(gdir: &Path, snapshot_dir: &Path) -> Res
             }
         }
     }
-    match std::fs::remove_dir(&generation_disk_dir) {
+    match std::fs::remove_dir_all(&generation_disk_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -852,7 +973,7 @@ fn rollback_uncommitted_disk_generation(gdir: &Path, snapshot_dir: &Path) -> Res
         .map_err(|error| Error::agent("sync recovered disk generation", error.to_string()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recover_uncommitted_generations(
     db: &SmolvmDb,
     golden: &str,
@@ -902,7 +1023,7 @@ fn snapshot_generation_id(snapshot: &Path) -> Option<&str> {
         .filter(|name| name.len() == 8 && name.as_bytes().iter().all(u8::is_ascii_hexdigit))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn gc_unreferenced_fork_generations(
     db: &SmolvmDb,
     golden: &str,
@@ -952,7 +1073,7 @@ fn gc_unreferenced_fork_generations(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rollback_prepared_disk_generation(
     overlays: &[(PathBuf, PathBuf, crate::data::disk::DiskFormat)],
     rotations: &[(PathBuf, PathBuf)],
@@ -964,10 +1085,10 @@ fn rollback_prepared_disk_generation(
     for (generation_base, original) in rotations.iter().rev() {
         let _ = std::fs::rename(generation_base, original);
     }
-    let _ = std::fs::remove_dir(generation_disk_dir);
+    let _ = std::fs::remove_dir_all(generation_disk_dir);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_generation_fork_disks(snapshot_dir: &Path) -> Result<Option<Vec<ForkDisk>>> {
     use crate::data::disk::DiskFormat;
 
@@ -1321,10 +1442,10 @@ pub fn prepare_held_fork(
 /// Preparation is transactional: if any clone fails, all clone records and
 /// disks created by this call are removed.
 ///
-/// Linux/x86_64 resumes the source after atomically rotating its writable disks;
-/// other hosts retain the source in its paused copy-on-write state. A direct
-/// later Linux fork captures current state; explicit pool replenishment can
-/// reuse its retained generation.
+/// Linux/x86_64 and macOS resume the source after atomically rotating its
+/// writable disks; other hosts retain the source in its paused copy-on-write
+/// state. A later direct fork captures current state; explicit pool
+/// replenishment can reuse its retained generation.
 pub fn prepare_forks(
     db: &SmolvmDb,
     golden: &str,
@@ -1435,7 +1556,7 @@ pub(crate) fn prepare_forks_reusing(
     // Never remove a colliding random directory because a live clone may still
     // be using an older snapshot.
     let snapshot_root = gdir.join("s");
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if fork_continue_enabled() && !golden_was_paused {
         recover_uncommitted_generations(db, golden, &gdir, &snapshot_root)?;
     }
@@ -1507,7 +1628,7 @@ pub(crate) fn prepare_forks_reusing(
 
         let fork_continue = fork_continue_enabled();
         if fork_continue {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Err(error) = prepare_running_disk_generation(&gdir, &snapshot_dir, vm_ids) {
                 let _ = std::fs::remove_dir_all(&snapshot_dir);
                 return Err(error);
@@ -1592,7 +1713,7 @@ pub(crate) fn prepare_forks_reusing(
                 error,
             ));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         gc_unreferenced_fork_generations(db, golden, &snapshot_root, retained_snapshot.as_ref())?;
     }
 
@@ -1661,9 +1782,9 @@ pub(crate) fn rollback_retained_fork_snapshot(
     }
 
     let mut rollback_errors = Vec::new();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let source_continues = fork_continue_snapshot(snapshot_dir);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let source_continues = false;
     if source_continues {
         let status = control_socket_cmd(&control_socket_path(golden), "STATUS").map_err(|error| {
@@ -1685,10 +1806,10 @@ pub(crate) fn rollback_retained_fork_snapshot(
             ));
         }
         if !snapshot_dir.join("source-continues-v1").is_file() {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             rollback_uncommitted_disk_generation(&vm_data_dir(golden), snapshot_dir)?;
-            #[cfg(not(target_os = "linux"))]
-            unreachable!("a non-Linux snapshot cannot carry fork-continue disk metadata");
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            unreachable!("this platform cannot carry fork-continue disk metadata");
         }
     } else if let Err(resume_error) = resume_golden(golden, snapshot_dir) {
         return Err(Error::agent(
@@ -1896,14 +2017,14 @@ fn prepare_clone_from_snapshot(
 
 /// Give the clone its own disks. The source's block workers were quiesced and
 /// flushed at the checkpoint boundary, so the generation is a consistent
-/// backing even when the Linux source has resumed. On Linux each
+/// backing even when the source has resumed. On Linux each
 /// disk is a qcow2 copy-on-write overlay over the golden's — filesystem
 /// independent, so the overlay starts near-empty and the fork is O(metadata)
 /// regardless of how much data the golden holds. macOS clonefiles the disks
 /// (APFS CoW). Either way the `.formatted` marker is copied so the clone never
 /// reformats and wipes the inherited filesystem.
 fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Result<()> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = snapshot_dir;
     // The golden's actual disks that exist, resolved by file presence (`.qcow2`
     // if the golden is itself a clone, else `.raw`) — the same single source of
@@ -1923,9 +2044,9 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
         .filter(|(_, src, _)| src.exists())
         .collect()
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let disks = read_generation_fork_disks(snapshot_dir)?.unwrap_or_else(fallback_disks);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let disks = fallback_disks();
 
     #[cfg(target_os = "linux")]
@@ -1956,14 +2077,21 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
     }
     #[cfg(target_os = "macos")]
     {
-        // macOS uses clonefile (APFS CoW), keeping the golden's disk format.
-        for (_, src, _) in &disks {
-            let dst = clone_dir.join(src.file_name().unwrap());
+        // macOS uses clonefile (APFS CoW) over the immutable generation disk,
+        // keeping its source format while the running VM writes a new overlay.
+        for (raw, src, format) in &disks {
+            let dst = match format {
+                crate::data::disk::DiskFormat::Raw => clone_dir.join(raw),
+                crate::data::disk::DiskFormat::Qcow2 => {
+                    clone_dir.join(Path::new(raw).with_extension("qcow2"))
+                }
+            };
             crate::disk_utils::clone_or_copy_file(src, &dst)
                 .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
-            let src_marker = src.with_extension("formatted");
+            let marker = Path::new(raw).with_extension("formatted");
+            let src_marker = gdir.join(&marker);
             if src_marker.exists() {
-                let _ = std::fs::copy(&src_marker, dst.with_extension("formatted"));
+                let _ = std::fs::copy(&src_marker, clone_dir.join(&marker));
             }
         }
     }
@@ -2821,6 +2949,31 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn relocating_qcow2_keeps_its_relative_backing_chain_valid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let raw = temp.path().join("0");
+        std::fs::write(&raw, vec![0_u8; 20]).unwrap();
+        let top = temp.path().join("storage.qcow2");
+        write_test_qcow2(&top, Some("0"));
+
+        let generation = temp.path().join("d/generation");
+        std::fs::create_dir_all(&generation).unwrap();
+        let relocated = generation.join("storage.base.qcow2");
+        stage_relocated_qcow2_backings(&top, &relocated).unwrap();
+        std::fs::rename(&top, &relocated).unwrap();
+
+        assert_eq!(qcow2_backing_depth(&relocated).unwrap(), 1);
+        assert_eq!(
+            std::fs::metadata(&raw).unwrap().ino(),
+            std::fs::metadata(generation.join("0")).unwrap().ino(),
+            "backing should be preserved without copying its contents"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn live_fork_refuses_an_unbounded_disk_chain() {
         let temp = tempfile::tempdir().unwrap();
         let raw = temp.path().join("base.raw");
@@ -3224,7 +3377,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn atomic_snapshot_metadata_never_overwrites_a_published_file() {
         let temp = tempfile::tempdir().unwrap();
