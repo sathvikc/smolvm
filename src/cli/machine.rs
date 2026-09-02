@@ -524,11 +524,16 @@ pub struct RunCmd {
     )]
     pub oci_platform: Option<String>,
 
-    /// Mount host directory into container (can be used multiple times)
+    /// Mount host directory into container (can be used multiple times). Also
+    /// accepts S3-compatible object storage, mounted inside the container:
+    /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
+    /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
+    /// for R2/MinIO; anonymous without them). Nothing is required of the
+    /// image: the agent performs the mount itself.
     #[arg(
         short = 'v',
         long = "volume",
-        value_name = "HOST:CONTAINER[:ro]",
+        value_name = "HOST|REMOTE:CONTAINER[:ro]",
         help_heading = "Container"
     )]
     pub volume: Vec<String>,
