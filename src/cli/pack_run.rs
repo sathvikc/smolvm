@@ -217,6 +217,10 @@ pub struct PackRunCmd {
     )]
     pub volume: Vec<String>,
 
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    #[arg(long, help_heading = "Container")]
+    pub allow_system_mounts: bool,
+
     /// Expose port from container to host (can be used multiple times)
     #[arg(
         short = 'p',
@@ -478,7 +482,7 @@ impl PackRunCmd {
         )?;
 
         // 8. Parse CLI args
-        let mounts = HostMount::parse(&self.volume)?;
+        let mounts = HostMount::parse_with_system_mounts(&self.volume, self.allow_system_mounts)?;
         let ports = PortMappingSpec::expand_all(&self.port)
             .map_err(|e| Error::config("pack run ports", e))?;
         let port_mappings = PortMapping::to_tuples(&ports);
@@ -579,6 +583,14 @@ impl PackRunCmd {
                 // Detach from parent's terminal so libkrun doesn't
                 // steal keystrokes or corrupt terminal state.
                 detach_vm_child_stdio();
+
+                let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+                    config.vsock_socket.to_path_buf(),
+                    config
+                        .mounts
+                        .iter()
+                        .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+                );
 
                 if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
                     let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
@@ -1215,6 +1227,10 @@ struct PackedRunArgs {
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
     volume: Vec<String>,
 
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    #[arg(long)]
+    allow_system_mounts: bool,
+
     /// Expose port from container to host (single port or one-to-one range)
     #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
     port: Vec<PortMappingSpec>,
@@ -1271,6 +1287,10 @@ struct PackedStartArgs {
     /// Mount a volume (HOST:GUEST[:ro])
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
     volume: Vec<String>,
+
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    #[arg(long)]
+    allow_system_mounts: bool,
 
     /// Expose port from container to host (single port or one-to-one range)
     #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
@@ -1422,6 +1442,7 @@ fn run_ephemeral(
                 workdir: args.workdir,
                 env: args.env,
                 volume: args.volume,
+                allow_system_mounts: args.allow_system_mounts,
                 port: args.port,
                 net: args.net,
                 net_backend: args.net_backend,
@@ -1556,7 +1577,7 @@ fn run_from_cache(
         args.overlay,
     )?;
 
-    let mounts = HostMount::parse(&args.volume)?;
+    let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed run ports", e))?;
     let port_mappings = PortMapping::to_tuples(&ports);
@@ -1615,6 +1636,14 @@ fn run_from_cache(
         // Detach from parent's terminal so libkrun doesn't
         // steal keystrokes or corrupt terminal state.
         detach_vm_child_stdio();
+
+        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+            config.vsock_socket.to_path_buf(),
+            config
+                .mounts
+                .iter()
+                .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+        );
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
@@ -1971,7 +2000,7 @@ fn daemon_start(
     let vsock_path = daemon.join("agent.sock");
 
     // Parse CLI args
-    let mounts = HostMount::parse(&args.volume)?;
+    let mounts = HostMount::parse_with_system_mounts(&args.volume, args.allow_system_mounts)?;
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed start ports", e))?;
     let port_mappings = PortMapping::to_tuples(&ports);
@@ -2054,6 +2083,14 @@ fn daemon_start(
         // Without this, libkrun's threads inherit stdin and steal
         // keystrokes from the user's shell.
         detach_vm_child_stdio();
+
+        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+            config.vsock_socket.to_path_buf(),
+            config
+                .mounts
+                .iter()
+                .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+        );
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
