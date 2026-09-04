@@ -111,6 +111,27 @@ fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
     }
 }
 
+/// Turn a control-socket refusal into something the person who ran the command
+/// can act on.
+///
+/// The VMM answers in its own vocabulary — `ERR EINVAL no memfd-backed RAM
+/// (start the VM with SMOLVM_FORKABLE=1)` — which leaks an errno and points at
+/// an internal environment variable rather than the flag a person types. Every
+/// caller (CLI and serve API alike) funnels through here, so the mapping is
+/// written once. An unrecognised reply is passed through verbatim rather than
+/// guessed at, so a new VMM error is never disguised as a known one.
+fn explain_fork_reply(golden: &str, reply: &str) -> String {
+    if reply.contains("no memfd-backed RAM") {
+        return format!(
+            "machine '{golden}' was not started as branchable, so it has no copy-on-write \
+             memory to branch from. Restart it with `smolvm machine start --name {golden} \
+             --branchable`; branchability is decided at start time and cannot be turned on \
+             for an already-running machine."
+        );
+    }
+    format!("branching '{golden}' failed: {reply}")
+}
+
 /// Path to a forkable machine's control socket (pause/resume/checkpoint/FORK).
 pub fn control_socket_path(name: &str) -> PathBuf {
     vm_data_dir(name).join("control.sock")
@@ -1508,6 +1529,12 @@ pub(crate) fn prepare_forks_reusing(
     let golden_rec = db
         .get_vm(golden)?
         .ok_or_else(|| Error::vm_not_found(golden))?;
+    if !golden_rec.staged_mounts.is_empty() {
+        return Err(Error::config(
+            "fork",
+            "staged mounts cannot be branched yet because multiple descendants would synchronize into the same host directory; use a live rw mount or remove the staged mount first",
+        ));
+    }
     let child_depth = db
         .fork_lineage_depth(golden)?
         .checked_add(1)
@@ -1658,7 +1685,7 @@ pub(crate) fn prepare_forks_reusing(
                     golden,
                     &snapshot_dir,
                     false,
-                    Error::agent("fork", format!("golden FORK failed: {reply}")),
+                    Error::agent("fork", explain_fork_reply(golden, &reply)),
                 ));
             }
             Err(error) => {
