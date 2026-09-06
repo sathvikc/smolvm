@@ -12,7 +12,9 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths::{self, STORAGE_ROOT};
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
-use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer};
+#[cfg(test)]
+use smolvm_oci_layer::extract_oci_layer;
+use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer_with_size};
 use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
@@ -887,7 +889,13 @@ fn ordered_packed_layer_names(packed_dir: &Path) -> Result<Vec<String>> {
             // A packed store is a volume root on macOS, so it always carries
             // filesystem bookkeeping directories. They are not image layers,
             // and mistaking one for the whole image builds a rootfs out of it.
-            if !name.ends_with(".tar") && !is_volume_metadata(&entry.file_name()) {
+            // A `.partial` directory is an extraction the host had not finished
+            // (it renames a complete one into its layer name); it is never a
+            // layer, whatever it happens to contain.
+            if !name.ends_with(".tar")
+                && !name.ends_with(".partial")
+                && !is_volume_metadata(&entry.file_name())
+            {
                 present.insert(name);
             }
         }
@@ -1420,7 +1428,45 @@ fn recover_archive_config(archive: &Path, dest: &Path) -> Result<()> {
         StorageError::new("archive manifest.json has no Config entry".to_string())
     })?;
     let config_bytes = extract_tar_member(archive, config_path)?;
+    if let Ok(config_json) = serde_json::from_slice::<serde_json::Value>(&config_bytes) {
+        if let Some(arch) = config_json["architecture"].as_str() {
+            ensure_archive_arch_compatible(arch)?;
+        }
+    }
     std::fs::write(dest, &config_bytes)?;
+    Ok(())
+}
+
+/// Validate that a local image archive's architecture is compatible with the guest microVM.
+fn ensure_archive_arch_compatible(archive_arch: &str) -> Result<()> {
+    let guest_arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let norm_arch = match archive_arch.trim() {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "i386" | "i486" | "i586" | "i686" => "386",
+        "armhf" | "armel" | "armv5" | "armv6" | "armv7" => "arm",
+        other => other,
+    };
+
+    // If Rosetta translation is active on an arm64 guest, amd64 is supported.
+    let rosetta_supported =
+        guest_arch == "arm64" && norm_arch == "amd64" && crate::rosetta::is_enabled();
+
+    if matches!(
+        norm_arch,
+        "amd64" | "arm64" | "386" | "arm" | "riscv64" | "ppc64le" | "s390x"
+    ) && norm_arch != guest_arch
+        && !rosetta_supported
+    {
+        return Err(StorageError::new(format!(
+            "this local image archive is built for architecture '{archive_arch}', but this guest microVM is '{guest_arch}'. \
+             A local image archive carries native binaries and cannot run on an incompatible CPU architecture — save the image on or for an '{guest_arch}' system."
+        )));
+    }
     Ok(())
 }
 
@@ -1794,6 +1840,23 @@ fn layer_ok_marker(layer_dir: &Path) -> PathBuf {
     layer_dir.with_file_name(name)
 }
 
+/// Cached logical size of one immutable content-addressed layer. Like the
+/// completion marker, this lives beside the lowerdir so it never appears in a
+/// container filesystem.
+fn layer_size_marker(layer_dir: &Path) -> PathBuf {
+    let mut name = layer_dir.file_name().unwrap_or_default().to_os_string();
+    name.push(".size");
+    layer_dir.with_file_name(name)
+}
+
+fn read_layer_size(layer_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(layer_size_marker(layer_dir))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 fn image_size_cache_path(root: &Path, image: &str) -> PathBuf {
     root.join(IMAGE_METADATA_DIR)
         .join(sanitize_image_name(image) + ".size")
@@ -1812,7 +1875,8 @@ fn calculate_image_size(root: &Path, layers: &[String]) -> u64 {
         .iter()
         .filter_map(|digest| {
             let id = digest.strip_prefix("sha256:").unwrap_or(digest);
-            dir_size(&root.join(LAYERS_DIR).join(id)).ok()
+            let layer_dir = root.join(LAYERS_DIR).join(id);
+            read_layer_size(&layer_dir).or_else(|| dir_size(&layer_dir).ok())
         })
         .sum()
 }
@@ -2207,10 +2271,19 @@ where
     // Extract layers with progress updates
     // Layers extracted by THIS pull; their completion markers are written only
     // after the writeback barrier below confirms the data reached the disk.
-    let mut newly_extracted: Vec<PathBuf> = Vec::new();
+    let mut newly_extracted: Vec<(PathBuf, u64)> = Vec::new();
     for (i, layer_digest) in layers.iter().enumerate() {
         let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
         let layer_dir = root.join(LAYERS_DIR).join(layer_id);
+
+        // A manifest can legally reference the same layer more than once. Its
+        // durable completion marker is delayed until the final writeback
+        // barrier, so remember successful work from this pull rather than
+        // deleting and extracting the same directory again.
+        if newly_extracted.iter().any(|(dir, _)| dir == &layer_dir) {
+            progress(i + 1, total_layers, layer_id);
+            continue;
+        }
 
         if is_layer_cached(&layer_dir) {
             info!(layer = %layer_id, "layer already cached");
@@ -2228,6 +2301,7 @@ where
             }
         }
         let _ = std::fs::remove_file(layer_ok_marker(&layer_dir));
+        let _ = std::fs::remove_file(layer_size_marker(&layer_dir));
 
         info!(
             layer = %layer_id,
@@ -2285,7 +2359,7 @@ where
             .take()
             .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
 
-        let extract_result = extract_oci_layer(crane_stdout, &layer_dir);
+        let extract_result = extract_oci_layer_with_size(crane_stdout, &layer_dir);
 
         let crane_status = crane
             .wait()
@@ -2307,7 +2381,7 @@ where
                 "crane blob failed for layer {}: {}",
                 layer_digest, crane_stderr
             ))
-        } else if let Err(e) = extract_result {
+        } else if let Err(ref e) = extract_result {
             Some(format!(
                 "layer extraction failed for layer {}: {}",
                 layer_digest, e
@@ -2325,7 +2399,7 @@ where
             return Err(StorageError::new(message));
         }
 
-        newly_extracted.push(layer_dir);
+        newly_extracted.push((layer_dir, extract_result.unwrap_or(0)));
 
         // Report progress after successful extraction
         progress(i + 1, total_layers, layer_id);
@@ -2344,17 +2418,20 @@ where
     //    (a host out of disk surfaces exactly this way) — only an error-reporting
     //    sync catches it, and a pull must FAIL then, not report done.
     if let Err(sync_error) = sync_layer_writeback(root) {
-        for dir in &newly_extracted {
+        for (dir, _) in &newly_extracted {
             let _ = std::fs::remove_dir_all(dir);
             let _ = std::fs::remove_file(layer_ok_marker(dir));
+            let _ = std::fs::remove_file(layer_size_marker(dir));
         }
         return Err(sync_error);
     }
 
     // Markers last: a layer without one is re-pulled, never trusted.
-    for dir in &newly_extracted {
+    for (dir, logical_bytes) in &newly_extracted {
         std::fs::write(layer_ok_marker(dir), "ok")
             .map_err(|e| StorageError::new(format!("write layer completion marker: {}", e)))?;
+        std::fs::write(layer_size_marker(dir), logical_bytes.to_string())
+            .map_err(|e| StorageError::new(format!("write layer size marker: {}", e)))?;
     }
 
     // Directory traversal is expensive for multi-gigabyte images and image
@@ -2669,14 +2746,23 @@ pub fn garbage_collect(dry_run: bool) -> Result<u64> {
     if layers_dir.exists() {
         for entry in std::fs::read_dir(&layers_dir)? {
             let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                // Completion and size sidecars live beside layer directories;
+                // they are handled with their directory below, not mistaken
+                // for independently garbage-collectable layers.
+                continue;
+            }
             let layer_id = entry.file_name().to_string_lossy().to_string();
 
             if !referenced_layers.contains(&layer_id) {
-                let size = dir_size(&entry.path()).unwrap_or(0);
+                let size = read_layer_size(&entry.path())
+                    .unwrap_or_else(|| dir_size(&entry.path()).unwrap_or(0));
                 info!(layer = %layer_id, size = size, dry_run = dry_run, "unreferenced layer");
 
                 if !dry_run {
                     std::fs::remove_dir_all(entry.path())?;
+                    let _ = std::fs::remove_file(layer_ok_marker(&entry.path()));
+                    let _ = std::fs::remove_file(layer_size_marker(&entry.path()));
                 }
 
                 freed += size;
@@ -2874,9 +2960,16 @@ impl OverlaySetup {
 
     /// Mount the overlay filesystem with fallback from multi-lowerdir to sequential.
     fn mount(&self, lowerdirs: &[String]) -> Result<()> {
+        // OCI manifests may repeat a content-addressed layer. Reapplying the
+        // exact same filesystem diff is idempotent, while passing the same
+        // directory to overlayfs twice makes fsconfig reject the stack with
+        // ELOOP and needlessly sends large images through the physical merge
+        // fallback.
+        let lowerdirs = unique_lowerdirs(lowerdirs);
+
         // Try multi-lowerdir mount first (efficient)
         let mount_result = try_mount_overlay_multi_lower(
-            lowerdirs,
+            &lowerdirs,
             &self.upper_path,
             &self.work_path,
             &self.merged_path,
@@ -2892,7 +2985,7 @@ impl OverlaySetup {
                 );
 
                 mount_overlay_sequential(
-                    lowerdirs,
+                    &lowerdirs,
                     &self.upper_path,
                     &self.work_path,
                     &self.merged_path,
@@ -4260,7 +4353,7 @@ fn mount_overlay_fsconfig(
 /// is tarred directly, since overlayfs requires two lower layers when there is no
 /// upperdir.
 pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> {
-    let present = mountable_lowerdirs(lowerdirs);
+    let present = unique_lowerdirs(&mountable_lowerdirs(lowerdirs));
 
     let source = match present.len() {
         0 => {
@@ -4305,6 +4398,16 @@ fn mountable_lowerdirs(lowerdirs: &[String]) -> Vec<String> {
                     .map(|mut entries| entries.next().is_some())
                     .unwrap_or(false)
         })
+        .cloned()
+        .collect()
+}
+
+/// Keep the first (highest-priority) occurrence of each lower directory.
+fn unique_lowerdirs(lowerdirs: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(lowerdirs.len());
+    lowerdirs
+        .iter()
+        .filter(|dir| seen.insert((*dir).clone()))
         .cloned()
         .collect()
 }
@@ -4867,6 +4970,31 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_archive_arch_compatibility() {
+        let guest_arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let other_arch = if guest_arch == "amd64" {
+            "arm64"
+        } else {
+            "386"
+        };
+
+        // Same arch is accepted
+        assert!(ensure_archive_arch_compatible(guest_arch).is_ok());
+        // Unknown / empty arch is leniently accepted
+        assert!(ensure_archive_arch_compatible("").is_ok());
+        assert!(ensure_archive_arch_compatible("unknown_arch").is_ok());
+        // Incompatible arch is rejected
+        let err = ensure_archive_arch_compatible(other_arch).unwrap_err();
+        assert!(err.to_string().contains("is built for architecture"));
+    }
+
     /// One empty layer is a legal OCI layer (metadata or whiteouts only), so
     /// verification must not reject an image just for containing one.
     #[test]
@@ -4915,6 +5043,27 @@ mod tests {
         let err = ordered_packed_layer_names(dir.path())
             .expect_err("bookkeeping directories are not layers");
         assert!(err.to_string().contains("no image layers"), "got: {err}");
+    }
+
+    /// An extraction the host did not finish is staged as `<layer>.partial`;
+    /// whatever it contains, it is not a layer, and a store holding nothing
+    /// else must fail the same way an empty one does.
+    #[test]
+    fn an_unfinished_extraction_is_never_enumerated_as_an_image_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("aaaa1111bbbb.partial");
+        std::fs::create_dir_all(staging.join("usr/bin")).unwrap();
+        std::fs::write(staging.join("usr/bin/sh"), b"").unwrap();
+        let err = ordered_packed_layer_names(dir.path())
+            .expect_err("a half-written layer must not be served as the image");
+        assert!(err.to_string().contains("no image layers"), "got: {err}");
+
+        // Once the host renames it into place it is a layer like any other.
+        std::fs::rename(&staging, dir.path().join("aaaa1111bbbb")).unwrap();
+        assert_eq!(
+            ordered_packed_layer_names(dir.path()).unwrap(),
+            vec!["aaaa1111bbbb".to_string()]
+        );
     }
 
     /// A store with no usable layer directory cannot produce the image, so it
@@ -4967,7 +5116,6 @@ mod tests {
         assert!(err.to_string().contains("does not exist"), "got: {err}");
     }
 
-    use super::*;
     // OCI layer helpers now live in the shared crate; these tests exercise them
     // through its public API (the crate also unit-tests them independently).
     use smolvm_oci_layer::{classify_layer_entry, jailed_join, LayerEntry};
@@ -5078,6 +5226,24 @@ mod tests {
             kept,
             vec![populated.to_string_lossy().into_owned()],
             "only the populated directory is mountable"
+        );
+    }
+
+    #[test]
+    fn duplicate_lowerdirs_keep_the_highest_priority_occurrence() {
+        let dirs = vec![
+            "/layers/top".to_string(),
+            "/layers/shared".to_string(),
+            "/layers/base".to_string(),
+            "/layers/shared".to_string(),
+        ];
+        assert_eq!(
+            unique_lowerdirs(&dirs),
+            vec![
+                "/layers/top".to_string(),
+                "/layers/shared".to_string(),
+                "/layers/base".to_string(),
+            ]
         );
     }
 
@@ -5777,6 +5943,26 @@ mod tests {
     }
 
     #[test]
+    fn image_size_uses_layer_sidecars_and_falls_back_for_old_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layers_root = tmp.path().join(LAYERS_DIR);
+        let cached = layers_root.join("cached");
+        let legacy = layers_root.join("legacy");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(cached.join("ignored-by-sidecar"), b"123456789").unwrap();
+        std::fs::write(legacy.join("measured"), b"1234").unwrap();
+        std::fs::write(layer_size_marker(&cached), "7").unwrap();
+
+        assert_eq!(
+            calculate_image_size(tmp.path(), &["cached".into(), "legacy".into()]),
+            11
+        );
+        assert_eq!(read_layer_size(&cached), Some(7));
+        assert_eq!(layer_size_marker(&cached).parent(), cached.parent());
+    }
+
+    #[test]
     fn test_validate_storage_id_rejects_traversal() {
         assert!(validate_storage_id("../escape", "workload_id").is_err());
         assert!(validate_storage_id("foo/bar", "workload_id").is_err());
@@ -5962,6 +6148,47 @@ mod tests {
         // The merged view exposes files from every layer.
         assert!(merged.join("f0").exists());
         assert!(merged.join("f7").exists());
+        let _ = std::process::Command::new("umount").arg(&merged).status();
+    }
+
+    /// Verify that the new mount API preserves OCI layer precedence and hides a
+    /// lower-layer name deleted by a whiteout in the top layer. This catches
+    /// ordering changes that ordinary additive-layer tests cannot observe.
+    #[test]
+    #[ignore = "requires root + Linux overlayfs"]
+    #[cfg(target_os = "linux")]
+    fn overlay_fsconfig_applies_lower_layer_whiteouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let base = root.join("base");
+        let top = root.join("top");
+        let upper = root.join("upper");
+        let work = root.join("work");
+        let merged = root.join("merged");
+        for path in [&base, &top, &upper, &work, &merged] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::create_dir_all(base.join("dir")).unwrap();
+        std::fs::create_dir_all(top.join("dir")).unwrap();
+        std::fs::write(base.join("priority"), b"base").unwrap();
+        std::fs::write(top.join("priority"), b"top").unwrap();
+        std::fs::write(base.join("dir/deleted"), b"lower payload").unwrap();
+        smolvm_oci_layer::create_overlay_whiteout(&top.join("dir/deleted")).unwrap();
+
+        let lowerdirs = vec![
+            top.to_string_lossy().into_owned(),
+            base.to_string_lossy().into_owned(),
+        ];
+        mount_overlay_fsconfig(&lowerdirs, &upper, &work, &merged).unwrap();
+
+        assert_eq!(std::fs::read(merged.join("priority")).unwrap(), b"top");
+        assert!(!merged.join("dir/deleted").exists());
+        let names: Vec<_> = std::fs::read_dir(merged.join("dir"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(!names.iter().any(|name| name == "deleted"));
+
         let _ = std::process::Command::new("umount").arg(&merged).status();
     }
 }

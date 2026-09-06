@@ -513,6 +513,11 @@ pub struct RunCmd {
     #[arg(short = 'w', long, value_name = "DIR", help_heading = "Container")]
     pub workdir: Option<String>,
 
+    /// Run as this user, like `docker run --user`: a name from the image or a
+    /// numeric `uid[:gid]`. Overrides the image's USER.
+    #[arg(short = 'u', long, value_name = "USER", help_heading = "Container")]
+    pub user: Option<String>,
+
     /// Set environment variable (can be used multiple times)
     #[arg(
         short = 'e',
@@ -1076,6 +1081,18 @@ fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
     Ok(())
 }
 
+/// When an agent request fails because the VM process is gone, replace the
+/// bare transport error ("connection closed") with how the process ended.
+fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error) -> smolvm::Error {
+    match manager.death_reason() {
+        Some(reason) => smolvm::Error::agent(
+            "run command",
+            format!("the machine's VM process died while the command ran: {reason}"),
+        ),
+        None => error,
+    }
+}
+
 impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
@@ -1105,6 +1122,7 @@ impl RunCmd {
                 tty: self.tty,
                 timeout: self.timeout,
                 workdir: self.workdir,
+                user: self.user,
                 env,
                 volume: self.volume,
                 allow_system_mounts: self.allow_system_mounts,
@@ -1179,6 +1197,7 @@ impl RunCmd {
             vec![],
             self.env,
             self.workdir,
+            self.user,
             self.smolfile.clone(),
             self.storage,
             self.overlay,
@@ -1243,6 +1262,7 @@ impl RunCmd {
                     tty: self.tty,
                     timeout: self.timeout,
                     workdir: params.workdir.clone(),
+                    user: params.user.clone(),
                     env: params.env.clone(),
                     volume: params.volume.clone(),
                     allow_system_mounts: params.allow_system_mounts,
@@ -1360,6 +1380,7 @@ impl RunCmd {
                 tty: self.tty,
                 timeout: self.timeout,
                 workdir: params.workdir.clone(),
+                user: params.user.clone(),
                 env: params.env.clone(),
                 volume: params.volume.clone(),
                 allow_system_mounts: params.allow_system_mounts,
@@ -1727,6 +1748,7 @@ impl RunCmd {
                     image_info: image_info.as_ref(),
                     env: &init_env,
                     workdir: params.workdir.as_deref(),
+                    user: params.user.as_deref(),
                     record_mounts: &record_mounts,
                     overlay_id: &vm_name,
                 },
@@ -1777,6 +1799,7 @@ impl RunCmd {
                 image_info.as_ref(),
                 &env,
                 params.workdir.as_deref(),
+                params.user.as_deref(),
             );
             // Credentials and endpoint come from the workload's own env, the
             // same place every AWS SDK reads them, so a remote volume needs no
@@ -1795,7 +1818,9 @@ impl RunCmd {
                         .with_persistent_overlay(Some(vm_name.clone()))
                         .with_unprivileged(self.unprivileged)
                         .with_s3_volumes(s3_volumes.clone());
-                    client.run_container_detached(run_config)?;
+                    client
+                        .run_container_detached(run_config)
+                        .map_err(|e| explain_vm_death(&manager, e))?;
                 }
 
                 // Container started — persist the DB record. If this fails,
@@ -1811,46 +1836,34 @@ impl RunCmd {
                             &mut config,
                             &vm_name,
                             manager.child_pid(),
-                            Some(DefaultVmOverrides {
-                                // Persist the REFS (re-resolved at each start via
-                                // record_env_with_secrets), never the resolved
-                                // plaintext — see `env` below.
-                                secret_refs: params.secret_refs.clone(),
-                                cpus: params.cpus,
-                                mem: params.mem,
-                                mounts: mount_tuples,
-                                staged_mounts,
-                                ports: port_tuples,
-                                network: params.net,
-                                network_backend: params.network_backend,
-                                dns: params.dns,
-                                network_name: params.network_name.clone(),
-                                storage_gb: params.storage_gb,
-                                overlay_gb: params.overlay_gb,
-                                allowed_cidrs: params.allowed_cidrs.clone(),
-                                init: params.init.clone(),
-                                // Strip resolved secret values so plaintext never
-                                // reaches the DB/pack record. defaults.env still
-                                // carries them for RUNNING the container above; the
-                                // record keeps only refs + non-secret env.
-                                env: defaults
+                            Some({
+                                let mut o = DefaultVmOverrides::from_create_params(
+                                    &params,
+                                    mount_tuples,
+                                    staged_mounts,
+                                    port_tuples,
+                                );
+                                // An image machine records what the image
+                                // resolved to: its env (minus secret values, which
+                                // stay as refs), workdir and user, the image itself
+                                // and the workload command.
+                                o.env = defaults
                                     .env
                                     .iter()
                                     .filter(|(k, _)| !params.secret_refs.contains_key(k))
                                     .cloned()
-                                    .collect(),
-                                workdir: defaults.workdir.clone(),
-                                user: defaults.user.clone(),
-                                image: Some(img.clone()),
-                                entrypoint: Vec::new(),
-                                cmd: command.clone(),
-                                ssh_agent: self.ssh_agent || params.ssh_agent,
-                                cuda: self.cuda || params.cuda,
-                                docker_socket: self.docker_socket || params.docker_socket,
-                                dns_filter_hosts: params.dns_filter_hosts.clone(),
-                                gpu: self.gpu || params.gpu,
-                                gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
-                                rosetta: self.rosetta || params.rosetta,
+                                    .collect();
+                                o.workdir = defaults.workdir.clone();
+                                o.user = defaults.user.clone();
+                                o.image = Some(img.clone());
+                                o.entrypoint = Vec::new();
+                                o.cmd = command.clone();
+                                o.ssh_agent = self.ssh_agent || o.ssh_agent;
+                                o.cuda = self.cuda || o.cuda;
+                                o.docker_socket = self.docker_socket || o.docker_socket;
+                                o.gpu = self.gpu || o.gpu;
+                                o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
+                                o
                             }),
                         )
                     });
@@ -1903,7 +1916,9 @@ impl RunCmd {
                         .with_persistent_overlay(Some(vm_name.clone()))
                         .with_unprivileged(self.unprivileged)
                         .with_s3_volumes(s3_volumes.clone());
-                    client.run_interactive(config)?
+                    client
+                        .run_interactive(config)
+                        .map_err(|e| explain_vm_death(&manager, e))?
                 } else {
                     let config = RunConfig::new(img, command)
                         .with_env(defaults.env)
@@ -1914,7 +1929,9 @@ impl RunCmd {
                         .with_persistent_overlay(Some(vm_name.clone()))
                         .with_unprivileged(self.unprivileged)
                         .with_s3_volumes(s3_volumes.clone());
-                    let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
+                    let (exit_code, stdout, stderr) = client
+                        .run_non_interactive(config)
+                        .map_err(|e| explain_vm_death(&manager, e))?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
                     }
@@ -1984,36 +2001,23 @@ impl RunCmd {
                         &mut config,
                         &vm_name,
                         manager.child_pid(),
-                        Some(DefaultVmOverrides {
-                            // Persist the refs so secrets re-resolve on restart
-                            // (env below is already secret-free: parse_env_list).
-                            secret_refs: params.secret_refs.clone(),
-                            cpus: params.cpus,
-                            mem: params.mem,
-                            mounts: mount_tuples,
-                            staged_mounts,
-                            ports: port_tuples,
-                            network: params.net,
-                            network_backend: params.network_backend,
-                            dns: params.dns,
-                            network_name: params.network_name.clone(),
-                            storage_gb: params.storage_gb,
-                            overlay_gb: params.overlay_gb,
-                            allowed_cidrs: params.allowed_cidrs.clone(),
-                            init: params.init.clone(),
-                            env: parse_env_list(&params.env),
-                            workdir: params.workdir.clone(),
-                            user: None,
-                            image: None,
-                            entrypoint: params.entrypoint.clone(),
-                            cmd: params.cmd.clone(),
-                            ssh_agent: self.ssh_agent || params.ssh_agent,
-                            cuda: self.cuda || params.cuda,
-                            docker_socket: self.docker_socket || params.docker_socket,
-                            dns_filter_hosts: params.dns_filter_hosts.clone(),
-                            gpu: self.gpu || params.gpu,
-                            gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
-                            rosetta: false,
+                        Some({
+                            let mut o = DefaultVmOverrides::from_create_params(
+                                &params,
+                                mount_tuples,
+                                staged_mounts,
+                                port_tuples,
+                            );
+                            // A one-shot run keeps no image on its record; the
+                            // command line flags may enable features on top of
+                            // what the Smolfile asked for.
+                            o.image = None;
+                            o.ssh_agent = self.ssh_agent || o.ssh_agent;
+                            o.cuda = self.cuda || o.cuda;
+                            o.docker_socket = self.docker_socket || o.docker_socket;
+                            o.gpu = self.gpu || o.gpu;
+                            o.gpu_vram_mib = self.gpu_vram_mib.or(o.gpu_vram_mib);
+                            o
                         }),
                     )?;
                 }
@@ -2760,6 +2764,11 @@ pub struct ExecCmd {
     #[arg(short = 'w', long, value_name = "DIR")]
     pub workdir: Option<String>,
 
+    /// Run as this user (name or `uid[:gid]`). Defaults to the machine's
+    /// configured user, then the image's USER.
+    #[arg(short = 'u', long, value_name = "USER")]
+    pub user: Option<String>,
+
     /// Set environment variable (can be used multiple times)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -2820,6 +2829,12 @@ impl ExecCmd {
             .workdir
             .clone()
             .or_else(|| record.as_ref().and_then(|r| r.workdir.clone()));
+        // Same precedence for the user: an explicit flag, then whatever the
+        // machine was created with (or resolved from the image at first start).
+        let user = self
+            .user
+            .clone()
+            .or_else(|| record.as_ref().and_then(|r| r.user.clone()));
         let record_image = record.as_ref().and_then(|r| r.image.clone());
 
         // Check if this machine has an image — if so, exec inside the image's
@@ -2866,6 +2881,7 @@ impl ExecCmd {
                 image_info.as_ref(),
                 &configured_env,
                 workdir.as_deref(),
+                user.as_deref(),
             );
             // Image-based machine: exec inside the image's rootfs via crun.
             // Fork clones address the golden's inherited overlay; ordinary
@@ -3032,6 +3048,7 @@ impl ShellCmd {
             command: vec!["/bin/sh".to_string()],
             name: self.name,
             workdir: None,
+            user: None,
             env: vec![],
             secret_env: vec![],
             secret_file: vec![],
@@ -3199,6 +3216,12 @@ pub struct CreateCmd {
     #[arg(short = 'w', long = "workdir", value_name = "DIR")]
     pub workdir: Option<String>,
 
+    /// Run the workload as this user, like `docker run --user`: a name from the
+    /// image or a numeric `uid[:gid]`. Overrides the image's USER, so a workload
+    /// can match the owner of a mounted host directory.
+    #[arg(short = 'u', long = "user", value_name = "USER")]
+    pub user: Option<String>,
+
     /// Forward host SSH agent into the VM (enables git/ssh without exposing keys)
     #[arg(long)]
     pub ssh_agent: bool,
@@ -3336,6 +3359,7 @@ impl CreateCmd {
             self.init,
             self.env,
             self.workdir,
+            self.user,
             self.smolfile.clone(),
             self.storage,
             self.overlay,
@@ -3640,6 +3664,7 @@ impl CreateCmd {
                 env
             },
             workdir: manifest.workdir,
+            user: None,
             storage_gb: checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.storage_gib)

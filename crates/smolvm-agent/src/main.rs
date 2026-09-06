@@ -2313,10 +2313,17 @@ fn handle_request(
     }
 
     match request {
-        AgentRequest::Ping => AgentResponse::Pong {
-            version: PROTOCOL_VERSION,
-            capabilities: vec![smolvm_protocol::forkpoint::WORKER_READY_CAPABILITY.to_string()],
-        },
+        AgentRequest::Ping => {
+            let mut capabilities =
+                vec![smolvm_protocol::forkpoint::WORKER_READY_CAPABILITY.to_string()];
+            if forkpoint::arming_enabled() {
+                capabilities.push(smolvm_protocol::forkpoint::ARMING_CAPABILITY.to_string());
+            }
+            AgentResponse::Pong {
+                version: PROTOCOL_VERSION,
+                capabilities,
+            }
+        }
 
         AgentRequest::FsNotify { events } => handle_fsnotify(&events),
 
@@ -4747,9 +4754,11 @@ fn spawn_interactive_command(
     // user) is rejected with "invalid USERSPEC specified". Resolve it against the
     // container rootfs /etc/passwd, consistent with the `crun run` path (#632).
     // (Harmless for the fresh-container path, which re-resolves via config.json.)
+    let mut exec_env = launch.env.clone();
+    oci::apply_process_env(Path::new(rootfs), launch.user.as_deref(), &mut exec_env);
     let launch_owned = ResolvedLaunch {
         command: launch.command.clone(),
-        env: launch.env.clone(),
+        env: exec_env,
         workdir: launch.workdir.clone(),
         user: oci::resolve_exec_user_spec(Path::new(rootfs), launch.user.as_deref())?,
     };
@@ -5890,6 +5899,7 @@ fn run_background_in_keepalive(
 
     // `crun exec --user` needs a numeric uid[:gid]; resolve any username
     // against the container's /etc/passwd, same as the foreground path.
+    oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
     launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -6092,6 +6102,7 @@ fn run_in_keepalive_container(
     // — a username (the image's `config.User`, e.g. `nobody`/`node`, or the
     // request user) is rejected with "invalid USERSPEC specified". Resolve it
     // against the container's /etc/passwd, matching the `crun run` path (#632).
+    oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
     launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 

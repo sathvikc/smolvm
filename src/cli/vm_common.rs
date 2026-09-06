@@ -247,6 +247,7 @@ pub(crate) struct InitRunContext<'a> {
     pub(crate) image_info: Option<&'a ImageInfo>,
     pub(crate) env: &'a [(String, String)],
     pub(crate) workdir: Option<&'a str>,
+    pub(crate) user: Option<&'a str>,
     pub(crate) record_mounts: &'a [(String, String, bool)],
     pub(crate) overlay_id: &'a str,
 }
@@ -269,8 +270,12 @@ pub(crate) fn run_init_commands(
     println!("Running {} init command(s)...", init.len());
     for (i, cmd) in init.iter().enumerate() {
         if let Some(image) = context.image {
-            let defaults =
-                resolve_image_runtime_defaults(context.image_info, context.env, context.workdir);
+            let defaults = resolve_image_runtime_defaults(
+                context.image_info,
+                context.env,
+                context.workdir,
+                context.user,
+            );
             let config = build_init_run_config(
                 image,
                 cmd,
@@ -342,6 +347,7 @@ pub(crate) fn resolve_image_runtime_defaults(
     image_info: Option<&ImageInfo>,
     env: &[(String, String)],
     explicit_workdir: Option<&str>,
+    explicit_user: Option<&str>,
 ) -> ImageRuntimeDefaults {
     let mut resolved_env = Vec::new();
 
@@ -359,7 +365,12 @@ pub(crate) fn resolve_image_runtime_defaults(
         .map(str::to_string)
         .or_else(|| image_info.and_then(|info| info.workdir.clone()));
 
-    let user = image_info.and_then(|info| info.user.clone());
+    // An explicit user wins over the image's USER, exactly as `docker run
+    // --user` does; without one the image default applies, and without that
+    // the agent runs the workload as root.
+    let user = explicit_user
+        .map(str::to_string)
+        .or_else(|| image_info.and_then(|info| info.user.clone()));
 
     ImageRuntimeDefaults {
         env: resolved_env,
@@ -452,6 +463,8 @@ pub struct CreateVmParams {
     pub init: Vec<String>,
     pub env: Vec<String>,
     pub workdir: Option<String>,
+    /// User the workload runs as (name or `uid[:gid]`); overrides the image `USER`.
+    pub user: Option<String>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub allowed_cidrs: Option<Vec<String>>,
@@ -691,6 +704,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.env = env;
     record.secret_refs = params.secret_refs.clone();
     record.workdir = params.workdir.clone();
+    record.user = params.user.clone();
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
@@ -1658,6 +1672,7 @@ fn start_vm_named_with_db(
                 image_info: image_info.as_ref(),
                 env: &exec_env,
                 workdir: record.workdir.as_deref(),
+                user: record.user.as_deref(),
                 record_mounts: &record.mounts,
                 overlay_id: name,
             },
@@ -1782,6 +1797,43 @@ fn start_vm_named_with_db(
 ///
 /// Creates the record if it doesn't exist, then updates state to Running
 /// with the current PID and optional config overrides (cpus, mem, etc.).
+/// The one place a machine record takes its settings from a set of overrides.
+///
+/// Every field a record carries for a workload is written here and nowhere
+/// else, so a setting added to [`DefaultVmOverrides`] cannot be persisted on
+/// one path and dropped on another. Covered by the launch-settings round-trip
+/// test in this module.
+pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
+    r.cpus = o.cpus;
+    r.mem = o.mem;
+    r.mounts = o.mounts.clone();
+    r.staged_mounts = o.staged_mounts.clone();
+    r.ports = o.ports.clone();
+    r.network = o.network;
+    r.network_backend = o.network_backend;
+    r.dns = o.dns;
+    r.network_name = o.network_name.clone();
+    r.storage_gb = o.storage_gb;
+    r.overlay_gb = o.overlay_gb;
+    r.allowed_cidrs = o.allowed_cidrs.clone();
+    r.init = o.init.clone();
+    r.init_completed = false;
+    r.env = o.env.clone();
+    r.secret_refs = o.secret_refs.clone();
+    r.workdir = o.workdir.clone();
+    r.user = o.user.clone();
+    r.image = o.image.clone();
+    r.entrypoint = o.entrypoint.clone();
+    r.cmd = o.cmd.clone();
+    r.ssh_agent = o.ssh_agent;
+    r.cuda = o.cuda;
+    r.docker_socket = o.docker_socket;
+    r.dns_filter_hosts = o.dns_filter_hosts.clone();
+    r.gpu = if o.gpu { Some(true) } else { None };
+    r.gpu_vram_mib = o.gpu_vram_mib;
+    r.rosetta = if o.rosetta { Some(true) } else { None };
+}
+
 pub fn persist_named_running(
     config: &mut SmolvmConfig,
     name: &str,
@@ -1806,34 +1858,7 @@ pub fn persist_named_running(
             r.pid = pid;
             r.pid_start_time = pid_start_time;
             if let Some(ref o) = overrides {
-                r.cpus = o.cpus;
-                r.mem = o.mem;
-                r.mounts = o.mounts.clone();
-                r.staged_mounts = o.staged_mounts.clone();
-                r.ports = o.ports.clone();
-                r.network = o.network;
-                r.network_backend = o.network_backend;
-                r.dns = o.dns;
-                r.network_name = o.network_name.clone();
-                r.storage_gb = o.storage_gb;
-                r.overlay_gb = o.overlay_gb;
-                r.allowed_cidrs = o.allowed_cidrs.clone();
-                r.init = o.init.clone();
-                r.init_completed = false;
-                r.env = o.env.clone();
-                r.secret_refs = o.secret_refs.clone();
-                r.workdir = o.workdir.clone();
-                r.user = o.user.clone();
-                r.image = o.image.clone();
-                r.entrypoint = o.entrypoint.clone();
-                r.cmd = o.cmd.clone();
-                r.ssh_agent = o.ssh_agent;
-                r.cuda = o.cuda;
-                r.docker_socket = o.docker_socket;
-                r.dns_filter_hosts = o.dns_filter_hosts.clone();
-                r.gpu = if o.gpu { Some(true) } else { None };
-                r.gpu_vram_mib = o.gpu_vram_mib;
-                r.rosetta = if o.rosetta { Some(true) } else { None };
+                apply_overrides(r, o);
             }
         })
         .ok_or_else(|| smolvm::Error::config(
@@ -1875,6 +1900,52 @@ pub struct DefaultVmOverrides {
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,
     pub rosetta: bool,
+}
+
+impl DefaultVmOverrides {
+    /// The one projection of create parameters onto the settings a machine
+    /// record keeps. Both the image-machine and the one-shot `run` path build
+    /// their record through here and then adjust only what is genuinely
+    /// path-specific (the image-resolved env, workdir and user; the image and
+    /// command). Before this each path spelled the projection out by hand, and
+    /// the two copies drifted: one persisted `user` while the other silently
+    /// wrote `None`.
+    pub(crate) fn from_create_params(
+        params: &CreateVmParams,
+        mounts: Vec<(String, String, bool)>,
+        staged_mounts: Vec<(usize, String, String)>,
+        ports: Vec<(u16, u16)>,
+    ) -> Self {
+        Self {
+            secret_refs: params.secret_refs.clone(),
+            cpus: params.cpus,
+            mem: params.mem,
+            mounts,
+            staged_mounts,
+            ports,
+            network: params.net,
+            network_backend: params.network_backend,
+            dns: params.dns,
+            network_name: params.network_name.clone(),
+            storage_gb: params.storage_gb,
+            overlay_gb: params.overlay_gb,
+            allowed_cidrs: params.allowed_cidrs.clone(),
+            init: params.init.clone(),
+            env: smolvm::util::parse_env_list(&params.env),
+            workdir: params.workdir.clone(),
+            user: params.user.clone(),
+            image: params.image.clone(),
+            entrypoint: params.entrypoint.clone(),
+            cmd: params.cmd.clone(),
+            ssh_agent: params.ssh_agent,
+            cuda: params.cuda,
+            docker_socket: params.docker_socket,
+            dns_filter_hosts: params.dns_filter_hosts.clone(),
+            gpu: params.gpu,
+            gpu_vram_mib: params.gpu_vram_mib,
+            rosetta: false,
+        }
+    }
 }
 
 /// Check if any running VM already binds to the same host ports.
@@ -1979,6 +2050,7 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
                     image_info: image_info.as_ref(),
                     env: &exec_env,
                     workdir: record.workdir.as_deref(),
+                    user: record.user.as_deref(),
                     record_mounts: &record.mounts,
                     overlay_id: "default",
                 },
@@ -2384,7 +2456,7 @@ fn ensure_fork_base_delete_is_safe(
 
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
-    let _fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
+    let fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
     let config = SmolvmConfig::load()?;
 
     // Check if exists
@@ -2512,6 +2584,20 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // orphaned by a crash/kill) now that this VM's data dir is gone, so the
     // rootfs doesn't accumulate stale markers (which also broke `pack create`).
     smolvm::agent::prune_orphaned_ready_markers();
+
+    // The fork-source lock is a *sibling* of the data dir, not a child, so the
+    // removal above cannot take it either -- see prune_orphaned_fork_source_locks
+    // for why it is placed there. Without this sweep a node accumulates one
+    // zero-byte lock per machine name it has ever forked.
+    //
+    // Release this delete's own guard first. The sweep only removes a lock it can
+    // take without blocking, and flock conflicts with the holding *process* even
+    // across a second descriptor -- so holding it here would veto the very file
+    // the sweep exists to remove. Everything the guard protects (the record and
+    // the data directory) is already gone, so a fork acquiring it now fails on a
+    // missing machine instead of racing us.
+    drop(fork_source_lock);
+    smolvm::agent::fork::prune_orphaned_fork_source_locks();
 
     println!("Deleted machine: {}", name);
     Ok(())
@@ -3424,7 +3510,7 @@ mod init_runner_tests {
             Some("steam"),
         );
 
-        let defaults = resolve_image_runtime_defaults(Some(&image_info), &[], None);
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &[], None, None);
 
         assert_eq!(
             defaults.env,
@@ -3444,7 +3530,7 @@ mod init_runner_tests {
             Some("/image-workdir"),
             Some("steam"),
         );
-        let defaults = resolve_image_runtime_defaults(Some(&image_info), &[], None);
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &[], None, None);
         let config = build_init_run_config("alpine:latest", "pwd", &defaults, &[], "vm");
 
         assert_eq!(config.workdir.as_deref(), Some("/image-workdir"));
@@ -3453,6 +3539,23 @@ mod init_runner_tests {
             config.env,
             vec![("FOO".to_string(), "from-image".to_string())]
         );
+    }
+
+    /// `--user` (or the Smolfile `user`) beats the image's USER the way
+    /// `docker run --user` does; without it the image's USER still applies.
+    #[test]
+    fn explicit_user_overrides_the_image_user() {
+        let image_info = sample_image_info(vec![], None, Some("steam"));
+        let overridden =
+            resolve_image_runtime_defaults(Some(&image_info), &[], None, Some("1000:1000"));
+        assert_eq!(overridden.user.as_deref(), Some("1000:1000"));
+
+        let kept = resolve_image_runtime_defaults(Some(&image_info), &[], None, None);
+        assert_eq!(kept.user.as_deref(), Some("steam"));
+
+        // No image metadata at all: the explicit value is still honoured.
+        let bare = resolve_image_runtime_defaults(None, &[], None, Some("app"));
+        assert_eq!(bare.user.as_deref(), Some("app"));
     }
 
     #[test]
@@ -3467,8 +3570,12 @@ mod init_runner_tests {
             ("BAZ".to_string(), "from-cli".to_string()),
         ];
 
-        let defaults =
-            resolve_image_runtime_defaults(Some(&image_info), &env, Some("/explicit-workdir"));
+        let defaults = resolve_image_runtime_defaults(
+            Some(&image_info),
+            &env,
+            Some("/explicit-workdir"),
+            None,
+        );
 
         assert_eq!(
             defaults.env,
@@ -3494,7 +3601,7 @@ mod init_runner_tests {
             ("BAR".to_string(), "last-cli".to_string()),
         ];
 
-        let defaults = resolve_image_runtime_defaults(Some(&image_info), &env, None);
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &env, None, None);
 
         assert_eq!(
             defaults.env,
@@ -3511,7 +3618,7 @@ mod init_runner_tests {
     fn resolve_image_runtime_defaults_falls_back_to_explicit_values_without_image_info() {
         let env = vec![("FOO".to_string(), "from-explicit".to_string())];
 
-        let defaults = resolve_image_runtime_defaults(None, &env, Some("/explicit-workdir"));
+        let defaults = resolve_image_runtime_defaults(None, &env, Some("/explicit-workdir"), None);
 
         assert_eq!(defaults.env, env);
         assert_eq!(defaults.workdir.as_deref(), Some("/explicit-workdir"));
